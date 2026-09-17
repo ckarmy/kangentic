@@ -29,12 +29,14 @@ import { prResolveOptionsFromGitConfig } from '../pr/pr-linking';
 export function buildCommandContextForProject(
   ipcContext: IpcContext,
   projectId: string,
+  actor: 'agent' | 'human' = 'agent',
 ): CommandContext | null {
   const project = ipcContext.projectRepo.getById(projectId);
   if (!project) return null;
   const projectPath = project.path;
 
   return {
+    actor,
     projectId,
     getProjectDb: () => getProjectDb(projectId),
     getProjectPath: () => projectPath,

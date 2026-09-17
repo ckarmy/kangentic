@@ -4,6 +4,12 @@ import type { PRResolveOptions } from '../../pr/shared/pr-connector';
 
 export interface CommandContext {
   /**
+   * Who initiated this command. The shared command registry is also reused by
+   * the mobile bridge, so not every call is agent-authored. Omitted means
+   * `agent` (fail closed) for every existing MCP/test caller.
+   */
+  actor?: 'agent' | 'human';
+  /**
    * The project this call is scoped to. Bound to the REQUEST's project, not the
    * active one, exactly like `getProjectPath` - a cross-project tool call must
    * record against the board it targets.

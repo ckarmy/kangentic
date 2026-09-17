@@ -476,10 +476,12 @@ export const handleUpdateTask: CommandHandler = (
   }
 
   const currentGuardLabels = task.labels.map((label) => label.trim().toLowerCase());
-  if (routerTaskHeld(currentGuardLabels) || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`)) {
+  const isHumanAction = context.actor === 'human';
+  if (!isHumanAction
+      && (routerTaskHeld(currentGuardLabels) || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`))) {
     return { success: false, error: 'Agents may not mutate a held or sensitive task; human action is required' };
   }
-  if (newLabels !== null) {
+  if (!isHumanAction && newLabels !== null) {
     const requestedLabels = newLabels.map((label) => label.trim().toLowerCase());
     if (!currentGuardLabels.includes('approved') && requestedLabels.includes('approved')) {
       return { success: false, error: 'Agents may not grant the approved label; human action is required' };
@@ -1593,8 +1595,9 @@ export const handleDeleteTask: CommandHandler = (
 
   const sourceLane = new SwimlaneRepository(db).getById(task.swimlane_id);
   const deleteGuardLabels = task.labels.map((label) => label.trim().toLowerCase());
-  if (sourceLane?.name === 'Draft' || routerTaskHeld(deleteGuardLabels)
-      || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`)) {
+  if (context.actor !== 'human'
+      && (sourceLane?.name === 'Draft' || routerTaskHeld(deleteGuardLabels)
+        || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`))) {
     return { success: false, error: 'Agents may not delete Draft, held, or sensitive tasks; human action is required' };
   }
 

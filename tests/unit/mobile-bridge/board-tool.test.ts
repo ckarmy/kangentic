@@ -93,14 +93,14 @@ describe('handleBoardTool', () => {
     const response = await handleBoardTool(fakeRequest('board-tool-read', { tool: 'search_tasks', params: {} }), fakeContext('proj-1'));
 
     expect(response.ok).toBe(true);
-    expect(buildCommandContextForProjectMock).toHaveBeenCalledWith(expect.anything(), 'proj-1');
+    expect(buildCommandContextForProjectMock).toHaveBeenCalledWith(expect.anything(), 'proj-1', 'human');
   });
 
   it('prefers an explicit params.project over the ambient current project', async () => {
     searchTasksHandler.mockReturnValue({ success: true, data: { tasks: [] } });
     await handleBoardTool(fakeRequest('board-tool-read', { tool: 'search_tasks', params: { project: 'proj-other' } }), fakeContext('proj-1'));
 
-    expect(buildCommandContextForProjectMock).toHaveBeenCalledWith(expect.anything(), 'proj-other');
+    expect(buildCommandContextForProjectMock).toHaveBeenCalledWith(expect.anything(), 'proj-other', 'human');
   });
 
   it('rejects when no project can be resolved at all', async () => {

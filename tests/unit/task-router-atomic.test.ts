@@ -306,6 +306,36 @@ describe('atomic task router contract', () => {
     expect(onTaskCreated).toHaveBeenCalledOnce();
   });
 
+  it('allows an authenticated human mobile action to edit or delete held work', () => {
+    const onTaskUpdated = vi.fn();
+    const onTaskDeleted = vi.fn();
+    const context = {
+      actor: 'human', getProjectDb: () => db, getProjectPath: () => 'C:/tmp/project',
+      onTaskUpdated, onTaskDeleted,
+    } as any;
+    const held = tasks.create({
+      title: '[Pedro] Sensitive proposal', description: 'Review production evidence.',
+      labels: ['pedro', 'manual-hold', 'risky'], swimlane_id: draftId,
+    });
+
+    // The mobile form sends the nullable MCP-shaped fields explicitly; keep
+    // that real payload shape here so this test isolates actor provenance.
+    const edited = handleUpdateTask({
+      taskId: held.id, title: '[Pedro] Edited by CK', description: null,
+      descriptionEdits: null, appendDescription: null, prUrl: null, prNumber: null,
+      agent: null, priority: null, labels: null, baseBranch: null,
+      useWorktree: null, attachments: null,
+    }, context);
+    expect(edited).toMatchObject({ success: true, data: { title: '[Pedro] Edited by CK' } });
+    expect(tasks.getById(held.id)?.title).toBe('[Pedro] Edited by CK');
+    expect(onTaskUpdated).toHaveBeenCalledOnce();
+
+    const deleted = handleDeleteTask({ taskId: held.id }, context);
+    expect(deleted).toMatchObject({ success: true, data: { id: held.id } });
+    expect(tasks.getById(held.id)).toBeUndefined();
+    expect(onTaskDeleted).toHaveBeenCalledOnce();
+  });
+
   it('Backlog cannot carry agent approval or bypass To Do', async () => {
     const context = {
       getProjectDb: () => db,

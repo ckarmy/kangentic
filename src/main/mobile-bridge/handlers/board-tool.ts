@@ -42,7 +42,10 @@ export async function handleBoardTool(
   if (!projectId) {
     return { type: 'capability-response', requestId: request.requestId, ok: false, error: 'No project is currently open and no project was specified' };
   }
-  const commandContext = buildCommandContextForProject(context, projectId);
+  // This request is a direct action by the paired phone's human user, not an
+  // MCP/LLM call. Preserve that provenance so agent-only approval/hold guards
+  // do not block the person they are explicitly meant to defer to.
+  const commandContext = buildCommandContextForProject(context, projectId, 'human');
   if (!commandContext) {
     return { type: 'capability-response', requestId: request.requestId, ok: false, error: `No such project: ${projectId}` };
   }
