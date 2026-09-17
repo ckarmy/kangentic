@@ -177,10 +177,9 @@ function ColumnRailRow({ row, active, sortable, onSelect, showDelete = false, on
  * The left rail: an "All columns" overview entry, a drag-to-reorder list of
  * columns, the Board Profile switcher, and an "Add column" button. The two
  * board-level controls sit together at the bottom, below the per-column list
- * they both act on. The To Do column is pinned at the top
- * (no drag handle, outside the SortableContext) so index 0 is structurally
- * unreachable, matching `swimlane-repository.reorder`'s constraint that To Do
- * stays first. Reorder is local (mutates the dialog's laneOrder); persistence
+ * they both act on. An inert Draft and the structural To Do/Approved column are
+ * pinned at the top (no drag handles, outside the SortableContext), matching
+ * `swimlane-repository.reorder`. Reorder is local (mutates the dialog's laneOrder); persistence
  * happens on Save.
  */
 export function ColumnRail({
@@ -195,8 +194,10 @@ export function ColumnRail({
   );
 
   const overviewSelected = activeId === ALL_COLUMNS_ID;
+  const draftRow = rows.find((row) => row.role == null && row.name === 'Draft') ?? null;
   const todoRow = rows.find((row) => row.role === 'todo') ?? null;
-  const sortableRows = rows.filter((row) => row.role !== 'todo');
+  const pinnedIds = new Set([draftRow?.id, todoRow?.id].filter((id): id is string => !!id));
+  const sortableRows = rows.filter((row) => !pinnedIds.has(row.id));
   const sortableIds = sortableRows.map((row) => row.id);
 
   const handleDragEnd = (event: { active: { id: string | number }; over: { id: string | number } | null }) => {
@@ -206,7 +207,7 @@ export function ColumnRail({
     const to = sortableIds.indexOf(String(over.id));
     if (from < 0 || to < 0) return;
     const movedSubset = arrayMove(sortableIds, from, to);
-    onReorder(todoRow ? [todoRow.id, ...movedSubset] : movedSubset);
+    onReorder([...(draftRow ? [draftRow.id] : []), ...(todoRow ? [todoRow.id] : []), ...movedSubset]);
   };
 
   // Focus-scoped ArrowUp/Down to walk the rail (overview + every column),

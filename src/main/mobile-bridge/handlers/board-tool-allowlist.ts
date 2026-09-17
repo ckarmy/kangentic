@@ -87,6 +87,13 @@ export const MOBILE_EXCLUDED_BOARD_TOOLS: ReadonlySet<string> = new Set([
   // neither name has to enter the published protocol tuples.
   'reserve_dev_ports',
   'check_dev_ports',
+  // Integration-only lifecycle authorities. The local router/Trello bridge
+  // call these through the loopback MCP endpoint with their own stale-write
+  // and idempotency contracts; the generic phone bridge must not impersonate
+  // either integration or complete an agent stage.
+  'route_task',
+  'complete_route_stage',
+  'sync_external_draft',
 ]);
 
 /** True only for a `commandHandlers` key that is both classified here and not on the exclusion list. */

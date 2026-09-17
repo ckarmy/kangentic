@@ -45,6 +45,7 @@ import { loadTaskProfile } from '../helpers/task-profile';
 import { reportAutoCommandOutcome } from '../helpers/auto-command-outcome';
 import { restartSessionForSettingsChange } from './session-reconcile';
 import type { Task, Swimlane, SessionRecord, TaskUpdateInput } from '../../../shared/types';
+import type { AtomicRouteInput } from '../../db/repositories/task-repository';
 
 /**
  * Per-task AbortController to cancel in-flight moves when a newer move
@@ -54,6 +55,38 @@ import type { Task, Swimlane, SessionRecord, TaskUpdateInput } from '../../../sh
  * AbortError when cancelled, and cleanup is centralized in a single catch.
  */
 const taskMoveControllers = new Map<string, AbortController>();
+const routeDispatchCompletions = new Map<string, Promise<void>>();
+
+export function routeLifecycleNeedsRecovery(task: Pick<Task, 'pending_dispatch_id'> | null | undefined, dispatchId: string): boolean {
+  return Boolean(task && task.pending_dispatch_id === dispatchId);
+}
+
+export async function retireOrphanTaskSessions(
+  sessionManager: IpcContext['sessionManager'],
+  taskId: string,
+): Promise<void> {
+  const orphanIds = sessionManager.listSessions()
+    .filter((session) => session.taskId === taskId)
+    .map((session) => session.id);
+  sessionManager.killByTaskId(taskId);
+  await Promise.all(orphanIds.map((sessionId) => sessionManager.awaitExit(sessionId)));
+  sessionManager.removeByTaskId(taskId);
+}
+
+export function restorePendingRouteDestination(
+  tasks: ReturnType<typeof getProjectRepos>['tasks'],
+  swimlanes: ReturnType<typeof getProjectRepos>['swimlanes'],
+  task: Task,
+  input: { taskId: string; targetSwimlaneId: string; targetPosition: number },
+): Task {
+  if (task.swimlane_id === input.targetSwimlaneId) return task;
+  const currentLane = swimlanes.getById(task.swimlane_id);
+  if (currentLane?.role !== 'todo') throw new Error('Cannot recover router lifecycle from an unexpected column');
+  tasks.move(input);
+  const restored = tasks.getById(input.taskId);
+  if (!restored) throw new Error('Task disappeared while restoring a pending route');
+  return restored;
+}
 
 /**
  * Suspend a live PTY session so Phase 3 can respawn it with new CLI flags:
@@ -240,7 +273,13 @@ const MOVE_PUSH_BY_ORIGIN: Record<
 
 export async function handleTaskMove(
   context: IpcContext,
-  input: { taskId: string; targetSwimlaneId: string; targetPosition: number },
+  input: {
+    taskId: string;
+    targetSwimlaneId: string;
+    targetPosition: number;
+    expectedSwimlaneId?: string;
+    expectedRevision?: number;
+  },
   origin: TaskMoveOrigin,
   projectId?: string | null,
   projectPath?: string | null,
@@ -255,8 +294,32 @@ export async function handleTaskMove(
   // answer someone on a deadline (the mobile bridge verb, against the phone's
   // 10s per-verb budget) answers on this signal and lets the tail finish behind
   // the response. Every other caller keeps awaiting the whole move.
-  options?: { continuationPrompt?: string; onCommitted?: () => void },
+  options?: { continuationPrompt?: string; onCommitted?: () => void; route?: AtomicRouteInput },
 ): Promise<void> {
+  // MCP clients may retry after a network timeout while the original route is
+  // still creating a worktree. A normal newer move intentionally aborts the
+  // previous one; the SAME dispatch must instead join it, or the retry would
+  // cancel the one operation it is trying to confirm.
+  const routeDispatchId = options?.route?.dispatchId;
+  if (routeDispatchId) {
+    const active = routeDispatchCompletions.get(routeDispatchId);
+    if (active) return active;
+  }
+  const routeSettlement: {
+    resolve?: () => void;
+    reject?: (error: unknown) => void;
+  } = {};
+  if (routeDispatchId) {
+    const completion = new Promise<void>((resolve, reject) => {
+      routeSettlement.resolve = resolve;
+      routeSettlement.reject = reject;
+    });
+    // The originating caller receives the real throw below. This catch only
+    // prevents an unhandled-rejection warning when nobody happened to retry.
+    void completion.catch(() => undefined);
+    routeDispatchCompletions.set(routeDispatchId, completion);
+  }
+  try {
   // Abort any in-flight move or promotion BEFORE queueing on the lock - the
   // existing holder must see its abort and return so we can acquire the lock.
   taskMoveControllers.get(input.taskId)?.abort();
@@ -328,12 +391,18 @@ export async function handleTaskMove(
       if (!resolvedProjectId) throw new Error('No project is currently open');
 
       const { tasks, swimlanes, attachments } = getProjectRepos(context, resolvedProjectId);
-      const task = tasks.getById(input.taskId);
+      let task = tasks.getById(input.taskId);
       if (!task) throw new Error(`Task ${input.taskId} not found`);
+      if (input.expectedSwimlaneId !== undefined && task.swimlane_id !== input.expectedSwimlaneId) {
+        throw new Error('Task column changed before the guarded move');
+      }
+      if (input.expectedRevision !== undefined && task.revision !== input.expectedRevision) {
+        throw new Error('Task revision changed before the guarded move');
+      }
 
-      const fromSwimlaneId = task.swimlane_id;
-      const originalPosition = task.position;
-      const fromLane = swimlanes.getById(fromSwimlaneId);
+      let fromSwimlaneId = task.swimlane_id;
+      let originalPosition = task.position;
+      let fromLane = swimlanes.getById(fromSwimlaneId);
       // Board Profiles: fold the task's profile over the destination column
       // ONCE, here, so every read below (agent resolution, the injection plan's
       // model/effort delta, the effort restart check, auto_command) sees the
@@ -346,6 +415,49 @@ export async function handleTaskMove(
       // spawnAgent would have switched it. Same task, different horsepower
       // depending on whether a session happened to be live.
       const rawToLane = swimlanes.getById(input.targetSwimlaneId);
+
+      if (options?.route) {
+        const routed = tasks.routeFromTodo(options.route);
+        if (routed.status === 'duplicate') {
+          let committed = tasks.getById(input.taskId);
+          // A completed lifecycle cleared pending_dispatch_id when its session
+          // row was inserted. A retry is then a true no-op. If it is still
+          // pending, the atomic DB move landed but lifecycle/spawn did not;
+          // resume it instead of stranding the card outside To Do forever.
+          if (!committed || !routeLifecycleNeedsRecovery(committed, options.route.dispatchId)) return null;
+
+          // A failed spawn rolls the row back to To Do but deliberately keeps
+          // the pending dispatch. Restore the authorized destination before
+          // continuing; otherwise Phase 3 sees To Do and skips the spawn.
+          committed = restorePendingRouteDestination(tasks, swimlanes, committed, input);
+
+          // A crash can occur after the PTY is born but before task/session rows
+          // are durable. Retire any such in-memory orphan before re-spawning so
+          // recovery never creates two agents for one dispatch.
+          await retireOrphanTaskSessions(context.sessionManager, committed.id);
+          if (committed.session_id) tasks.update({ id: committed.id, session_id: null });
+
+          const todoLane = swimlanes.list().find((lane) => lane.role === 'todo');
+          if (!todoLane) throw new Error('Cannot recover router lifecycle: To Do column is missing');
+          fromSwimlaneId = todoLane.id;
+          fromLane = todoLane;
+          originalPosition = tasks.nextPositionInSwimlane(todoLane.id);
+        }
+        const refreshed = tasks.getById(input.taskId);
+        if (!refreshed) throw new Error(`Task ${input.taskId} disappeared after route commit`);
+        task = refreshed;
+      } else {
+        // Ordinary UI/MCP moves retain the established repository path.
+        tasks.move(input);
+        // Leaving the quiet Draft is the human GO boundary. Detach the Trello
+        // mirror in the same locked lifecycle before any worktree/session work,
+        // so a scheduled sync can never reclaim or overwrite the active task.
+        if (fromLane?.name === 'Draft' && task.external_source === 'trello_draft') {
+          tasks.detachExternalDraft(task.id);
+          task = tasks.getById(task.id) ?? task;
+        }
+      }
+
       const toLane = applyProfileToLane(rawToLane, loadTaskProfile(context, task, resolvedProjectPath)) ?? rawToLane;
 
       // Only send the full prompt template (title + description + attachments) when
@@ -358,9 +470,6 @@ export async function handleTaskMove(
       // auto_command. The user is restoring the task to inspect it; the next
       // move injects per column config. See spawnAgent's `suppressAutoCommand`.
       const suppressAutoCommand = fromLane?.role === 'done';
-
-      // Move the task in the database
-      tasks.move(input);
 
       // Atomic archive for Done-role target: run synchronously in the same tick
       // as tasks.move so no reader can observe the intermediate state
@@ -1324,6 +1433,15 @@ export async function handleTaskMove(
       if (moveSucceeded) {
         autoLinkPRForTask(context, input.taskId, announceProjectId);
       }
+    }
+  }
+  } catch (error) {
+    routeSettlement.reject?.(error);
+    throw error;
+  } finally {
+    routeSettlement.resolve?.();
+    if (routeDispatchId && routeDispatchCompletions.get(routeDispatchId)) {
+      routeDispatchCompletions.delete(routeDispatchId);
     }
   }
 }

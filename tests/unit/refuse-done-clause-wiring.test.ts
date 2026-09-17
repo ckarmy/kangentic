@@ -175,17 +175,13 @@ describe('handleMoveTaskToProject refuseDone wiring', () => {
     expect(source.onTaskDeleted).not.toHaveBeenCalled();
   });
 
-  it('resolves a non-Done target (Merge) normally, completing the move', () => {
-    // Proves the refusal is Done-specific, not a blanket failure that would
-    // make the "refuses Done" test above pass for the wrong reason.
-    mockTaskRepoCreate.mockReturnValue({ id: 'task-2', display_id: 8, title: 'Relocate me', swimlane_id: 'lane-merge' });
+  it('refuses a non-To Do target so project relocation cannot bypass routing', () => {
 
     const response = handleMoveTaskToProject({ taskId: 'task-1', column: 'Merge' }, source, target);
 
-    expect(response.success).toBe(true);
-    expect(mockTaskRepoCreate).toHaveBeenCalledWith(
-      expect.objectContaining({ swimlane_id: 'lane-merge' }),
-    );
+    expect(response.success).toBe(false);
+    expect(response.error).toContain('To Do');
+    expect(mockTaskRepoCreate).not.toHaveBeenCalled();
   });
 });
 
@@ -212,15 +208,11 @@ describe('handlePromoteBacklog refuseDone wiring', () => {
     expect(result.error).toContain('kangentic_move_task');
   });
 
-  it('resolves a non-Done target (Merge) normally, falling through to the item lookup', () => {
-    // Proves the refusal is Done-specific: naming a real, non-Done column
-    // reaches the item lookup instead (and fails there only because the
-    // fixture ID does not exist in the mocked backlog).
+  it('refuses a non-To Do target so backlog promotion cannot bypass routing', () => {
     const result = handlePromoteBacklog({ itemIds: ['missing-item'], column: 'Merge' }, context);
 
     expect(result.success).toBe(false);
-    expect(result.error).toMatch(/^No backlog tasks found for the provided IDs\./);
-    expect(result.error).not.toContain('completed column');
+    expect(result.error).toContain('only to To Do');
   });
 });
 
@@ -251,21 +243,12 @@ describe('handleCreateTask refuseDone wiring', () => {
     expect(context.onTaskCreated).not.toHaveBeenCalled();
   });
 
-  it('resolves a non-Done target (Merge) normally, creating the task there', async () => {
-    // Proves the refusal is Done-specific, not a blanket failure that would
-    // make the "refuses Done" test above pass for the wrong reason.
-    mockTaskRepoCreate.mockReturnValue({
-      id: 'task-3',
-      display_id: 9,
-      title: 'New task',
-      swimlane_id: 'lane-merge',
-    });
+  it('refuses creating directly in an active workflow column', async () => {
 
     const response = await handleCreateTask({ title: 'New task', column: 'Merge' }, context);
 
-    expect(response.success).toBe(true);
-    expect(mockTaskRepoCreate).toHaveBeenCalledWith(
-      expect.objectContaining({ swimlane_id: 'lane-merge' }),
-    );
+    expect(response.success).toBe(false);
+    expect(response.error).toContain('only in Draft or To Do');
+    expect(mockTaskRepoCreate).not.toHaveBeenCalled();
   });
 });

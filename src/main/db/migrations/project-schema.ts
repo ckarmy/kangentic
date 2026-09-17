@@ -24,6 +24,8 @@ export function runProjectMigrations(db: Database.Database): void {
 
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
+      revision INTEGER NOT NULL DEFAULT 0,
+      pending_dispatch_id TEXT DEFAULT NULL,
       title TEXT NOT NULL,
       description TEXT NOT NULL DEFAULT '',
       swimlane_id TEXT NOT NULL REFERENCES swimlanes(id),
@@ -41,6 +43,35 @@ export function runProjectMigrations(db: Database.Database): void {
     );
 
     CREATE INDEX IF NOT EXISTS idx_tasks_swimlane_position ON tasks(swimlane_id, position);
+
+    CREATE TABLE IF NOT EXISTS route_dispatches (
+      dispatch_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      expected_fingerprint TEXT NOT NULL,
+      policy_version TEXT NOT NULL,
+      profile_id TEXT NOT NULL,
+      target_swimlane_id TEXT NOT NULL REFERENCES swimlanes(id),
+      workflow TEXT NOT NULL,
+      committed_revision INTEGER NOT NULL,
+      session_id TEXT DEFAULT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_route_dispatches_task_id ON route_dispatches(task_id);
+
+    CREATE TABLE IF NOT EXISTS route_stage_completions (
+      dispatch_id TEXT NOT NULL REFERENCES route_dispatches(dispatch_id) ON DELETE CASCADE,
+      stage TEXT NOT NULL,
+      task_revision INTEGER NOT NULL,
+      target_swimlane_id TEXT NOT NULL REFERENCES swimlanes(id),
+      status TEXT NOT NULL CHECK(status IN ('pending', 'completed', 'failed')),
+      error TEXT DEFAULT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (dispatch_id, stage, task_revision)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_route_stage_completions_dispatch
+      ON route_stage_completions(dispatch_id, updated_at);
 
     CREATE TABLE IF NOT EXISTS actions (
       id TEXT PRIMARY KEY,
@@ -62,6 +93,7 @@ export function runProjectMigrations(db: Database.Database): void {
 
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
+      dispatch_id TEXT UNIQUE,
       task_id TEXT NOT NULL REFERENCES tasks(id),
       session_type TEXT NOT NULL,
       agent_session_id TEXT,
@@ -96,6 +128,35 @@ export function runProjectMigrations(db: Database.Database): void {
       agent TEXT,
       effort TEXT
     );
+  `);
+
+  // A single monotonic token covers every task mutation, including legacy
+  // update paths that do not know about the router. The WHEN clause also makes
+  // this safe if recursive_triggers is enabled: the trigger's own UPDATE has a
+  // changed revision and therefore cannot recurse.
+  const hasTaskRevision = (db.pragma('table_info(tasks)') as Array<{ name: string }>)
+    .some((col) => col.name === 'revision');
+  if (!hasTaskRevision) {
+    db.exec('ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0');
+  }
+  const hasPendingDispatch = (db.pragma('table_info(tasks)') as Array<{ name: string }>)
+    .some((col) => col.name === 'pending_dispatch_id');
+  if (!hasPendingDispatch) {
+    db.exec('ALTER TABLE tasks ADD COLUMN pending_dispatch_id TEXT DEFAULT NULL');
+  }
+  const routeDispatchColumns = new Set(
+    (db.pragma('table_info(route_dispatches)') as Array<{ name: string }>).map((col) => col.name),
+  );
+  if (!routeDispatchColumns.has('session_id')) {
+    db.exec('ALTER TABLE route_dispatches ADD COLUMN session_id TEXT DEFAULT NULL');
+  }
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS tasks_revision_after_update
+    AFTER UPDATE ON tasks
+    FOR EACH ROW WHEN NEW.revision = OLD.revision
+    BEGIN
+      UPDATE tasks SET revision = OLD.revision + 1 WHERE id = OLD.id;
+    END;
   `);
 
   // Migration: add 'role' column for existing databases
@@ -335,6 +396,12 @@ export function runProjectMigrations(db: Database.Database): void {
     .some((col) => col.name === 'suspended_by');
   if (!hasSuspendedBy) {
     db.exec("ALTER TABLE sessions ADD COLUMN suspended_by TEXT DEFAULT NULL");
+  }
+  const hasSessionDispatchId = (db.pragma('table_info(sessions)') as Array<{ name: string }>)
+    .some((col) => col.name === 'dispatch_id');
+  if (!hasSessionDispatchId) {
+    db.exec('ALTER TABLE sessions ADD COLUMN dispatch_id TEXT DEFAULT NULL');
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_dispatch_id ON sessions(dispatch_id) WHERE dispatch_id IS NOT NULL');
   }
 
   // Migration: add 'is_ghost' column to swimlanes
@@ -1106,6 +1173,13 @@ export function runProjectMigrations(db: Database.Database): void {
 
   // Import dedup scans promoted board tasks by external origin (mirrors idx_backlog_external).
   db.exec('CREATE INDEX IF NOT EXISTS idx_tasks_external ON tasks(external_source, external_id)');
+  // The Luuk Trello mirror is an idempotent ingress. A response can be lost
+  // after commit, so retries must be prevented from creating a second board
+  // task for the same card. Scope the uniqueness to this integration only;
+  // upstream connectors retain their existing semantics.
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_trello_draft_external_unique
+    ON tasks(external_id)
+    WHERE external_source IN ('trello_draft', 'trello_draft_detached') AND external_id IS NOT NULL`);
 
   // usage_history query indices (usage-dashboard period bucketing uses session_started_at).
   db.exec('CREATE INDEX IF NOT EXISTS idx_usage_history_session_started_at ON usage_history(session_started_at)');

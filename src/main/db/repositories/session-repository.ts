@@ -66,28 +66,50 @@ export class SessionRepository {
   constructor(private db: Database.Database) {}
 
   insert(record: SessionInsertInput): SessionRecord {
-    this.db.prepare(`
-      INSERT INTO sessions (id, task_id, session_type, isolated_swimlane_id, agent_session_id, command, cwd, permission_mode, prompt, status, exit_code, started_at, suspended_at, exited_at, suspended_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      record.id,
-      record.task_id,
-      record.session_type,
-      record.isolated_swimlane_id,
-      record.agent_session_id,
-      record.command,
-      record.cwd,
-      record.permission_mode,
-      record.prompt,
-      record.status,
-      record.exit_code,
-      record.started_at,
-      record.suspended_at,
-      record.exited_at,
-      record.suspended_by,
-    );
+    let dispatchId: string | null = record.dispatch_id ?? null;
+    if (!dispatchId) {
+      const task = this.db.prepare('SELECT pending_dispatch_id FROM tasks WHERE id = ?')
+        .get(record.task_id) as { pending_dispatch_id: string | null } | undefined;
+      dispatchId = task?.pending_dispatch_id ?? null;
+    }
+    const insertRecord = (): void => {
+      this.db.prepare(`
+        INSERT INTO sessions (id, dispatch_id, task_id, session_type, isolated_swimlane_id, agent_session_id, command, cwd, permission_mode, prompt, status, exit_code, started_at, suspended_at, exited_at, suspended_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        record.id,
+        dispatchId,
+        record.task_id,
+        record.session_type,
+        record.isolated_swimlane_id,
+        record.agent_session_id,
+        record.command,
+        record.cwd,
+        record.permission_mode,
+        record.prompt,
+        record.status,
+        record.exit_code,
+        record.started_at,
+        record.suspended_at,
+        record.exited_at,
+        record.suspended_by,
+      );
+      if (dispatchId) {
+        this.db.prepare('UPDATE tasks SET pending_dispatch_id = NULL WHERE id = ? AND pending_dispatch_id = ?')
+          .run(record.task_id, dispatchId);
+        this.db.prepare('UPDATE route_dispatches SET session_id = ? WHERE dispatch_id = ? AND task_id = ?')
+          .run(record.id, dispatchId, record.task_id);
+      }
+    };
+    // The common non-router path remains one INSERT (and stays compatible with
+    // lightweight repository mocks). A pending dispatch additionally clears
+    // the task marker and links the audit row, so those three writes commit as
+    // one unit.
+    if (dispatchId) this.db.transaction(insertRecord)();
+    else insertRecord();
     return {
       ...record,
+      ...(dispatchId ? { dispatch_id: dispatchId } : {}),
       total_cost_usd: null,
       total_input_tokens: null,
       total_output_tokens: null,

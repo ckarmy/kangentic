@@ -92,6 +92,7 @@ function configReader(enabled: boolean): () => ResolvedBrowserAutomationConfig {
 async function listToolNames(
   browserEnabled: boolean,
   steering?: SteeringToolDependencies | null,
+  taskSessionScoped = false,
 ): Promise<string[]> {
   const server = buildConfiguredMcpServer(
     makeResolver(),
@@ -102,6 +103,8 @@ async function listToolNames(
     // built with unscoped browser tools; the scoping behavior itself is covered
     // by mcp-browser-tools-project-scope.test.ts.
     { projectId: 'p1' },
+    undefined,
+    taskSessionScoped,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'guard', version: '1.0.0' });
@@ -112,6 +115,31 @@ async function listToolNames(
   await server.close();
   return tools.map((tool) => tool.name);
 }
+
+describe('buildConfiguredMcpServer - task-session authority', () => {
+  it('omits board/profile administration and generic lifecycle moves from running agents', async () => {
+    const names = await listToolNames(false, null, true);
+    expect(names).not.toContain('kangentic_move_task');
+    expect(names).not.toContain('kangentic_create_task');
+    expect(names).not.toContain('kangentic_update_task');
+    expect(names).not.toContain('kangentic_delete_task');
+    expect(names).not.toContain('kangentic_route_task');
+    expect(names).not.toContain('kangentic_sync_external_draft');
+    expect(names).not.toContain('kangentic_update_column');
+    expect(names).not.toContain('kangentic_create_column');
+    expect(names).not.toContain('kangentic_delete_column');
+    expect(names).not.toContain('kangentic_create_board_profile');
+    expect(names).toContain('kangentic_complete_route_stage');
+    expect(names).toContain('kangentic_get_usage_stats');
+  });
+
+  it('keeps administrative tools on the unscoped local integration endpoint', async () => {
+    const names = await listToolNames(false, null, false);
+    expect(names).toContain('kangentic_move_task');
+    expect(names).toContain('kangentic_update_column');
+    expect(names).toContain('kangentic_create_board_profile');
+  });
+});
 
 /** A minimal, valid SteeringToolDependencies stub - only the shape matters for gating. */
 function fakeSteeringDependencies(): SteeringToolDependencies {

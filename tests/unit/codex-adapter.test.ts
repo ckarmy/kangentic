@@ -77,6 +77,12 @@ describe('Codex Adapter', () => {
       expect(command).toContain('--disable apps');
     });
 
+    it('applies the per-column reasoning effort on a fresh session', () => {
+      const command = adapter.buildCommand(makeOptions({ effort: 'medium' }));
+      expect(command).toContain('-c');
+      expect(command).toContain('model_reasoning_effort=medium');
+    });
+
     it('omits --disable apps when the disableApps launch option is false', () => {
       const command = adapter.buildCommand(makeOptions({ launchOptions: { disableApps: false } }));
       expect(command).not.toContain('--disable');
@@ -124,6 +130,16 @@ describe('Codex Adapter', () => {
       }));
       expect(command).toContain('--model');
       expect(command).toContain('gpt-5.5');
+    });
+
+    it('resume command carries the per-column effort override', () => {
+      const command = adapter.buildCommand(makeOptions({
+        resume: true,
+        sessionId: 'sess-abc-123',
+        effort: 'high',
+      }));
+      expect(command).toContain('-c');
+      expect(command).toContain('model_reasoning_effort=high');
     });
 
     it('resume command omits prompt even if provided', () => {
@@ -271,15 +287,15 @@ describe('Codex Adapter', () => {
 
     // --- buildEnv, the other half of the pair ---
 
-    it('buildEnv returns only the MCP token variable when fully configured', () => {
+    it('buildEnv fixes TERM and adds the MCP token variable when fully configured', () => {
       const env = adapter.buildEnv(withMcp());
-      expect(env).toEqual({ KANGENTIC_MCP_TOKEN: TOKEN });
+      expect(env).toEqual({ TERM: 'xterm-256color', KANGENTIC_MCP_TOKEN: TOKEN });
     });
 
-    it('buildEnv returns null when disabled or incompletely configured', () => {
-      expect(adapter.buildEnv(withMcp({ mcpServerEnabled: false }))).toBeNull();
-      expect(adapter.buildEnv(withMcp({ mcpServerUrl: undefined }))).toBeNull();
-      expect(adapter.buildEnv(withMcp({ mcpServerToken: undefined }))).toBeNull();
+    it('buildEnv still fixes TERM but omits the token when MCP is disabled or incomplete', () => {
+      expect(adapter.buildEnv(withMcp({ mcpServerEnabled: false }))).toEqual({ TERM: 'xterm-256color' });
+      expect(adapter.buildEnv(withMcp({ mcpServerUrl: undefined }))).toEqual({ TERM: 'xterm-256color' });
+      expect(adapter.buildEnv(withMcp({ mcpServerToken: undefined }))).toEqual({ TERM: 'xterm-256color' });
     });
 
     it('the env_http_headers override names the same variable buildEnv sets', () => {
@@ -288,7 +304,8 @@ describe('Codex Adapter', () => {
       const headerValue = command.match(
         /mcp_servers\.kangentic\.env_http_headers\.X-Kangentic-Token=([A-Z_]+)/,
       )?.[1];
-      expect(headerValue).toBe(Object.keys(adapter.buildEnv(withMcp())!)[0]);
+      expect(headerValue).toBe('KANGENTIC_MCP_TOKEN');
+      expect(adapter.buildEnv(withMcp())?.[headerValue!]).toBe(TOKEN);
     });
 
     it('flag emission and buildEnv agree across the whole gate matrix', () => {
@@ -307,7 +324,7 @@ describe('Codex Adapter', () => {
             expect(
               adapter.buildCommand(options).includes('mcp_servers'),
               `flag/env disagreement at ${cell}`,
-            ).toBe(adapter.buildEnv(options) !== null);
+            ).toBe(Object.hasOwn(adapter.buildEnv(options)!, 'KANGENTIC_MCP_TOKEN'));
           }
         }
       }
@@ -327,10 +344,11 @@ describe('Codex Adapter', () => {
       expect(command).toContain('--ask-for-approval never');
     });
 
-    it("maps 'default' to --sandbox workspace-write --ask-for-approval untrusted", () => {
+    it("maps 'default' to --sandbox workspace-write --ask-for-approval on-request", () => {
       const command = adapter.buildCommand(makeOptions({ permissionMode: 'default' }));
       expect(command).toContain('--sandbox workspace-write');
-      expect(command).toContain('--ask-for-approval untrusted');
+      expect(command).toContain('--ask-for-approval on-request');
+      expect(command).not.toContain('--ask-for-approval untrusted');
     });
 
     it("maps 'acceptEdits' to --sandbox workspace-write --ask-for-approval never", () => {

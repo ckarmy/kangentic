@@ -224,6 +224,15 @@ function registerNoOpUpdaterHandlers(): void {
  * marker AND an app-update.yml, exactly like the NSIS and DMG builds.
  */
 export function initUpdater(mainWindow: BrowserWindow): void {
+  // Local Luuk builds are reviewed by the weekly upstream audit and must not
+  // replace themselves with an unsigned/different upstream artifact. They also
+  // use a prerelease version that GitHub's published-release feed cannot
+  // resolve, which would otherwise emit an error on every launch.
+  if (app.getVersion().includes('-luuk.')) {
+    console.log(`[UPDATER] Disabled for local build ${app.getVersion()}.`);
+    registerNoOpUpdaterHandlers();
+    return;
+  }
   if (!app.isPackaged) {
     // The renderer's release-notes modal reaches `installUpdate()` from its
     // primary button, and the Developer tab can open that modal with fixture

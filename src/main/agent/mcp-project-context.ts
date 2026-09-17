@@ -115,6 +115,11 @@ export function buildCommandContextForProject(
       ipcContext.boardEvents.emitBoardChanged({ projectId, change: 'task-updated', ids: [task.id] });
     },
 
+    onTaskPrepared: (task) => {
+      sendToRenderer(ipcContext.mainWindow, IPC.TASK_PR_LINK_CHANGED, projectId);
+      ipcContext.boardEvents.emitBoardChanged({ projectId, change: 'task-updated', ids: [task.id] });
+    },
+
     // Same board invalidation as onTaskUpdated, on the quiet channel. Used by
     // the link-time PR re-resolve, which is a write the app fired in response
     // to the agent's write - the agent's own call already toasted, and the
@@ -183,6 +188,10 @@ export function buildCommandContextForProject(
     // purely to recover a title for the toast.
     onTaskMove: async (input) => {
       await handleTaskMove(ipcContext, input, 'agent', projectId, projectPath);
+    },
+
+    onTaskRoute: async (input) => {
+      await handleTaskMove(ipcContext, input, 'agent', projectId, projectPath, { route: input });
     },
 
     onTasksReordered: (swimlane, orderedTaskIds) => {

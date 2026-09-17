@@ -532,17 +532,12 @@ describe.runIf(CAN_RUN)('handleCreateColumn / handleDeleteColumn', () => {
   // on an existing column), since each threads its own resolveColumn call.
   // -------------------------------------------------------------------------
 
-  it('handleCreateColumn resolves planExitTargetColumn: "Done" via includeArchivedDone', () => {
-    // Red trigger: drop the `{ includeArchivedDone: true }` options argument
-    // from handleCreateColumn's resolveColumn call - Done is archived by
-    // default, so the response would fail with "Column not found" instead.
+  it('handleCreateColumn refuses planExitTargetColumn: "Done"', () => {
     const response = handleCreateColumn({ name: 'Brand Review', planExitTargetColumn: 'Done' }, context);
 
-    expect(response.success).toBe(true);
-    const done = repository.list().find((lane) => lane.role === 'done');
-    expect(done).toBeDefined();
-    const created = repository.getById((response.data as { id: string }).id);
-    expect(created?.plan_exit_target_id).toBe(done!.id);
+    expect(response.success).toBe(false);
+    expect(response.error).toContain('human approval');
+    expect(repository.list().some((lane) => lane.name === 'Brand Review')).toBe(false);
   });
 
   it('handleCreateColumn reports an error for a genuinely unknown planExitTargetColumn, without creating the column', () => {
@@ -553,17 +548,14 @@ describe.runIf(CAN_RUN)('handleCreateColumn / handleDeleteColumn', () => {
     expect(repository.list().some((lane) => lane.name === 'Brand Review')).toBe(false);
   });
 
-  it('handleUpdateColumn resolves planExitTargetColumn: "Done" via includeArchivedDone', () => {
-    // Same red trigger as the create-side test above, against
-    // handleUpdateColumn's own resolveColumn call.
+  it('handleUpdateColumn refuses planExitTargetColumn: "Done"', () => {
     const lane = repository.create({ name: 'Brand Review' });
 
     const response = handleUpdateColumn({ column: 'Brand Review', planExitTargetColumn: 'Done' }, context);
 
-    expect(response.success).toBe(true);
-    const done = repository.list().find((swimlane) => swimlane.role === 'done');
-    expect(done).toBeDefined();
-    expect(repository.getById(lane.id)?.plan_exit_target_id).toBe(done!.id);
+    expect(response.success).toBe(false);
+    expect(response.error).toContain('human approval');
+    expect(repository.getById(lane.id)?.plan_exit_target_id).toBeNull();
   });
 
   it('handleUpdateColumn reports an error for a genuinely unknown planExitTargetColumn, without changing the column', () => {

@@ -38,7 +38,7 @@ export interface CodexCommandOptions {
  * pair `--sandbox <mode>` and `--ask-for-approval <policy>`. Mappings:
  *   plan        → Safe read-only browsing (model can request escalation)
  *   dontAsk     → Read-only non-interactive (CI; failures returned to model)
- *   default     → Workspace-write, escalate on untrusted commands
+ *   default     → Workspace-write, ask when Codex needs approval
  *   acceptEdits → Workspace-write, never ask (replaces old --full-auto)
  *   auto        → Workspace-write, model decides when to ask
  *   bypass      → Dangerous full access (no sandbox, no approval)
@@ -50,7 +50,10 @@ function mapPermissionMode(mode: PermissionMode): string[] {
     case 'dontAsk':
       return ['--sandbox', 'read-only', '--ask-for-approval', 'never'];
     case 'default':
-      return ['--sandbox', 'workspace-write', '--ask-for-approval', 'untrusted'];
+      // Codex 0.153 removed the legacy `untrusted` approval value. `on-request`
+      // preserves the intended interactive safety boundary without preventing
+      // ordinary workspace edits.
+      return ['--sandbox', 'workspace-write', '--ask-for-approval', 'on-request'];
     case 'acceptEdits':
       return ['--sandbox', 'workspace-write', '--ask-for-approval', 'never'];
     case 'auto':
@@ -192,6 +195,13 @@ export class CodexCommandBuilder {
       parts.push('--model', quoteArg(options.model.trim(), shell));
     }
 
+    // Codex exposes reasoning effort through its per-process config override,
+    // not a dedicated flag. Apply it on both fresh and resumed sessions so the
+    // model/effort shown by Kangentic matches what the CLI actually runs.
+    if (options.effort && options.effort.trim().length > 0) {
+      parts.push('-c', quoteArg(`model_reasoning_effort=${options.effort.trim()}`, shell));
+    }
+
     // Kangentic's MCP server. Must precede the positional prompt, since
     // Codex's grammar is `codex [OPTIONS] [PROMPT]`.
     parts.push(...buildMcpConfigArgs(options));
@@ -229,8 +239,13 @@ export class CodexCommandBuilder {
    * the spawn chokepoints coalesce to "no env override at all".
    */
   buildCodexEnv(options: CodexCommandOptions): Record<string, string> | null {
-    if (!codexMcpWiringEnabled(options)) return null;
-    return { [KANGENTIC_MCP_TOKEN_ENV]: options.mcpServerToken };
+    // Electron/ConPTY can inherit TERM=dumb from the desktop launcher. Codex
+    // refuses to start its interactive TUI in that environment before it ever
+    // reads the task prompt. Kangentic provides a real ANSI-capable PTY, so
+    // advertise the terminal it actually emulates for every Codex launch.
+    const env: Record<string, string> = { TERM: 'xterm-256color' };
+    if (codexMcpWiringEnabled(options)) env[KANGENTIC_MCP_TOKEN_ENV] = options.mcpServerToken;
+    return env;
   }
 
   interpolateTemplate(template: string, variables: Record<string, string>): string {

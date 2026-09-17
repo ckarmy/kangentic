@@ -24,6 +24,43 @@ import type { CommandContext, CommandHandler, CommandResponse } from './types';
 import type { Task, TaskUpdateInput, PermissionMode, TaskRunMode } from '../../../shared/types';
 
 export const TASK_DESCRIPTION_MAX_LENGTH = 50_000;
+const DRAFT_PREPARATION_BLOCK_RE = /<!-- kangentic-draft:v1 source=[a-f0-9]{64} -->\r?\n[\s\S]*?\r?\n<!-- \/kangentic-draft -->/gi;
+
+function mergeDraftPreparationBlock(current: string, block: string): DescriptionEditResult {
+  const trimmed = block.trim();
+  const matches = current.match(DRAFT_PREPARATION_BLOCK_RE) ?? [];
+  DRAFT_PREPARATION_BLOCK_RE.lastIndex = 0;
+  if (!/^<!-- kangentic-draft:v1 source=[a-f0-9]{64} -->\r?\n## Preparación Kangentic\r?\n/i.test(trimmed)
+      || !trimmed.endsWith('<!-- /kangentic-draft -->')
+      || (trimmed.match(/<!-- kangentic-draft:v1 source=/gi) ?? []).length !== 1
+      || (trimmed.match(/<!-- \/kangentic-draft -->/gi) ?? []).length !== 1) {
+    return { success: false, error: 'block must be exactly one Kangentic Draft preparation block' };
+  }
+  const next = matches.length === 0
+    ? `${current}${current.trim() ? '\n\n' : ''}${trimmed}`
+    : matches.length === 1 ? current.replace(matches[0], trimmed) : '';
+  if (matches.length > 1) return { success: false, error: 'Draft contains more than one preparation block' };
+  if (next.length > TASK_DESCRIPTION_MAX_LENGTH) {
+    return { success: false, error: `Resulting description would exceed ${TASK_DESCRIPTION_MAX_LENGTH} characters` };
+  }
+  return { success: true, text: next };
+}
+
+function stripDraftPreparationBlocks(description: string): string {
+  DRAFT_PREPARATION_BLOCK_RE.lastIndex = 0;
+  const stripped = description.replace(DRAFT_PREPARATION_BLOCK_RE, '').trimEnd();
+  DRAFT_PREPARATION_BLOCK_RE.lastIndex = 0;
+  return stripped;
+}
+
+function preserveDraftPreparationBlock(baseDescription: string, currentDescription: string): string {
+  DRAFT_PREPARATION_BLOCK_RE.lastIndex = 0;
+  const matches = currentDescription.match(DRAFT_PREPARATION_BLOCK_RE) ?? [];
+  DRAFT_PREPARATION_BLOCK_RE.lastIndex = 0;
+  return matches.length === 1
+    ? `${baseDescription}${baseDescription.trim() ? '\n\n' : ''}${matches[0]}`
+    : baseDescription;
+}
 
 export interface DescriptionEdit {
   find: string;
@@ -197,7 +234,8 @@ export const handleCreateTask: CommandHandler = async (
   context: CommandContext,
 ) => {
   const title = String(params.title ?? '').slice(0, 200);
-  const description = String(params.description ?? '').slice(0, TASK_DESCRIPTION_MAX_LENGTH);
+  const description = stripDraftPreparationBlocks(String(params.description ?? ''))
+    .slice(0, TASK_DESCRIPTION_MAX_LENGTH);
   const columnName = params.column as string | null;
   const branchName = params.branchName as string | null;
   const baseBranch = params.baseBranch as string | null;
@@ -264,6 +302,9 @@ export const handleCreateTask: CommandHandler = async (
       }
     }
   }
+  if (labelNames.some((label) => label.trim().toLowerCase() === 'approved')) {
+    return { success: false, error: 'Agents may not grant the approved label; human action is required' };
+  }
 
   if (priority !== null && priority !== undefined && (priority < 0 || priority > 4)) {
     return { success: false, error: 'Priority must be 0-4 (0=none, 1=low, 2=medium, 3=high, 4=urgent)' };
@@ -301,6 +342,13 @@ export const handleCreateTask: CommandHandler = async (
     return { success: false, error: resolution.error };
   }
   const { swimlane: targetSwimlane } = resolution;
+  const isQuietDraft = targetSwimlane.name === 'Draft' && targetSwimlane.auto_spawn === false;
+  if (targetSwimlane.role !== 'todo' && !isQuietDraft) {
+    return {
+      success: false,
+      error: 'Agents may create board tasks only in Draft or To Do; the router is the only automatic entry to active columns',
+    };
+  }
 
   const task = taskRepo.create({
     title,
@@ -421,6 +469,21 @@ export const handleUpdateTask: CommandHandler = (
   const task = resolveTask(taskRepo, taskId);
   if (!task) {
     return { success: false, error: `Task "${taskId}" not found` };
+  }
+
+  if (task.external_source === 'trello_draft') {
+    return { success: false, error: 'Agents may not edit a Trello Draft mirror; promote it by human UI action first' };
+  }
+
+  const currentGuardLabels = task.labels.map((label) => label.trim().toLowerCase());
+  if (routerTaskHeld(currentGuardLabels) || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`)) {
+    return { success: false, error: 'Agents may not mutate a held or sensitive task; human action is required' };
+  }
+  if (newLabels !== null) {
+    const requestedLabels = newLabels.map((label) => label.trim().toLowerCase());
+    if (!currentGuardLabels.includes('approved') && requestedLabels.includes('approved')) {
+      return { success: false, error: 'Agents may not grant the approved label; human action is required' };
+    }
   }
 
   const updates: Record<string, unknown> = { id: task.id };
@@ -607,6 +670,162 @@ export const handleUpdateTask: CommandHandler = (
       ...(newAttachments !== null ? { attachmentCount: updated.attachment_count, attachmentsAdded } : {}),
     },
   };
+};
+
+/**
+ * Idempotent, atomic ingress for the read-only Trello Draft mirror.
+ *
+ * This deliberately is not a generic external-task upsert. Its source and
+ * label are fixed server-side, it can only touch the quiet Draft column, and a
+ * task becomes permanently detached the first time the server observes it
+ * outside Draft. The transaction closes the find/update race that would let a
+ * periodic sync overwrite work after a human promoted it.
+ */
+export const handleSyncExternalDraft: CommandHandler = (
+  params: Record<string, unknown>,
+  context: CommandContext,
+): CommandResponse => {
+  const externalId = String(params.externalId ?? '').trim();
+  const externalUrl = String(params.externalUrl ?? '').trim();
+  const title = String(params.title ?? '').trim().slice(0, 200);
+  const description = String(params.description ?? '').slice(0, TASK_DESCRIPTION_MAX_LENGTH);
+  if (!externalId || !externalUrl || !title) {
+    return { success: false, error: 'externalId, externalUrl, and title are required' };
+  }
+
+  const db = context.getProjectDb();
+  const draftResolution = resolveColumn(db, 'Draft', 'todo', { includeArchivedDone: false });
+  if ('error' in draftResolution || draftResolution.swimlane.name !== 'Draft'
+      || draftResolution.swimlane.auto_spawn !== false) {
+    return { success: false, error: 'A quiet Draft column with autoSpawn=false is required' };
+  }
+  const draftId = draftResolution.swimlane.id;
+  const repo = new TaskRepository(db);
+  type SyncAction = 'created' | 'updated' | 'unchanged' | 'detached';
+  let notifyTask: Task | undefined;
+
+  const outcome = db.transaction((): { action: SyncAction; task: Task } => {
+    const lookup = () => {
+      const row = db.prepare(`SELECT id FROM tasks
+        WHERE external_id = ? AND external_source IN ('trello_draft', 'trello_draft_detached')
+        ORDER BY created_at ASC LIMIT 1`).get(externalId) as { id: string } | undefined;
+      return row ? repo.getById(row.id) : undefined;
+    };
+
+    let task = lookup();
+    if (task) {
+      const detached = task.external_source === 'trello_draft_detached'
+        || task.archived_at !== null || task.swimlane_id !== draftId;
+      if (detached) {
+        if (task.external_source !== 'trello_draft_detached') {
+          db.prepare(`UPDATE tasks SET external_source = 'trello_draft_detached', updated_at = ?
+            WHERE id = ?`).run(new Date().toISOString(), task.id);
+          task = repo.getById(task.id) ?? task;
+        }
+        return { action: 'detached', task };
+      }
+
+      const labels = Array.from(new Set([...task.labels, 'trello']));
+      const syncedDescription = preserveDraftPreparationBlock(description, task.description);
+      const unchanged = task.title === title && task.description === syncedDescription
+        && task.external_url === externalUrl
+        && JSON.stringify(task.labels) === JSON.stringify(labels);
+      if (unchanged) return { action: 'unchanged', task };
+
+      // The lane/source predicates are defense in depth around the transaction:
+      // this write can never land on a task already detached by another path.
+      const changed = db.prepare(`UPDATE tasks
+        SET title = ?, description = ?, labels = ?, external_url = ?, updated_at = ?
+        WHERE id = ? AND swimlane_id = ? AND external_source = 'trello_draft' AND archived_at IS NULL`)
+        .run(title, syncedDescription, JSON.stringify(labels), externalUrl, new Date().toISOString(), task.id, draftId);
+      if (changed.changes !== 1) throw new Error('Draft changed before external sync commit');
+      task = repo.getById(task.id) ?? task;
+      notifyTask = task;
+      return { action: 'updated', task };
+    }
+
+    const created = repo.create({
+      title,
+      description,
+      swimlane_id: draftId,
+      labels: ['trello'],
+      priority: 0,
+      externalId,
+      externalSource: 'trello_draft',
+      externalUrl,
+      // Omit useWorktree: Draft is inert, and when promoted the task must
+      // inherit the project's isolation setting instead of pinning false.
+    });
+    notifyTask = created;
+    return { action: 'created', task: created };
+  })();
+
+  if (outcome.action === 'created') context.onTaskCreated(outcome.task, 'Draft', draftId);
+  else if (notifyTask) context.onTaskUpdated(notifyTask);
+  return {
+    success: true,
+    data: { action: outcome.action, taskId: outcome.task.id, revision: outcome.task.revision },
+    message: JSON.stringify({ action: outcome.action, taskId: outcome.task.id, revision: outcome.task.revision }),
+  };
+};
+
+/**
+ * Narrow, quiet write used by the trusted local pre-router.
+ *
+ * It can only append or replace the machine-owned preparation block of an
+ * unchanged task in an inert Draft column. It cannot alter labels, priority,
+ * project, column, session, worktree, or any other user-controlled field.
+ */
+export const handlePrepareDraft: CommandHandler = (
+  params: Record<string, unknown>,
+  context: CommandContext,
+): CommandResponse => {
+  const taskId = String(params.taskId ?? '').trim();
+  const expectedRevision = Number(params.expectedRevision);
+  const block = String(params.block ?? '');
+  if (!taskId || !Number.isInteger(expectedRevision) || expectedRevision < 0 || !block) {
+    return { success: false, error: 'taskId, expectedRevision, and block are required' };
+  }
+  if (block.length > 8_000) return { success: false, error: 'Preparation block is too large' };
+
+  const db = context.getProjectDb();
+  const draftResolution = resolveColumn(db, 'Draft', 'todo', { includeArchivedDone: false });
+  if ('error' in draftResolution || draftResolution.swimlane.name !== 'Draft'
+      || draftResolution.swimlane.auto_spawn !== false) {
+    return { success: false, error: 'A quiet Draft column with autoSpawn=false is required' };
+  }
+  const repo = new TaskRepository(db);
+  let updated: Task | undefined;
+  const outcome = db.transaction((): CommandResponse => {
+    const task = resolveTask(repo, taskId);
+    if (!task || task.archived_at !== null) return { success: false, error: `Task "${taskId}" not found` };
+    if (task.swimlane_id !== draftResolution.swimlane.id) {
+      return { success: false, error: 'Task is no longer in Draft' };
+    }
+    if (task.revision !== expectedRevision) {
+      return { success: false, error: `Task revision changed (expected ${expectedRevision}, found ${task.revision})` };
+    }
+    if (task.session_id || task.worktree_path || task.pending_dispatch_id) {
+      return { success: false, error: 'Draft preparation refuses tasks with execution state' };
+    }
+    const merged = mergeDraftPreparationBlock(task.description, block);
+    if (!merged.success) return merged;
+    if (merged.text === task.description) {
+      return { success: true, data: { action: 'unchanged', taskId: task.id, revision: task.revision } };
+    }
+    const changed = db.prepare(`UPDATE tasks SET description = ?, updated_at = ?
+      WHERE id = ? AND revision = ? AND swimlane_id = ? AND archived_at IS NULL`)
+      .run(merged.text, new Date().toISOString(), task.id, expectedRevision, draftResolution.swimlane.id);
+    if (changed.changes !== 1) return { success: false, error: 'Draft changed before preparation commit' };
+    updated = repo.getById(task.id);
+    if (!updated) return { success: false, error: 'Prepared Draft disappeared after commit' };
+    return { success: true, data: { action: 'prepared', taskId: updated.id, revision: updated.revision } };
+  })();
+  if (outcome.success && updated) {
+    if (context.onTaskPrepared) context.onTaskPrepared(updated);
+    else context.onTaskUpdated(updated);
+  }
+  return outcome;
 };
 
 /**
@@ -825,10 +1044,29 @@ export const handleMoveTask: CommandHandler = (
     };
   }
 
-  // Cross-column. The task is not in the target lane yet, so its length is a
-  // legal (appending) slot. An ordinal has to be translated into a RAW position
-  // before it reaches the repository: the two diverge as soon as archiving has
-  // left the lane's positions gapped. See `resolveRawPosition`.
+  const sourceSwimlane = new SwimlaneRepository(db).getById(task.swimlane_id);
+  if (sourceSwimlane?.name === 'Draft') {
+    return {
+      success: false,
+      error: 'Agents may not move tasks out of Draft; a human must provide GO in the board UI',
+    };
+  }
+
+  // General agent-driven moves must not bypass the router's authorization
+  // surface. UI drag/drop does not use this command handler, so a human can
+  // still approve/finish work explicitly in the app.
+  if (targetSwimlane.role === 'done' || targetSwimlane.name === 'Done') {
+    return { success: false, error: 'Agents may not move tasks to Done; human approval is required' };
+  }
+  const normalizedLabels = (task.labels ?? []).map((label) => label.trim().toLowerCase());
+  if (routerTaskHeld(normalizedLabels) || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`)) {
+    return { success: false, error: 'Server guard refused an agent move for held or sensitive work' };
+  }
+
+  // Cross-column movement remains available to the unscoped administrative
+  // MCP endpoint. Running task sessions do not receive this tool at all (see
+  // registerTaskTools), so they must use complete_route_stage and cannot pick
+  // their own next stage.
   const targetTasks = taskRepo.list(targetSwimlane.id);
   const slot = parsedSlot ? clampSlot(parsedSlot.slot, targetTasks.length) : targetTasks.length;
   const targetPosition = resolveRawPosition(
@@ -836,9 +1074,6 @@ export const handleMoveTask: CommandHandler = (
     slot,
     taskRepo.nextPositionInSwimlane(targetSwimlane.id),
   );
-
-  // Fire-and-forget the async move (transition engine, agent spawn/suspend, worktree management).
-  // The MCP response confirms intent; the LLM should re-query to verify state if needed.
   void context.onTaskMove({
     taskId: task.id,
     targetSwimlaneId: targetSwimlane.id,
@@ -846,12 +1081,268 @@ export const handleMoveTask: CommandHandler = (
   }).catch((error) => {
     console.error(`[move_task] Failed for task ${task.id.slice(0, 8)}:`, error);
   });
-
   const placement = parsedSlot ? ` at position ${slot}` : '';
   return {
     success: true,
     message: `Moving "${task.title}" (#${task.display_id}) to ${targetSwimlane.name}${placement}.`,
     data: { id: task.id, displayId: task.display_id, column: targetSwimlane.name, position: slot },
+  };
+};
+
+const ROUTER_SENSITIVE = /\b(prod(?:uction)?|main|deploy|secret|credential|migrat(?:e|ion)|drop|delete data|borrar datos|terraform destroy)\b/i;
+const ROUTER_HOLD_LABELS = new Set([
+  'pedro', 'no-auto', 'manual-hold', 'production', 'risky',
+  // Set atomically by kangentic_request_human_input. Both labels are holds so
+  // neither the routed completion tool nor native plan-exit can advance work
+  // while a material human answer is outstanding.
+  'needs-info', 'needs-human',
+]);
+
+export function routerTaskHeld(labels: string[]): boolean {
+  const approved = labels.includes('approved');
+  return labels.some((label) => ROUTER_HOLD_LABELS.has(label) && (label !== 'pedro' || !approved));
+}
+
+/**
+ * Narrow ingress for the external quota-aware router. Unlike move_task this
+ * awaits the complete lifecycle and delegates the actual profile+move claim to
+ * one repository transaction inside the per-task lifecycle lock.
+ */
+export const handleRouteTask: CommandHandler = async (
+  params: Record<string, unknown>,
+  context: CommandContext,
+): Promise<CommandResponse> => {
+  if (!context.onTaskRoute) return { success: false, error: 'Atomic routing is unavailable in this build' };
+  const taskIdParam = String(params.taskId ?? '');
+  const columnName = String(params.destination ?? '');
+  const profileSelector = String(params.profile ?? '');
+  const expectedRevision = Number(params.expectedRevision);
+  const expectedFingerprint = String(params.expectedFingerprint ?? '');
+  const expectedPolicyVersion = String(params.expectedPolicyVersion ?? '');
+  const workflow = String(params.workflow ?? '');
+  const dispatchId = String(params.dispatchId ?? '');
+  if (!taskIdParam || !columnName || !profileSelector || !Number.isInteger(expectedRevision)
+      || expectedRevision < 0 || !/^[a-f0-9]{64}$/i.test(expectedFingerprint)
+      || !expectedPolicyVersion || !workflow || !dispatchId) {
+    return { success: false, error: 'Invalid atomic route arguments' };
+  }
+
+  const db = context.getProjectDb();
+  const taskRepo = new TaskRepository(db);
+  const task = resolveTask(taskRepo, taskIdParam);
+  if (!task) return { success: false, error: `Task "${taskIdParam}" not found` };
+  const normalizedLabels = task.labels.map((label) => label.trim().toLowerCase());
+  const text = `${task.title}\n${task.description}`;
+  if (routerTaskHeld(normalizedLabels) || ROUTER_SENSITIVE.test(text)) {
+    return { success: false, error: 'Server guard refused automatic routing for a held or sensitive task' };
+  }
+
+  const destination = resolveColumn(db, columnName, 'todo', { includeArchivedDone: false });
+  if ('error' in destination) return { success: false, error: destination.error };
+  if (!['Planning', 'Executing'].includes(destination.swimlane.name)) {
+    return { success: false, error: 'Atomic router may only enter Planning or Executing' };
+  }
+  const profile = resolveProfileSelector(context, profileSelector);
+  if (!profile.ok) return { success: false, error: profile.error };
+
+  const targetTasks = taskRepo.list(destination.swimlane.id);
+  const targetPosition = resolveRawPosition(
+    targetTasks.map((laneTask) => laneTask.position),
+    targetTasks.length,
+    taskRepo.nextPositionInSwimlane(destination.swimlane.id),
+  );
+  try {
+    await context.onTaskRoute({
+      taskId: task.id,
+      targetSwimlaneId: destination.swimlane.id,
+      targetPosition,
+      expectedRevision,
+      expectedFingerprint,
+      policyVersion: expectedPolicyVersion,
+      profileId: profile.profileId,
+      workflow,
+      dispatchId,
+      projectId: context.projectId,
+    });
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  return {
+    success: true,
+    data: { id: task.id, displayId: task.display_id, column: destination.swimlane.name, profile: profileSelector, dispatchId },
+    message: `Routed "${task.title}" to ${destination.swimlane.name} with profile ${profileSelector}.`,
+  };
+};
+
+export function nextRouteStage(stage: string, workflow: string): string | null {
+  if (stage === 'Planning') return 'Executing';
+  if (stage === 'Executing') {
+    if (workflow === 'review' || workflow === 'review-test') return 'Review';
+    if (workflow === 'test') return 'Verify';
+    if (workflow === 'direct') return 'Ready';
+  }
+  if (stage === 'Review') {
+    if (workflow === 'review-test') return 'Verify';
+    if (workflow === 'review') return 'Ready';
+  }
+  if (stage === 'Verify' && (workflow === 'test' || workflow === 'review-test')) return 'Ready';
+  return null;
+}
+
+/**
+ * Finish one successful routed stage. Unlike the general move tool, the target
+ * is derived server-side from the dispatch workflow and can never be Done.
+ * The claim is durable before lifecycle work starts, so duplicate tool calls do
+ * not spawn duplicate sessions; a failed/crashed move is retryable.
+ */
+export const handleCompleteRouteStage: CommandHandler = (
+  params: Record<string, unknown>,
+  context: CommandContext,
+): CommandResponse => {
+  const taskIdParam = String(params.taskId ?? '');
+  const expectedStage = String(params.stage ?? '');
+  if (!taskIdParam) return { success: false, error: 'taskId is required' };
+  if (!['Planning', 'Executing', 'Review', 'Verify'].includes(expectedStage)) {
+    return { success: false, error: 'stage must be Planning, Executing, Review, or Verify' };
+  }
+  const db = context.getProjectDb();
+  const taskRepo = new TaskRepository(db);
+  const task = resolveTask(taskRepo, taskIdParam);
+  if (!task) return { success: false, error: `Task "${taskIdParam}" not found` };
+  const labels = task.labels.map((label) => label.trim().toLowerCase());
+  if (routerTaskHeld(labels)
+      || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`)) {
+    return { success: false, error: 'Server guard refused automatic stage completion for held or sensitive work' };
+  }
+  const current = db.prepare('SELECT id, name FROM swimlanes WHERE id = ?')
+    .get(task.swimlane_id) as { id: string; name: string } | undefined;
+  if (!current) return { success: false, error: 'Current column not found' };
+  const dispatch = taskRepo.getLatestRouteDispatch(task.id);
+  if (!dispatch) return { success: false, error: 'Task has no router dispatch' };
+  const priorCompletion = taskRepo.getLatestRouteStageCompletion(dispatch.dispatchId, expectedStage);
+  if (priorCompletion?.status === 'completed') {
+    const priorTarget = db.prepare('SELECT name FROM swimlanes WHERE id = ?')
+      .get(priorCompletion.targetSwimlaneId) as { name: string } | undefined;
+    return {
+      success: true,
+      message: `Stage ${expectedStage} was already accepted (${priorCompletion.status}).`,
+      data: { id: task.id, column: expectedStage, target: priorTarget?.name ?? null, duplicate: true },
+    };
+  }
+  if (priorCompletion?.status === 'pending') {
+    const priorTarget = db.prepare('SELECT name FROM swimlanes WHERE id = ?')
+      .get(priorCompletion.targetSwimlaneId) as { name: string } | undefined;
+    if (current.id === priorCompletion.targetSwimlaneId) {
+      taskRepo.finishRouteStageCompletion({
+        dispatchId: dispatch.dispatchId,
+        stage: expectedStage,
+        taskRevision: priorCompletion.taskRevision,
+        success: true,
+      });
+      return {
+        success: true,
+        message: `Stage ${expectedStage} had already moved and is now reconciled.`,
+        data: { id: task.id, column: expectedStage, target: priorTarget?.name ?? null, duplicate: true },
+      };
+    }
+    if (priorCompletion.taskRevision !== task.revision) {
+      return {
+        success: true,
+        message: `Stage ${expectedStage} has an earlier pending completion and will not be replayed after task changes.`,
+        data: { id: task.id, column: expectedStage, target: priorTarget?.name ?? null, duplicate: true },
+      };
+    }
+  }
+  if (current.name !== expectedStage) {
+    return { success: false, error: `Task is in ${current.name}, not the declared stage ${expectedStage}` };
+  }
+  const targetName = nextRouteStage(current.name, dispatch.workflow);
+  if (!targetName) {
+    return { success: false, error: `Workflow ${dispatch.workflow} cannot auto-advance from ${current.name}` };
+  }
+  const target = resolveColumn(db, targetName, 'todo', { includeArchivedDone: false });
+  if ('error' in target) return { success: false, error: target.error };
+  if (target.swimlane.role === 'done' || target.swimlane.name === 'Done') {
+    return { success: false, error: 'Automatic stage completion may never enter Done' };
+  }
+  let claim;
+  try {
+    claim = taskRepo.claimRouteStageCompletion({
+      taskId: task.id,
+      dispatchId: dispatch.dispatchId,
+      stage: current.name,
+      taskRevision: task.revision,
+      currentSwimlaneId: current.id,
+      targetSwimlaneId: target.swimlane.id,
+    });
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  if (claim.status === 'duplicate') {
+    return {
+      success: true,
+      message: `Stage ${current.name} was already accepted (${claim.moveStatus}).`,
+      data: { id: task.id, column: current.name, target: targetName, duplicate: true },
+    };
+  }
+  const targetPosition = taskRepo.nextPositionInSwimlane(target.swimlane.id);
+  void context.onTaskMove({
+    taskId: task.id,
+    targetSwimlaneId: target.swimlane.id,
+    targetPosition,
+    expectedSwimlaneId: current.id,
+    expectedRevision: task.revision,
+  }).then(() => {
+    new TaskRepository(context.getProjectDb()).finishRouteStageCompletion({
+      dispatchId: dispatch.dispatchId, stage: current.name, taskRevision: task.revision, success: true,
+    });
+  }).catch((error) => {
+    new TaskRepository(context.getProjectDb()).finishRouteStageCompletion({
+      dispatchId: dispatch.dispatchId, stage: current.name, taskRevision: task.revision,
+      success: false, error: error instanceof Error ? error.message : String(error),
+    });
+    console.error(`[complete_route_stage] Failed for task ${task.id.slice(0, 8)}:`, error);
+  });
+  return {
+    success: true,
+    message: `Accepted successful ${current.name}; moving "${task.title}" to ${targetName}.`,
+    data: { id: task.id, displayId: task.display_id, column: current.name, target: targetName, duplicate: false },
+  };
+};
+
+/**
+ * Mark the current routed task as requiring an explicit human answer.
+ * This deliberately cannot move the card: it only records a bounded question
+ * and two well-known labels, leaving every lifecycle decision to the human.
+ */
+export const handleRequestHumanInput: CommandHandler = (
+  params: Record<string, unknown>,
+  context: CommandContext,
+): CommandResponse => {
+  const taskIdParam = String(params.taskId ?? '');
+  const question = String(params.question ?? '').trim().slice(0, 2_000);
+  if (!taskIdParam) return { success: false, error: 'taskId is required' };
+  if (!question) return { success: false, error: 'question is required' };
+  const taskRepo = new TaskRepository(context.getProjectDb());
+  const task = resolveTask(taskRepo, taskIdParam);
+  if (!task) return { success: false, error: `Task "${taskIdParam}" not found` };
+  const current = context.getProjectDb().prepare('SELECT name FROM swimlanes WHERE id = ?')
+    .get(task.swimlane_id) as { name: string } | undefined;
+  if (!current || !['Planning', 'Executing', 'Review', 'Verify'].includes(current.name)) {
+    return { success: false, error: 'Human input may only be requested from an active routed stage' };
+  }
+  const labels = [...new Set([...task.labels, 'needs-info', 'needs-human'])];
+  const marker = `\n\n## Información requerida\n${question}`;
+  const description = task.description.includes(marker) ? task.description : `${task.description}${marker}`;
+  if (description.length > TASK_DESCRIPTION_MAX_LENGTH) {
+    return { success: false, error: 'The question would exceed the task description limit' };
+  }
+  const updated = taskRepo.update({ id: task.id, labels, description });
+  context.onTaskUpdated(updated);
+  return {
+    success: true,
+    message: `Recorded human question for "${task.title}"; the task remains in ${current.name}.`,
+    data: { id: task.id, displayId: task.display_id, column: current.name, question },
   };
 };
 
@@ -1003,6 +1494,10 @@ export function handleMoveTaskToProject(
   if (task.worktree_path && fs.existsSync(task.worktree_path)) {
     return { success: false, error: `Task #${task.display_id} still has a worktree on disk and cannot be moved to another project.` };
   }
+  const normalizedLabels = (task.labels ?? []).map((label) => label.trim().toLowerCase());
+  if (routerTaskHeld(normalizedLabels) || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`)) {
+    return { success: false, error: 'Server guard refused relocation of held or sensitive work' };
+  }
 
   const targetDb = target.getProjectDb();
   const resolution = resolveColumn(targetDb, params.column ?? null, 'todo', {
@@ -1012,6 +1507,12 @@ export function handleMoveTaskToProject(
     return { success: false, error: resolution.error };
   }
   const { swimlane: targetSwimlane } = resolution;
+  if (targetSwimlane.role !== 'todo') {
+    return {
+      success: false,
+      error: 'A relocated task may only land in the target project To Do column; the router decides active execution',
+    };
+  }
 
   const targetTaskRepo = new TaskRepository(targetDb);
   const newTask = targetTaskRepo.create({
@@ -1088,6 +1589,13 @@ export const handleDeleteTask: CommandHandler = (
   const task = resolveTask(taskRepo, taskId);
   if (!task) {
     return { success: false, error: `Task "${taskId}" not found` };
+  }
+
+  const sourceLane = new SwimlaneRepository(db).getById(task.swimlane_id);
+  const deleteGuardLabels = task.labels.map((label) => label.trim().toLowerCase());
+  if (sourceLane?.name === 'Draft' || routerTaskHeld(deleteGuardLabels)
+      || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`)) {
+    return { success: false, error: 'Agents may not delete Draft, held, or sensitive tasks; human action is required' };
   }
 
   const attachmentRepo = new AttachmentRepository(db);

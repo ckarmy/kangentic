@@ -78,7 +78,7 @@ export function syncProjectMcpConfig(context: IpcContext, projectId: string, pro
         kangentic: {
           type: 'http' as const,
           url: context.mcpServerHandle.urlForProject(projectId),
-          headers: { 'X-Kangentic-Token': context.mcpServerHandle.token },
+          headers: { 'X-Kangentic-Token': context.mcpServerHandle.adminToken },
         },
       },
     };

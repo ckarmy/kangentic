@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
+import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { Task, TaskCreateInput, TaskUpdateInput, TaskMoveInput, ArchivedTasksPreview, AutoCommandState, WorktreeSkipReason } from '../../../shared/types';
 import { worktreeFolderUnderRoot } from '../../../shared/worktree-folder';
@@ -9,12 +10,56 @@ interface TaskRow extends Omit<Task, 'labels'> {
   labels: string;
 }
 
+export interface AtomicRouteInput extends TaskMoveInput {
+  expectedRevision: number;
+  expectedFingerprint: string;
+  policyVersion: string;
+  profileId: string;
+  workflow: string;
+  dispatchId: string;
+  projectId: string;
+}
+
+export type AtomicRouteResult =
+  | { status: 'applied'; revision: number }
+  | { status: 'duplicate'; revision: number };
+
+export interface RouteDispatchRecord {
+  dispatchId: string;
+  taskId: string;
+  workflow: string;
+}
+
+export type StageCompletionClaimResult =
+  | { status: 'claimed'; dispatchId: string }
+  | { status: 'duplicate'; dispatchId: string; moveStatus: 'pending' | 'completed' };
+
 function rowToTask(row: TaskRow): Task {
   let labels: string[] = [];
   try {
     labels = JSON.parse(row.labels);
   } catch { /* default to empty */ }
   return { ...row, labels };
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function taskFingerprint(task: Pick<Task, 'title' | 'description' | 'priority' | 'labels'>, projectId: string): string {
+  const relevant = {
+    title: task.title,
+    description: task.description,
+    priority: task.priority,
+    labels: [...task.labels].map((label) => String(label).toLowerCase()).sort(),
+    projectId,
+  };
+  return createHash('sha256').update(stableJson(relevant)).digest('hex');
 }
 
 /**
@@ -123,6 +168,14 @@ export class TaskRepository {
       WHERE t.session_id = ? AND t.archived_at IS NULL
       LIMIT 1`).get(sessionId) as TaskRow | undefined;
     return row ? rowToTask(row) : undefined;
+  }
+
+  /** Permanently hand an externally mirrored Draft to Kangentic ownership. */
+  detachExternalDraft(id: string): boolean {
+    const result = this.db.prepare(`UPDATE tasks
+      SET external_source = 'trello_draft_detached', updated_at = ?
+      WHERE id = ? AND external_source = 'trello_draft'`).run(new Date().toISOString(), id);
+    return result.changes === 1;
   }
 
   /**
@@ -326,6 +379,8 @@ export class TaskRepository {
 
     const task: Task = {
       id,
+      revision: 0,
+      pending_dispatch_id: null,
       display_id: displayId,
       title: input.title,
       description: input.description,
@@ -464,6 +519,154 @@ export class TaskRepository {
         .run(targetSwimlaneId, targetPosition, new Date().toISOString(), taskId);
     });
     tx();
+  }
+
+  /**
+   * Atomically claim a router dispatch, apply its profile and move the task.
+   * This is deliberately separate from `move()`: external routers must never
+   * create the observable half-state "new profile, still in To Do" (or the
+   * inverse), and retries with the same dispatch id must be no-ops.
+   */
+  routeFromTodo(input: AtomicRouteInput): AtomicRouteResult {
+    const route = this.db.transaction((): AtomicRouteResult => {
+      const prior = this.db.prepare(`SELECT task_id, expected_fingerprint, policy_version,
+          profile_id, target_swimlane_id, workflow, committed_revision
+        FROM route_dispatches WHERE dispatch_id = ?`).get(input.dispatchId) as {
+          task_id: string; expected_fingerprint: string; policy_version: string;
+          profile_id: string; target_swimlane_id: string; workflow: string; committed_revision: number;
+        } | undefined;
+      if (prior) {
+        const same = prior.task_id === input.taskId
+          && prior.expected_fingerprint === input.expectedFingerprint
+          && prior.policy_version === input.policyVersion
+          && prior.profile_id === input.profileId
+          && prior.target_swimlane_id === input.targetSwimlaneId
+          && prior.workflow === input.workflow;
+        if (!same) throw new Error(`dispatchId ${input.dispatchId} was already used for a different route`);
+        return { status: 'duplicate', revision: prior.committed_revision };
+      }
+
+      const task = this.getById(input.taskId);
+      if (!task) throw new Error(`Task ${input.taskId} not found`);
+      if (task.revision !== input.expectedRevision) {
+        throw new Error(`Task revision changed (expected ${input.expectedRevision}, found ${task.revision})`);
+      }
+      if (taskFingerprint(task, input.projectId) !== input.expectedFingerprint) {
+        throw new Error('Task fingerprint changed');
+      }
+      const source = this.db.prepare('SELECT role FROM swimlanes WHERE id = ?')
+        .get(task.swimlane_id) as { role: string | null } | undefined;
+      if (source?.role !== 'todo') throw new Error('Router may only dispatch tasks from To Do');
+
+      this.db.prepare('UPDATE tasks SET position = position - 1 WHERE swimlane_id = ? AND position > ?')
+        .run(task.swimlane_id, task.position);
+      this.db.prepare('UPDATE tasks SET position = position + 1 WHERE swimlane_id = ? AND position >= ?')
+        .run(input.targetSwimlaneId, input.targetPosition);
+      const now = new Date().toISOString();
+      const update = this.db.prepare(`UPDATE tasks SET swimlane_id = ?, position = ?,
+          profile_id = ?, run_mode = 'column_settings', agent_override = NULL,
+          model_override = NULL, effort_override = NULL, permission_mode = NULL,
+          pending_dispatch_id = ?, updated_at = ? WHERE id = ? AND revision = ?`)
+        .run(input.targetSwimlaneId, input.targetPosition, input.profileId, input.dispatchId, now, input.taskId, input.expectedRevision);
+      if (update.changes !== 1) throw new Error('Task changed while route was being committed');
+      const committedRevision = input.expectedRevision + 1;
+      this.db.prepare(`INSERT INTO route_dispatches
+          (dispatch_id, task_id, expected_fingerprint, policy_version, profile_id,
+           target_swimlane_id, workflow, committed_revision, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(input.dispatchId, input.taskId, input.expectedFingerprint, input.policyVersion,
+          input.profileId, input.targetSwimlaneId, input.workflow, committedRevision, now);
+      return { status: 'applied', revision: committedRevision };
+    });
+    return route();
+  }
+
+  getLatestRouteDispatch(taskId: string): RouteDispatchRecord | null {
+    const row = this.db.prepare(`SELECT dispatch_id, task_id, workflow
+      FROM route_dispatches WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1`)
+      .get(taskId) as { dispatch_id: string; task_id: string; workflow: string } | undefined;
+    return row ? { dispatchId: row.dispatch_id, taskId: row.task_id, workflow: row.workflow } : null;
+  }
+
+  getLatestRouteStageCompletion(dispatchId: string, stage: string): {
+    targetSwimlaneId: string;
+    taskRevision: number;
+    status: 'pending' | 'completed' | 'failed';
+  } | null {
+    const row = this.db.prepare(`SELECT target_swimlane_id, task_revision, status
+      FROM route_stage_completions
+      WHERE dispatch_id = ? AND stage = ?
+      ORDER BY task_revision DESC LIMIT 1`).get(dispatchId, stage) as {
+        target_swimlane_id: string;
+        task_revision: number;
+        status: 'pending' | 'completed' | 'failed';
+      } | undefined;
+    return row ? { targetSwimlaneId: row.target_swimlane_id, taskRevision: row.task_revision, status: row.status } : null;
+  }
+
+  /**
+   * Claim one workflow edge before the async lifecycle starts. The task's
+   * revision makes a rework cycle (Review -> Executing -> Review) a new edge,
+   * while an MCP retry for the same stage is a no-op. A process crash can leave
+   * a pending claim; after 15 minutes it is reclaimable instead of stranding the
+   * card forever.
+   */
+  claimRouteStageCompletion(input: {
+    taskId: string;
+    dispatchId: string;
+    stage: string;
+    taskRevision: number;
+    currentSwimlaneId: string;
+    targetSwimlaneId: string;
+  }): StageCompletionClaimResult {
+    return this.db.transaction((): StageCompletionClaimResult => {
+      const task = this.getById(input.taskId);
+      if (!task) throw new Error(`Task ${input.taskId} not found`);
+      if (task.swimlane_id !== input.currentSwimlaneId || task.revision !== input.taskRevision) {
+        throw new Error('Task changed before stage completion was claimed');
+      }
+      const latest = this.getLatestRouteDispatch(input.taskId);
+      if (!latest || latest.dispatchId !== input.dispatchId) throw new Error('Route dispatch is no longer current');
+      const prior = this.db.prepare(`SELECT target_swimlane_id, status, updated_at
+        FROM route_stage_completions
+        WHERE dispatch_id = ? AND stage = ? AND task_revision = ?`)
+        .get(input.dispatchId, input.stage, input.taskRevision) as {
+          target_swimlane_id: string; status: 'pending' | 'completed' | 'failed'; updated_at: string;
+        } | undefined;
+      const now = new Date();
+      if (prior) {
+        if (prior.target_swimlane_id !== input.targetSwimlaneId) throw new Error('Stage completion target changed');
+        const stalePending = prior.status === 'pending'
+          && now.getTime() - Date.parse(prior.updated_at) >= 15 * 60_000;
+        if (prior.status === 'completed' || (prior.status === 'pending' && !stalePending)) {
+          return { status: 'duplicate', dispatchId: input.dispatchId, moveStatus: prior.status };
+        }
+        this.db.prepare(`UPDATE route_stage_completions
+          SET status = 'pending', error = NULL, updated_at = ?
+          WHERE dispatch_id = ? AND stage = ? AND task_revision = ?`)
+          .run(now.toISOString(), input.dispatchId, input.stage, input.taskRevision);
+        return { status: 'claimed', dispatchId: input.dispatchId };
+      }
+      this.db.prepare(`INSERT INTO route_stage_completions
+          (dispatch_id, stage, task_revision, target_swimlane_id, status, updated_at)
+        VALUES (?, ?, ?, ?, 'pending', ?)`)
+        .run(input.dispatchId, input.stage, input.taskRevision, input.targetSwimlaneId, now.toISOString());
+      return { status: 'claimed', dispatchId: input.dispatchId };
+    })();
+  }
+
+  finishRouteStageCompletion(input: {
+    dispatchId: string;
+    stage: string;
+    taskRevision: number;
+    success: boolean;
+    error?: string;
+  }): void {
+    this.db.prepare(`UPDATE route_stage_completions
+      SET status = ?, error = ?, updated_at = ?
+      WHERE dispatch_id = ? AND stage = ? AND task_revision = ?`)
+      .run(input.success ? 'completed' : 'failed', input.success ? null : input.error?.slice(0, 1000) ?? 'move failed',
+        new Date().toISOString(), input.dispatchId, input.stage, input.taskRevision);
   }
 
   /**

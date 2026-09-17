@@ -15,6 +15,14 @@ import type { BacklogTaskUpdateInput } from '../../../shared/types';
 // backlog description fails loudly instead of being silently truncated.
 export const BACKLOG_DESCRIPTION_MAX_LENGTH = 10_000;
 
+function includesApprovedLabel(labels: Array<string | { name: string }>): boolean {
+  return labels.some((entry) => (typeof entry === 'string' ? entry : entry?.name)?.trim().toLowerCase() === 'approved');
+}
+
+const AGENT_PROTECTED_BACKLOG_LABELS = new Set([
+  'approved', 'pedro', 'no-auto', 'manual-hold', 'risky', 'production',
+]);
+
 export const handleListBacklog: CommandHandler = (
   params: Record<string, unknown>,
   context: CommandContext,
@@ -82,6 +90,10 @@ export const handleCreateBacklogTask: CommandHandler = (
     descriptionLength: description.length,
     labels: params.labels ?? null,
   });
+
+  if (includesApprovedLabel(rawLabels)) {
+    return { success: false, error: 'Agents may not grant the approved label; human action is required' };
+  }
 
   // Normalize labels: extract names for DB storage and colors for config
   const labelNames: string[] = [];
@@ -199,6 +211,9 @@ export const handleUpdateBacklogItem: CommandHandler = (
 
   const labelColorMap: Record<string, string> = {};
   if (rawLabels !== null) {
+    if (includesApprovedLabel(rawLabels)) {
+      return { success: false, error: 'Agents may not grant the approved label; human action is required' };
+    }
     const labelNames: string[] = [];
     for (const entry of rawLabels) {
       if (typeof entry === 'string') {
@@ -209,6 +224,16 @@ export const handleUpdateBacklogItem: CommandHandler = (
           labelColorMap[entry.name] = entry.color;
         }
       }
+    }
+    const requestedLabels = new Set(labelNames.map((label) => label.trim().toLowerCase()));
+    const removedProtected = existing.labels
+      .map((label) => label.trim().toLowerCase())
+      .filter((label) => AGENT_PROTECTED_BACKLOG_LABELS.has(label) && !requestedLabels.has(label));
+    if (removedProtected.length > 0) {
+      return {
+        success: false,
+        error: `Agents may not remove protected backlog labels (${removedProtected.join(', ')}); human action is required`,
+      };
     }
     updates.labels = labelNames;
     changedFields.push('labels');
@@ -326,6 +351,17 @@ export const handlePromoteBacklog: CommandHandler = (
     return { success: false, error: resolution.error };
   }
   const { swimlane: targetSwimlane } = resolution;
+  if (targetSwimlane.role !== 'todo') {
+    return { success: false, error: 'Agents may promote backlog items only to To Do for human/router review' };
+  }
+
+  for (const itemId of itemIds) {
+    const item = backlogRepo.getById(itemId);
+    const labels = item?.labels.map((label) => label.trim().toLowerCase()) ?? [];
+    if (labels.some((label) => AGENT_PROTECTED_BACKLOG_LABELS.has(label))) {
+      return { success: false, error: 'Protected backlog work must be promoted by a human in the UI' };
+    }
+  }
 
   const backlogAttachmentRepo = new BacklogAttachmentRepository(db);
   const attachmentRepo = new AttachmentRepository(db);

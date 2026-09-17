@@ -164,6 +164,9 @@ describe('startMcpHttpServer - network config', () => {
       { bindAddress: '127.0.0.1', callbackHost: '10.0.0.5' },
     );
     const port = new URL(handle.baseUrl).port;
+    expect(handle.adminToken).not.toBe(handle.token);
+    expect(handle.adminToken).toHaveLength(64);
+    expect(handle.token).toHaveLength(64);
     expect(handle.urlForProject('proj-1')).toBe(`http://127.0.0.1:${port}/mcp/proj-1`);
     expect(handle.baseUrl).toBe(`http://127.0.0.1:${port}/mcp`);
   });

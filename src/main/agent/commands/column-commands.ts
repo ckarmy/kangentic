@@ -143,6 +143,9 @@ export const handleUpdateColumn: CommandHandler = (
       if ('error' in targetResolution) {
         return { success: false, error: `planExitTargetColumn: ${targetResolution.error}` };
       }
+      if (targetResolution.swimlane.role === 'done') {
+        return { success: false, error: 'planExitTargetColumn may not be Done; human approval is required' };
+      }
       updates.plan_exit_target_id = targetResolution.swimlane.id;
     }
     changedFields.push('planExitTargetColumn');
@@ -275,6 +278,9 @@ export const handleCreateColumn: CommandHandler = (
     const targetResolution = resolveColumn(db, String(params.planExitTargetColumn), 'todo', { includeArchivedDone: true });
     if ('error' in targetResolution) {
       return { success: false, error: `planExitTargetColumn: ${targetResolution.error}` };
+    }
+    if (targetResolution.swimlane.role === 'done') {
+      return { success: false, error: 'planExitTargetColumn may not be Done; human approval is required' };
     }
     input.plan_exit_target_id = targetResolution.swimlane.id;
   }

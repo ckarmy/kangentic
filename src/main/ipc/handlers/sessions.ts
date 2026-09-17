@@ -27,6 +27,8 @@ import type { IpcContext } from '../ipc-context';
 import { isAbortError } from '../../../shared/abort-utils';
 import { resumeBlockMessage, resumeBlockReason } from '../../../shared/session-resume-eligibility';
 import { broadcast } from '../../pop-out/window-broadcast';
+import { NEVER_AUTO_SPAWN_ROLES } from '../../../shared/types';
+import { routerTaskHeld } from '../../agent/commands/task-commands';
 
 // Track session start times for duration calculation on exit
 const sessionStartTimes = new Map<string, number>();
@@ -858,6 +860,16 @@ export function registerSessionHandlers(context: IpcContext): void {
       const task = tasks.getBySessionId(sessionId);
       if (!task) return;
 
+      // A plan-mode agent may request human input and then still emit a plan
+      // exit event. Use the same server-side hold policy as routed completion
+      // so that event cannot bypass needs-info, risky, production or manual
+      // holds. The human can clear the applicable hold after resolving it.
+      const normalizedLabels = task.labels.map((label) => label.trim().toLowerCase());
+      if (routerTaskHeld(normalizedLabels)) {
+        console.warn(`[plan-exit] Refused auto-move of "${task.title}" while a human/guard hold is active`);
+        return;
+      }
+
       // Folded through the task's Board Profile: a profile can re-point where
       // this column routes on plan exit, so two tasks leaving plan mode in the
       // same column can legitimately land in different columns.
@@ -870,6 +882,13 @@ export function registerSessionHandlers(context: IpcContext): void {
 
       const target = swimlanes.getById(lane.plan_exit_target_id);
       if (!target) return;
+      // Defense in depth: even an old database/config written before the MCP
+      // guard existed may still point plan-exit at Done. Never let an agent's
+      // plan-mode transition grant the human approval represented by Done.
+      if (target.role !== null && NEVER_AUTO_SPAWN_ROLES.has(target.role)) {
+        console.warn(`[plan-exit] Refused auto-move of "${task.title}" to Done; human approval is required`);
+        return;
+      }
 
       const position = tasks.list(target.id).length;
       // 'auto-move' sends TASK_AUTO_MOVED, emits the board-changed event this
@@ -881,7 +900,16 @@ export function registerSessionHandlers(context: IpcContext): void {
       // staleness bug hard to attribute.
       await handleTaskMove(
         context,
-        { taskId: task.id, targetSwimlaneId: target.id, targetPosition: position },
+        {
+          taskId: task.id,
+          targetSwimlaneId: target.id,
+          targetPosition: position,
+          // Revalidated inside the task lifecycle lock. If a human-input hold
+          // (or any other edit/move) lands while this auto-move is queued, its
+          // revision/column no longer match and the move is refused.
+          expectedSwimlaneId: task.swimlane_id,
+          expectedRevision: task.revision,
+        },
         'auto-move',
         resolvedProjectId,
         resolvedProjectPath,

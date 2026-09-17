@@ -399,9 +399,9 @@ export function useBoardDragDrop({ swimlanes, tasks, archivedTasks }: UseBoardDr
       const fromSwimlaneId = activeId.slice(7); // strip 'column:'
       const toSwimlaneId = overId.slice(7);
 
-      // Backlog and Done are locked in place
+      // The structural queue and inert Draft inbox are locked in place.
       const draggedCol = swimlanes.find((swimlane) => swimlane.id === fromSwimlaneId);
-      if (!draggedCol || draggedCol.role === 'todo') return;
+      if (!draggedCol || draggedCol.role === 'todo' || (draggedCol.name === 'Draft' && !draggedCol.auto_spawn)) return;
 
       const fromIdx = swimlanes.findIndex((swimlane) => swimlane.id === fromSwimlaneId);
       const toIdx = swimlanes.findIndex((swimlane) => swimlane.id === toSwimlaneId);
@@ -410,11 +410,13 @@ export function useBoardDragDrop({ swimlanes, tasks, archivedTasks }: UseBoardDr
       // arrayMove handles directional offset correctly for dnd-kit
       const ordered = arrayMove([...swimlanes], fromIdx, toIdx);
 
-      // Validate constraints: To Do must be first
+      // Validate constraints: inert Draft first, then the structural queue.
+      const draftIndex = ordered.findIndex((swimlane) => swimlane.name === 'Draft' && !swimlane.auto_spawn && swimlane.role == null);
       const todoIndex = ordered.findIndex((swimlane) => swimlane.role === 'todo');
 
       const toast = useToastStore.getState().addToast;
-      if (todoIndex !== 0) { toast({ message: 'To Do must remain the first column', variant: 'warning' }); return; }
+      if (draftIndex >= 0 && (draftIndex !== 0 || todoIndex !== 1)) { toast({ message: 'Draft must remain before Approved', variant: 'warning' }); return; }
+      if (draftIndex < 0 && todoIndex !== 0) { toast({ message: 'Approved must remain the first column', variant: 'warning' }); return; }
 
       await reorderSwimlanes(ordered.map((swimlane) => swimlane.id));
       return;

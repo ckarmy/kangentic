@@ -1562,3 +1562,44 @@ The agent is sending the wrong token. The token is regenerated per launch; close
 ### Tool call returns 404
 
 Either the URL path doesn't match `/mcp/<projectId>` (probably a malformed `mcp.json`), or the project ID is no longer registered (deleted while the agent was running). Check `kangentic_list_projects`.
+### kangentic_sync_external_draft
+
+Integration-only, idempotent upsert for the Luuk Trello **Borrador** mirror. It
+accepts `externalId`, `externalUrl`, `title`, `description`, and optional
+`project`. The server
+hard-codes the source and `trello` label, requires an inert `Draft` column, and
+leaves `useWorktree` unset so a promoted task inherits project isolation.
+
+The lookup, Draft check, and update are one SQLite transaction. The external ID
+is unique for this source, so retrying after a lost response cannot duplicate a
+card. Once the task is observed outside Draft it is permanently marked detached
+and later syncs never edit it. The result is JSON with `action` (`created`,
+`updated`, `unchanged`, or `detached`), `taskId`, and `revision`.
+
+### kangentic_prepare_draft
+
+Trusted-local-router endpoint for adding the editable `Preparación Kangentic`
+preview to an inert Draft. It accepts `taskId`, `expectedRevision`, `block`, and
+an optional project selector. The server only appends or replaces the exact
+machine-owned block, requires `Draft` with `autoSpawn=false`, rejects stale
+revisions and any task carrying execution state, and cannot change labels,
+priority, column, worktree, or session. Trello refreshes preserve this block.
+
+### kangentic_route_task
+
+Atomically dispatch an unchanged task from **To Do** into **Planning** or
+**Executing** with a Board Profile. The caller supplies the task revision,
+content fingerprint, routing-policy version, workflow and a UUID `dispatchId`.
+The server refuses stale, held, Pedro-originated, production or otherwise
+sensitive tasks. Profile assignment, movement and dispatch claim commit in one
+SQLite transaction; retrying the same dispatch is idempotent, and the first
+spawned session records that dispatch id.
+
+### kangentic_complete_route_stage
+
+Advances a successfully completed routed task to the single next column allowed
+by its stored workflow. The server derives the target, durably deduplicates
+retries, rechecks hold and sensitive-work guards, and never moves a task to
+**Done**. Pass the exact stage that succeeded (`Planning`, `Executing`, `Review`,
+or `Verify`); a late retry of that stage is a no-op and cannot complete the next
+stage. Failed or uncertain stages stay where they are for human attention.

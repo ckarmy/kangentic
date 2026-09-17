@@ -17,7 +17,7 @@ import { CURRENT_VERSION, validateBoardConfig } from './config-helpers';
  * renderer to surface (duplicate names, missing system columns, etc.).
  *
  * Key invariants enforced here:
- *   - "To Do" role exists and is the first column.
+ *   - "To Do" role exists and is first, except for one inert Draft inbox.
  *   - "Done" role exists and is the last column.
  *   - Columns present in the DB but absent from config are either
  *     ghosted (if they hold tasks) or deleted (if empty), but only
@@ -112,12 +112,21 @@ export function applyBoardConfigToDb(
       warnings.push('kangentic.json is missing a done column. Added default.');
     }
 
-    // Enforce position: To Do first, Done last.
+    // Enforce position: an inert Draft inbox may precede the structural
+    // To Do/Approved queue; Done always remains last.
+    const draftIndex = config.columns.findIndex((column) => column.role == null && column.name === 'Draft' && column.autoSpawn === false);
+    if (draftIndex > 0) {
+      const [draftColumn] = config.columns.splice(draftIndex, 1);
+      config.columns.unshift(draftColumn);
+      warnings.push('Draft inbox moved before Approved.');
+    }
+
     const todoIndex = config.columns.findIndex((column) => column.role === 'todo');
-    if (todoIndex > 0) {
+    const expectedTodoIndex = draftIndex >= 0 ? 1 : 0;
+    if (todoIndex >= 0 && todoIndex !== expectedTodoIndex) {
       const [todoColumn] = config.columns.splice(todoIndex, 1);
-      config.columns.unshift(todoColumn);
-      warnings.push('To Do column must be first. Position corrected.');
+      config.columns.splice(expectedTodoIndex, 0, todoColumn);
+      warnings.push(`Approved column moved to position ${expectedTodoIndex}.`);
     }
 
     const doneIndex = config.columns.findIndex((column) => column.role === 'done');

@@ -84,6 +84,8 @@ function taskContentsMatch(previous: Task, next: Task): boolean {
   if (previous === next) return true;
   if (
     previous.id !== next.id ||
+    previous.revision !== next.revision ||
+    previous.pending_dispatch_id !== next.pending_dispatch_id ||
     previous.display_id !== next.display_id ||
     previous.title !== next.title ||
     previous.description !== next.description ||

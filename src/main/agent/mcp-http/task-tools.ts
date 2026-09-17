@@ -179,12 +179,25 @@ export function registerTaskTools(
   resolver: RequestResolver,
   taskCounter: TaskCounter,
   toolArgumentNotices?: ToolArgumentNotices,
+  options: { allowAdministrativeTools?: boolean; callerTaskId?: string } = {},
 ): void {
+  const requireOwnTask = (ctx: CommandContext, taskId: string): McpToolResult | null => {
+    if (options.allowAdministrativeTools !== false) return null;
+    if (!options.callerTaskId) {
+      return { content: [{ type: 'text' as const, text: 'Caller session is not linked to a task.' }], isError: true };
+    }
+    const requested = resolveTask(new TaskRepository(ctx.getProjectDb()), taskId);
+    if (!requested || requested.id !== options.callerTaskId) {
+      return { content: [{ type: 'text' as const, text: 'This lifecycle tool may only target the calling session\'s own task.' }], isError: true };
+    }
+    return null;
+  };
+  if (options.allowAdministrativeTools !== false) {
   // --- kangentic_create_task ---
   server.registerTool(
     'kangentic_create_task',
     {
-      description: 'Create a task on the Kangentic board (default: the To Do column on the active board) or in the backlog. This is the only task-creation tool - use it whenever the user asks to "create a task", "add a todo", "add to backlog", or similar. ATTACHMENTS RULE: When the user\'s prompt references local files by absolute path (design handoffs, mockups, screenshots, specs, READMEs, transcripts), pass those paths in `attachments` on this same call. Default to attaching, not omitting. Do not require a second user request to add them. The only exception is files the user explicitly named as "for context only, don\'t attach." With no `column` argument, the task always lands in the active board\'s To Do column - never the backlog. Pass `column: "Backlog"` (case-insensitive) to create a backlog item instead. Pass any other column name (e.g. "Planning", "Code Review") to land directly in that board column. Board tasks are ready to work on immediately; with worktrees on (the project default) each gets its own worktree and branch, and with `useWorktree: false` the agent works in the project directory on the branch already checked out. If the user\'s prompt names a different Kangentic project, pass that name as `project` to route the task to that project instead of the active default - do not rely on the active default when the user clearly targeted another project. The name counts however it is phrased, not just the explicit "create a task in X" form: "create a task in X to fix ...", "the X to do board", "add a bug to the X board", "in X", and "X\'s backlog" all target project X. Use kangentic_list_projects to find valid selectors. LABELS WITH A LONG DESCRIPTION: due to a known large-payload limitation, when this call carries both a long description (roughly 1KB or more) and labels, the labels can be dropped before they reach the server. In that case create the task here (you may omit labels), then set labels with a separate labels-only kangentic_update_task call right after.',
+      description: 'Create a task on the Kangentic board (default: To Do), in Draft, or in the native backlog. Agents may create only in Draft or To Do; the router is the only automatic entry to active work columns. Use Draft for unapproved ideas/proposals and To Do only for work authorized to run. This is the only task-creation tool - use it whenever the user asks to "create a task", "add a todo", "add to backlog", or similar, however it is phrased. ATTACHMENTS RULE: When the user\'s prompt references local files by absolute path (design handoffs, mockups, screenshots, specs, READMEs, transcripts), pass those paths in `attachments` on this same call. Default to attaching, not omitting. Do not require a second user request to add them. The only exception is files the user explicitly named as "for context only, don\'t attach." With no `column` argument, the task always lands in To Do. Pass `column: "Draft"` for work that must stay inert until a human moves it to To Do, or `column: "Backlog"` for the native backlog. With worktrees on, a board task gets its worktree only when work starts. If the user\'s prompt names a different Kangentic project, pass that name as `project`. Use kangentic_list_projects to find valid selectors. LABELS WITH A LONG DESCRIPTION: due to a known large-payload limitation, when this call carries both a long description (roughly 1KB or more) and labels, the labels can be dropped before they reach the server. In that case create the task here (you may omit labels), then set labels with a separate labels-only kangentic_update_task call right after.',
       inputSchema: z.object({
         title: z.string().max(200).describe('Task title (max 200 characters)'),
         description: z.string().max(TASK_DESCRIPTION_MAX_LENGTH).optional().describe('Task description. Supports markdown.'),
@@ -333,6 +346,7 @@ export function registerTaskTools(
       );
     }, { alwaysAnnotate: true }),
   );
+  }
 
   // --- kangentic_list_columns ---
   server.registerTool(
@@ -580,6 +594,7 @@ export function registerTaskTools(
     async ({ column, project }) => withProject(resolver, project, (ctx) => callHandler('get_column_detail', { column }, ctx, 'Failed to get column detail')),
   );
 
+  if (options.allowAdministrativeTools !== false) {
   // --- kangentic_update_task ---
   server.registerTool(
     'kangentic_update_task',
@@ -703,6 +718,7 @@ export function registerTaskTools(
       });
     },
   );
+  }
 
   // --- kangentic_link_pr ---
   server.registerTool(
@@ -719,6 +735,7 @@ export function registerTaskTools(
     async ({ taskId, branch, project }) => withProject(resolver, project, (ctx) => callHandler('link_pr', { taskId, branch }, ctx, 'Failed to resolve PR')),
   );
 
+  if (options.allowAdministrativeTools !== false) {
   // --- kangentic_move_task ---
   server.registerTool(
     'kangentic_move_task',
@@ -734,7 +751,133 @@ export function registerTaskTools(
     },
     async ({ taskId, column, position, project }) => withProject(resolver, project, (ctx) => callHandler('move_task', { taskId, column, position: position ?? null }, ctx, 'Failed to move task')),
   );
+  }
 
+  if (options.allowAdministrativeTools !== false) {
+  // --- kangentic_sync_external_draft ---
+  server.registerTool(
+    'kangentic_sync_external_draft',
+    {
+      description: 'Idempotently mirror one Trello Borrador card into the quiet Draft column. This integration-only tool never starts work, never moves a task, and permanently detaches after human promotion.',
+      inputSchema: z.object({
+        externalId: z.string().min(1).max(200).describe('Stable Trello card id'),
+        externalUrl: z.string().url().describe('Trello card URL'),
+        title: z.string().min(1).max(200),
+        description: z.string().max(TASK_DESCRIPTION_MAX_LENGTH),
+        project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
+      }),
+      annotations: MUTATING_ANNOTATIONS,
+    },
+    async ({ externalId, externalUrl, title, description, project }) => withProject(
+      resolver,
+      project,
+      (ctx) => callHandler('sync_external_draft', {
+        externalId,
+        externalUrl,
+        title,
+        description,
+      }, ctx, 'Failed to sync external Draft task'),
+    ),
+  );
+  }
+
+  if (options.allowAdministrativeTools !== false) {
+  // --- kangentic_prepare_draft ---
+  server.registerTool(
+    'kangentic_prepare_draft',
+    {
+      description: 'Quietly append or replace only the structured Preparación Kangentic block on one unchanged task in the inert Draft column. It cannot move work, start a session, alter labels, or bypass human approval. Intended for the trusted local pre-router.',
+      inputSchema: z.object({
+        taskId: z.string().min(1),
+        expectedRevision: z.number().int().min(0),
+        block: z.string().min(1).max(8_000),
+        project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
+      }),
+      annotations: MUTATING_ANNOTATIONS,
+    },
+    async ({ taskId, expectedRevision, block, project }) => withProject(
+      resolver,
+      project,
+      (ctx) => callHandler('prepare_draft', { taskId, expectedRevision, block }, ctx, 'Failed to prepare Draft task'),
+    ),
+  );
+  }
+
+  if (options.allowAdministrativeTools !== false) {
+  // --- kangentic_route_task ---
+  // Deliberately narrow and fail-closed. This is not a general replacement for
+  // move_task; it is the transactional ingress for the local quota router.
+  server.registerTool(
+    'kangentic_route_task',
+    {
+      description: 'Atomically and idempotently dispatch one unchanged To Do task into Planning or Executing with a Board Profile. Refuses held/sensitive work and stale revisions/fingerprints. Intended for a trusted local router, not ordinary agent-directed moves.',
+      inputSchema: z.object({
+        taskId: z.string().min(1),
+        expectedRevision: z.number().int().min(0),
+        expectedColumn: z.literal('To Do'),
+        expectedFingerprint: z.string().regex(/^[a-f0-9]{64}$/i),
+        expectedPolicyVersion: z.string().min(1).max(100),
+        profile: z.string().min(1).max(100),
+        workflow: z.enum(['direct', 'review', 'test', 'review-test']),
+        destination: z.enum(['Planning', 'Executing']),
+        dispatchId: z.string().uuid(),
+        project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
+      }),
+      annotations: MUTATING_ANNOTATIONS,
+    },
+    async ({ taskId, expectedRevision, expectedColumn: _expectedColumn, expectedFingerprint,
+      expectedPolicyVersion, profile, workflow, destination, dispatchId, project }) => withProject(
+      resolver,
+      project,
+      (ctx) => callHandler('route_task', {
+        taskId, expectedRevision, expectedFingerprint, expectedPolicyVersion,
+        profile, workflow, destination, dispatchId,
+      }, ctx, 'Failed to route task'),
+    ),
+  );
+  }
+
+  // --- kangentic_complete_route_stage ---
+  server.registerTool(
+    'kangentic_complete_route_stage',
+    {
+      description: 'Advance a successfully completed routed task to the one next column allowed by its stored workflow. The server derives the target, deduplicates retries, rechecks safety labels/text, and never moves to Done. Call only after the current stage has genuinely succeeded; on failure or uncertainty, leave the task in place for a human.',
+      inputSchema: z.object({
+        taskId: z.string().min(1).describe('Task ID for the current routed task.'),
+        stage: z.enum(['Planning', 'Executing', 'Review', 'Verify'])
+          .describe('Exact stage that just succeeded. A retry must repeat this value.'),
+        project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
+      }),
+      annotations: MUTATING_ANNOTATIONS,
+    },
+    async ({ taskId, stage, project }) => withProject(resolver, project, async (ctx) => {
+      const refused = requireOwnTask(ctx, taskId);
+      return refused ?? await callHandler(
+        'complete_route_stage', { taskId, stage }, ctx, 'Failed to complete routed stage',
+      );
+    }),
+  );
+
+  server.registerTool(
+    'kangentic_request_human_input',
+    {
+      description: 'Record that the current routed task cannot continue without a specific human answer. Adds only needs-info/needs-human labels and the bounded question; it never moves the task. Use this only for genuinely missing information or a material human decision, not for technical errors, failed tests, rate limits, or uncertainty you can investigate yourself.',
+      inputSchema: z.object({
+        taskId: z.string().min(1).describe('Task ID for the current routed task.'),
+        question: z.string().min(1).max(2_000).describe('One concrete question the human must answer.'),
+        project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
+      }),
+      annotations: MUTATING_ANNOTATIONS,
+    },
+    async ({ taskId, question, project }) => withProject(resolver, project, async (ctx) => {
+      const refused = requireOwnTask(ctx, taskId);
+      return refused ?? await callHandler(
+        'request_human_input', { taskId, question }, ctx, 'Failed to request human input',
+      );
+    }),
+  );
+
+  if (options.allowAdministrativeTools !== false) {
   // --- kangentic_reorder_tasks ---
   server.registerTool(
     'kangentic_reorder_tasks',
@@ -788,7 +931,9 @@ export function registerTaskTools(
       }
     },
   );
+  }
 
+  if (options.allowAdministrativeTools !== false) {
   // --- kangentic_update_column ---
   server.registerTool(
     'kangentic_update_column',
@@ -896,7 +1041,9 @@ export function registerTaskTools(
       column,
     }, ctx, 'Failed to delete column'), { alwaysAnnotate: true }),
   );
+  }
 
+  if (options.allowAdministrativeTools !== false) {
   // --- kangentic_delete_task ---
   server.registerTool(
     'kangentic_delete_task',
@@ -924,4 +1071,5 @@ export function registerTaskTools(
     },
     async ({ attachmentId, project }) => withProject(resolver, project, (ctx) => callHandler('remove_attachment', { attachmentId }, ctx, 'Failed to remove attachment')),
   );
+  }
 }

@@ -371,6 +371,10 @@ export type WorktreeSkipReason =
 
 export interface Task {
   id: string;
+  /** Monotonic optimistic-concurrency token. Every UPDATE of this row increments it. */
+  revision: number;
+  /** Router dispatch awaiting its first spawned session; cleared by SessionRepository.insert. */
+  pending_dispatch_id?: string | null;
   display_id: number;
   title: string;
   description: string;
@@ -875,6 +879,8 @@ export type SuspendedBy = 'user' | 'system';
 
 export interface SessionRecord {
   id: string;
+  /** Idempotency key of the atomic router dispatch that created this session, when applicable. */
+  dispatch_id?: string | null;
   task_id: string;
   session_type: string;
   /**

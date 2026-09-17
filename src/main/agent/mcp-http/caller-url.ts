@@ -14,7 +14,7 @@
  * `/mcp/<projectId>/<sessionId>`.
  *
  * The server otherwise has no way to know WHICH session is calling: the token
- * is per-launch and the URL is per-project. Stamping the spawning session's own
+ * is per-launch (and restricted to agent tools) and the URL is per-project. Stamping the spawning session's own
  * id into its own `mcp.json` makes caller identity correct by construction - it
  * is written, never looked up, so it cannot drift - and takes it out of the set
  * of things the agent can choose through the tool's own parameters. That is
@@ -22,13 +22,14 @@
  * chain server-side, and attribute a relayed message truthfully instead of
  * trusting a caller-supplied field.
  *
- * This is honesty-by-default, NOT cryptographic attribution. The bearer token
- * is one shared per-launch secret every spawned agent holds, and the server
+ * This is honesty-by-default for identity, NOT cryptographic attribution. The
+ * restricted bearer token is one shared per-launch secret every spawned agent holds, and the server
  * does not verify that the segment names a real or currently-connected session,
  * so a process with the token (an agent has both the token and shell access)
  * can dial any caller id via a raw HTTP request. The guards this feeds are
  * circuit breakers against a looping or careless agent, not a defense against a
- * deliberately lying one. A real guarantee would need a per-session secret
+ * deliberately lying one. This does not grant board-administration authority:
+ * that uses a separate token never passed to agents. A real identity guarantee would need a per-session secret
  * distinct from the session id, which `kangentic_list_sessions` already exposes.
  *
  * Returns undefined when there is no URL (MCP server disabled or not yet

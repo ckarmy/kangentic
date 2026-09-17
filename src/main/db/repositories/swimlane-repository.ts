@@ -166,19 +166,27 @@ export class SwimlaneRepository {
   }
 
   reorder(ids: string[]): void {
-    // Build a map of id → role for validation
-    const allLanes = this.db.prepare('SELECT id, role FROM swimlanes').all() as Array<{ id: string; role: string | null }>;
+    // Build a map of id → lane metadata for validation. An inert column named
+    // Draft is the one supported pre-authorization inbox and may sit before
+    // the structural To Do/Approved role column.
+    const allLanes = this.db.prepare('SELECT id, name, role, auto_spawn FROM swimlanes').all() as Array<{ id: string; name: string; role: string | null; auto_spawn: number }>;
     const roleById = new Map(allLanes.map((l) => [l.id, l.role]));
+    const draftId = allLanes.find((lane) => lane.role === null && lane.name === 'Draft' && lane.auto_spawn === 0)?.id;
 
     // Validate locked column constraints:
-    // 1. 'todo' must be at position 0
+    // 1. An inert Draft, when configured, is first and To Do/Approved follows.
+    //    Without one, the structural todo role remains first.
     const todoId = allLanes.find((lane) => lane.role === 'todo')?.id;
-    if (todoId && ids[0] !== todoId) {
-      throw new Error('To Do column must remain at position 0.');
+    const expectedTodoIndex = draftId ? 1 : 0;
+    if (draftId && ids[0] !== draftId) {
+      throw new Error('Draft column must remain before Approved.');
+    }
+    if (todoId && ids[expectedTodoIndex] !== todoId) {
+      throw new Error(`Approved column must remain at position ${expectedTodoIndex}.`);
     }
 
-    // 2. Custom columns (role=null) cannot be at position 0 (To Do slot)
-    if (!roleById.get(ids[0])) {
+    // 2. No other custom column can occupy the protected first slot.
+    if (!draftId && !roleById.get(ids[0])) {
       throw new Error('Custom columns cannot be at the first position.');
     }
 

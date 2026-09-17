@@ -11,13 +11,15 @@
  *       The optional third segment identifies WHICH session is calling. It is
  *       stamped into that session's own mcp.json at spawn, so it is correct by
  *       construction and not settable through any tool parameter. It is not a
- *       cryptographic identity: the bearer token is shared per launch and the
- *       segment is not validated, so a process holding the token can dial any
- *       id (see caller-url.ts). Absent for a human-driven client, the
+ *       per-session cryptographic identity: spawned agents share the restricted
+ *       agent token and the segment is not validated, so one agent could still
+ *       claim another agent id (see caller-url.ts). Administrative clients use
+ *       a separate token that is never passed to spawned agents. Absent for a human-driven client, the
  *       per-project `.kangentic/mcp-config.json`, or a Command Terminal
  *       session; steering then degrades to an unattributed caller rather than
  *       refusing.
- * Auth: random per-launch token, validated via `X-Kangentic-Token` header
+ * Auth: separate random per-launch agent/admin tokens, validated via the
+ *       `X-Kangentic-Token` header. The token selects the tool authority.
  * Bind: 127.0.0.1 by default -- loopback skips Windows Defender Firewall
  *       prompts and is unreachable from other machines. A user can widen
  *       this by hand-editing `mcpServer.bindAddress` in the global
@@ -105,6 +107,8 @@ export interface McpHttpServerHandle {
   baseUrl: string;
   /** Random per-launch token. Clients must send it as `X-Kangentic-Token`. */
   token: string;
+  /** Separate token for external/local administration integrations. Never passed to spawned agents. */
+  adminToken: string;
   /** Build a project-scoped URL for the given project ID. */
   urlForProject(projectId: string): string;
   /** Synchronously stop accepting new connections and close the server. */
@@ -137,6 +141,8 @@ export async function startMcpHttpServer(
 ): Promise<McpHttpServerHandle> {
   const token = randomBytes(32).toString('hex');
   const expectedTokenBuffer = Buffer.from(token, 'utf-8');
+  const adminToken = randomBytes(32).toString('hex');
+  const expectedAdminTokenBuffer = Buffer.from(adminToken, 'utf-8');
   const taskCounter = makeTaskCounter();
 
   // One coordinator per server launch (its rate-limit windows, steer-chain
@@ -177,7 +183,7 @@ export async function startMcpHttpServer(
   };
 
   const httpServer: Server = createServer((req, res) => {
-    handleHttpRequest(req, res, expectedTokenBuffer, buildContext, taskCounter, getBrowserAutomationConfig, networkConfig, resolveSteering, resolveBrowser)
+    handleHttpRequest(req, res, expectedTokenBuffer, expectedAdminTokenBuffer, buildContext, taskCounter, getBrowserAutomationConfig, networkConfig, resolveSteering, resolveBrowser)
       .catch((error) => {
         console.error('[mcp-http] Request handler crashed:', error);
         if (!res.headersSent) {
@@ -229,6 +235,7 @@ export async function startMcpHttpServer(
   return {
     baseUrl,
     token,
+    adminToken,
     urlForProject: (projectId: string) => `${baseUrl}/${projectId}`,
     close: () => {
       // Detach the SessionManager listeners the coordinator holds before the
@@ -348,6 +355,10 @@ export function buildConfiguredMcpServer(
   // empty one. See the call site in handleHttpRequest for why passing it here,
   // before it is populated, is safe.
   toolArgumentNotices?: ToolArgumentNotices,
+  // Requests made by a running task use the session-qualified URL. They need
+  // task lifecycle tools, but never board/profile administration: exposing
+  // those would let an agent rewrite the very barriers governing its run.
+  taskSessionScoped = false,
 ): McpServer {
   const browserAutomationEnabled = getBrowserAutomationConfig().enabled;
   const instructions = buildServerInstructions(resolver, browserAutomationEnabled);
@@ -355,8 +366,13 @@ export function buildConfiguredMcpServer(
     { name: SERVER_NAME, version: SERVER_VERSION },
     { instructions },
   );
-  registerTaskTools(mcpServer, resolver, taskCounter, toolArgumentNotices);
-  registerProfileTools(mcpServer, resolver);
+  registerTaskTools(mcpServer, resolver, taskCounter, toolArgumentNotices, {
+    allowAdministrativeTools: !taskSessionScoped,
+    callerTaskId: taskSessionScoped && steering?.callerSessionId
+      ? steering.sessions.getSessionTaskId(steering.callerSessionId)
+      : undefined,
+  });
+  if (!taskSessionScoped) registerProfileTools(mcpServer, resolver);
   registerSessionTools(mcpServer, resolver);
   registerProjectTools(mcpServer, resolver);
   registerSearchTools(mcpServer, resolver);
@@ -387,6 +403,7 @@ async function handleHttpRequest(
   req: IncomingMessage,
   res: ServerResponse,
   expectedTokenBuffer: Buffer,
+  expectedAdminTokenBuffer: Buffer,
   buildContext: ProjectContextFactory,
   taskCounter: TaskCounter,
   getBrowserAutomationConfig: AutomationConfigReader,
@@ -406,10 +423,11 @@ async function handleHttpRequest(
     return;
   }
   const headerTokenBuffer = Buffer.from(headerToken, 'utf-8');
-  if (
-    headerTokenBuffer.length !== expectedTokenBuffer.length ||
-    !timingSafeEqual(headerTokenBuffer, expectedTokenBuffer)
-  ) {
+  const isAgentToken = headerTokenBuffer.length === expectedTokenBuffer.length
+    && timingSafeEqual(headerTokenBuffer, expectedTokenBuffer);
+  const isAdminToken = headerTokenBuffer.length === expectedAdminTokenBuffer.length
+    && timingSafeEqual(headerTokenBuffer, expectedAdminTokenBuffer);
+  if (!isAgentToken && !isAdminToken) {
     res.statusCode = 401;
     res.end();
     return;
@@ -453,6 +471,7 @@ async function handleHttpRequest(
     resolveSteering(callerSessionId),
     resolveBrowser(projectId, callerSessionId),
     toolArgumentNotices,
+    !isAdminToken,
   );
 
   const transport = new StreamableHTTPServerTransport({
@@ -530,4 +549,3 @@ function readRequestBody(req: IncomingMessage): Promise<string> {
     req.on('error', reject);
   });
 }
-

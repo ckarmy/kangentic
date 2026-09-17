@@ -54,6 +54,8 @@ export interface CommandContext {
   setBoardProfiles: (profiles: BoardProfile[]) => void;
   onTaskCreated: (task: Task, columnName: string, swimlaneId: string) => void;
   onTaskUpdated: (task: Task) => void;
+  /** Quiet invalidation for deterministic metadata added to an inert Draft. */
+  onTaskPrepared?: (task: Task) => void;
   /**
    * The quiet twin of `onTaskUpdated`, for a PR link/state the APP reconciled
    * rather than the agent: the forced re-resolve that follows a link write.
@@ -68,7 +70,26 @@ export interface CommandContext {
    */
   onTaskPrLinkChanged?: (task: Task) => void;
   onTaskDeleted: (task: Task) => void;
-  onTaskMove: (input: { taskId: string; targetSwimlaneId: string; targetPosition: number }) => Promise<void>;
+  onTaskMove: (input: {
+    taskId: string;
+    targetSwimlaneId: string;
+    targetPosition: number;
+    expectedSwimlaneId?: string;
+    expectedRevision?: number;
+  }) => Promise<void>;
+  /** Atomic, idempotent To Do dispatch used only by the quota-aware router. */
+  onTaskRoute?: (input: {
+    taskId: string;
+    targetSwimlaneId: string;
+    targetPosition: number;
+    expectedRevision: number;
+    expectedFingerprint: string;
+    policyVersion: string;
+    profileId: string;
+    workflow: string;
+    dispatchId: string;
+    projectId: string;
+  }) => Promise<void>;
   /**
    * Tasks were re-sequenced WITHIN one column. Distinct from `onTaskMove`
    * because a reorder is presentation only: no column change, no session

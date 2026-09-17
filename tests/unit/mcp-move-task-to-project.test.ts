@@ -127,7 +127,7 @@ describe.runIf(CAN_RUN)('handleMoveTaskToProject', () => {
     const sourceTaskRepo = new TaskRepository(sourceDb);
     const created = sourceTaskRepo.create({
       title: 'Retrack core submodule',
-      description: 'Point the core submodule at main.',
+      description: 'Refresh the core submodule pointer.',
       swimlane_id: sourceTodo.id,
       labels: ['infra', 'urgent'],
       priority: 3,
@@ -152,7 +152,7 @@ describe.runIf(CAN_RUN)('handleMoveTaskToProject', () => {
     const newTask: Task = targetTasks[0];
     expect(newTask.id).not.toBe(created.id);
     expect(newTask.title).toBe('Retrack core submodule');
-    expect(newTask.description).toBe('Point the core submodule at main.');
+    expect(newTask.description).toBe('Refresh the core submodule pointer.');
     expect(newTask.labels).toEqual(['infra', 'urgent']);
     expect(newTask.priority).toBe(3);
     expect(newTask.created_at).toBe('2026-01-01T00:00:00.000Z');
@@ -166,7 +166,7 @@ describe.runIf(CAN_RUN)('handleMoveTaskToProject', () => {
     expect(fs.readFileSync(copiedAttachments[0].file_path, 'utf8')).toBe('hello');
   });
 
-  it('lands in an explicit target column when `column` is provided', () => {
+  it('refuses an explicit active target column so relocation cannot bypass routing', () => {
     const targetSwimlanes = new SwimlaneRepository(targetDb);
     const review = targetSwimlanes.create({ name: 'Review', auto_spawn: false });
 
@@ -175,11 +175,12 @@ describe.runIf(CAN_RUN)('handleMoveTaskToProject', () => {
 
     const response = handleMoveTaskToProject({ taskId: created.id, column: 'review' }, source, target);
 
-    expect(response.success).toBe(true);
+    expect(response.success).toBe(false);
+    expect(response.error).toContain('To Do');
     const targetTaskRepo = new TaskRepository(targetDb);
     const reviewTasks = targetTaskRepo.list(review.id);
-    expect(reviewTasks).toHaveLength(1);
-    expect(reviewTasks[0].title).toBe('Task to review');
+    expect(reviewTasks).toHaveLength(0);
+    expect(sourceTaskRepo.getById(created.id)).toBeDefined();
   });
 
   it('errors on an unknown target column and mutates nothing', () => {

@@ -196,6 +196,46 @@ describeWithSqlite('runProjectMigrations - legacy role repair', () => {
   });
 });
 
+describeWithSqlite('Draft before Approved ordering', () => {
+  it('keeps one inert Draft before the structural todo role', () => {
+    const database = new sqlite!.DatabaseSync(':memory:');
+    try {
+      const db = adaptDatabase(database);
+      runProjectMigrations(db);
+      hoisted.currentDb = db;
+      const repository = new SwimlaneRepository(db);
+      const existing = repository.list();
+      const todo = existing.find((lane) => lane.role === 'todo')!;
+      const done = existing.find((lane) => lane.role === 'done')!;
+      const middle = existing.filter((lane) => lane.id !== todo.id && lane.id !== done.id);
+      const config: BoardConfig = {
+        version: 1,
+        columns: [
+          { id: 'lane-draft', name: 'Draft', autoSpawn: false },
+          { id: todo.id, name: 'Approved', role: 'todo' },
+          ...middle.map((lane) => ({ id: lane.id, name: lane.name, role: lane.role ?? undefined })),
+          { id: done.id, name: done.name, role: 'done' },
+        ],
+        actions: [],
+        transitions: [],
+      };
+
+      applyBoardConfigToDb('project-1', config);
+      const ordered = repository.list();
+      expect(ordered.slice(0, 2).map((lane) => [lane.name, lane.role])).toEqual([
+        ['Draft', null],
+        ['Approved', 'todo'],
+      ]);
+      expect(() => repository.reorder(ordered.map((lane) => lane.id))).not.toThrow();
+      expect(() => repository.reorder([todo.id, 'lane-draft', ...ordered.slice(2).map((lane) => lane.id)]))
+        .toThrow('Draft column must remain before Approved.');
+    } finally {
+      hoisted.currentDb = null;
+      database.close();
+    }
+  });
+});
+
 describeWithSqlite('applyBoardConfigToDb - role arriving from kangentic.json', () => {
   /**
    * A config that mirrors every existing lane 1:1 (so the reconciler's ghost-or-delete
