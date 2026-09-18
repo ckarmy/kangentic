@@ -8,6 +8,7 @@ import { IPC } from '../../../shared/ipc-channels';
 import type { StrategyChange } from './strategy-propagation';
 import type { IpcContext } from '../ipc-context';
 import { NEVER_AUTO_SPAWN_ROLES } from '../../../shared/types';
+import { isHeldForHuman } from '../../transition-engine/session-startup/human-hold';
 
 /**
  * One task selected for a spawn because its column just started wanting agents.
@@ -88,6 +89,9 @@ export function planAutoSpawnReconcile(
       // was switched on. Only an explicit Resume clears that, which is why
       // spawnAgent carries the same guard and both startup passes skip these ids.
       if (dependencies.userPausedTaskIds.has(task.id)) continue;
+      // needs-info/needs-human/manual holds are equally explicit: changing a
+      // column or profile must not wake work that is waiting for a person.
+      if (isHeldForHuman(task)) continue;
       // Already has a session (running, queued, or a suspended placeholder):
       // nothing to start.
       if (dependencies.hasSessionForTask(task.id)) continue;

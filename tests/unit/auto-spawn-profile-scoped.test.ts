@@ -131,6 +131,21 @@ describe('autoSpawnTasks: auto_spawn is resolved per task, not per lane', () => 
     expect(mockPrepareAgentSpawn).not.toHaveBeenCalled();
   });
 
+  it('does not create a fresh session for a task held for human input', async () => {
+    mockSwimlaneList.mockReturnValue([lane(LOUD_LANE, true)]);
+    mockTaskList.mockReturnValue([{
+      id: TASK_ID,
+      swimlane_id: LOUD_LANE,
+      profile_id: null,
+      worktree_path: null,
+      labels: ['approved', 'needs-info'],
+    }]);
+
+    await runAutoSpawn([]);
+
+    expect(mockPrepareAgentSpawn).not.toHaveBeenCalled();
+  });
+
   it('leaves an unprofiled task on its column\'s own flag, in both directions', async () => {
     mockSwimlaneList.mockReturnValue([lane(LOUD_LANE, true), lane(QUIET_LANE, false)]);
     mockTaskList.mockImplementation((laneId: string) => (laneId === LOUD_LANE

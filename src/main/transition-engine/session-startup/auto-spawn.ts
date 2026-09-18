@@ -15,6 +15,7 @@ import { demoteMissingWorktree } from './missing-worktree';
 import { startStartupTimer } from './timing';
 import { DEFAULT_SPAWN_PROMPT_TEMPLATE } from '../../../shared/task-template-vars';
 import { interpolateTaskTemplate, interpolateTemplate, resolveTaskTemplateVars } from '../../agent/shared';
+import { isHeldForHuman } from './human-hold';
 
 /**
  * Enforce the auto-spawn invariant on project open: find tasks in
@@ -96,6 +97,11 @@ export async function autoSpawnTasks(
   for (const lane of lanesToScan) {
     for (const task of taskRepo.list(lane.id)) {
       if (sessionManager.hasSessionForTask(task.id)) continue;
+      // Human-attention labels are a hard startup hold. This check must happen
+      // on the fresh-spawn path as well as resumeSuspendedSessions: a cleanly
+      // exited session is not recoverable and would otherwise be replaced by a
+      // brand-new conversation on every project open.
+      if (isHeldForHuman(task)) continue;
       const laneForTask = applyProfileToLane(
         lane,
         findTaskProfile({ profiles: boardProfiles, profileId: task.profile_id, taskId: task.id }),

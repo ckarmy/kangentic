@@ -142,6 +142,14 @@ describe('planAutoSpawnReconcile', () => {
     expect(plan.toSpawn).toEqual([]);
   });
 
+  it('never selects a task held for human input', () => {
+    const plan = planAutoSpawnReconcile([
+      turnedOn(makeTask({ labels: ['approved', 'needs-human'] })),
+    ], NO_DEPENDENCIES);
+
+    expect(plan.toSpawn).toEqual([]);
+  });
+
   it('skips a task that already has a session', () => {
     const plan = planAutoSpawnReconcile([turnedOn()], {
       ...NO_DEPENDENCIES,

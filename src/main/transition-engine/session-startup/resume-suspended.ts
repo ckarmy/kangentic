@@ -18,16 +18,11 @@ import { demoteMissingWorktree } from './missing-worktree';
 import { startStartupTimer } from './timing';
 import { DEFAULT_SPAWN_PROMPT_TEMPLATE } from '../../../shared/task-template-vars';
 import { interpolateTaskTemplate, interpolateTemplate, resolveTaskTemplateVars } from '../../agent/shared';
+import { isHeldForHuman } from './human-hold';
 
 const AUTO_RESUME_CONTINUATION_PROMPT =
   'Continúa exactamente desde el punto interrumpido. No repitas trabajo ya completado. '
   + 'Si la etapa ya estaba lista, completa una sola vez la transición de Kangentic correspondiente.';
-
-const HUMAN_HOLD_LABELS = new Set(['needs-info', 'needs-human', 'manual-hold', 'no-auto']);
-
-function isHeldForHuman(task: Task): boolean {
-  return task.labels.some((label) => HUMAN_HOLD_LABELS.has(label.trim().toLowerCase()));
-}
 
 /**
  * Recover suspended and orphaned agent sessions on project open.
@@ -481,12 +476,10 @@ export async function resumeSuspendedSessions(
         agentName: input.adapter.name,
         agentSessionId: input.agentSessionId,
         isolatedSwimlaneId: input.record.isolated_swimlane_id,
-        // Recovery spawns carry no initial prompt (prompt: undefined in
-        // prepare-spawn), so the agent comes up waiting for the user: a resume
-        // sits at a quiet prompt, a fresh spawn at a blank one. Mark resuming so
-        // the activity engine seeds idle, not 'thinking' (the documented
-        // orphan-recovery contract). The command is already built, so this flag
-        // does not alter it - it only drives the seed and the resume overlay.
+        // The continuation prompt is already embedded atomically in the built
+        // command. `resuming` remains true so the renderer preserves the resume
+        // overlay and does not treat crash recovery as a brand-new session; it
+        // does not remove or defer that command-line prompt.
         resuming: true,
         exitSequence: input.adapter.getExitSequence?.() ?? ['\x03'],
       });
