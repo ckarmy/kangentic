@@ -540,6 +540,20 @@ describe('Prompt Delivery (Claude Agent)', () => {
     expect(cmd).not.toContain('Continue working');
   });
 
+  it('resumed session delivers an explicit unattended continuation prompt', () => {
+    const cmd = buildClaudeCommand({
+      cliPath: '/usr/bin/claude',
+      sessionId: 'session-xyz',
+      resume: true,
+      permissionMode: 'auto',
+      prompt: 'Continue the Verify stage and advance once it passes',
+    });
+
+    expect(cmd).toContain('--resume');
+    expect(cmd).toContain('--permission-mode auto');
+    expect(cmd).toContain('Continue the Verify stage and advance once it passes');
+  });
+
   it('plan permission mode adds --permission-mode plan', () => {
     const cmd = buildClaudeCommand({
       cliPath: '/usr/bin/claude',
@@ -2076,4 +2090,3 @@ describe('UNC Path Support', () => {
     });
   });
 });
-
