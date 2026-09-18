@@ -142,13 +142,13 @@ describe('Codex Adapter', () => {
       expect(command).toContain('model_reasoning_effort=high');
     });
 
-    it('resume command omits prompt even if provided', () => {
+    it('resume command delivers an explicitly provided continuation prompt', () => {
       const command = adapter.buildCommand(makeOptions({
         resume: true,
         sessionId: 'sess-abc-123',
-        prompt: 'this should be ignored',
+        prompt: 'continue the interrupted stage',
       }));
-      expect(command).not.toContain('this should be ignored');
+      expect(command).toContain('continue the interrupted stage');
     });
 
     it('resume command adds --disable apps when the disableApps launch option is enabled', () => {
@@ -351,10 +351,10 @@ describe('Codex Adapter', () => {
       expect(command).not.toContain('--ask-for-approval untrusted');
     });
 
-    it("maps 'acceptEdits' to --sandbox workspace-write --ask-for-approval never", () => {
+    it("maps 'acceptEdits' to Codex automatic approval review", () => {
       const command = adapter.buildCommand(makeOptions({ permissionMode: 'acceptEdits' }));
-      expect(command).toContain('--sandbox workspace-write');
-      expect(command).toContain('--ask-for-approval never');
+      expect(command).toContain('--approve-for-me');
+      expect(command).not.toContain('--ask-for-approval never');
     });
 
     it("maps 'auto' to --sandbox workspace-write --ask-for-approval on-request", () => {

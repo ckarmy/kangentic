@@ -16,6 +16,18 @@ import { isShuttingDown } from '../../shutdown-state';
 import { prepareAgentSpawn, type PreparedSpawn } from './prepare-spawn';
 import { demoteMissingWorktree } from './missing-worktree';
 import { startStartupTimer } from './timing';
+import { DEFAULT_SPAWN_PROMPT_TEMPLATE } from '../../../shared/task-template-vars';
+import { interpolateTaskTemplate, interpolateTemplate, resolveTaskTemplateVars } from '../../agent/shared';
+
+const AUTO_RESUME_CONTINUATION_PROMPT =
+  'Continúa exactamente desde el punto interrumpido. No repitas trabajo ya completado. '
+  + 'Si la etapa ya estaba lista, completa una sola vez la transición de Kangentic correspondiente.';
+
+const HUMAN_HOLD_LABELS = new Set(['needs-info', 'needs-human', 'manual-hold', 'no-auto']);
+
+function isHeldForHuman(task: Task): boolean {
+  return task.labels.some((label) => HUMAN_HOLD_LABELS.has(label.trim().toLowerCase()));
+}
 
 /**
  * Recover suspended and orphaned agent sessions on project open.
@@ -254,6 +266,31 @@ export async function resumeSuspendedSessions(
       continue;
     }
 
+    // A routed agent may have concluded that it genuinely needs a human answer.
+    // Such tasks deliberately remain in their active column so the board keeps
+    // the context, but restarting Kangentic must not wake them again and burn
+    // quota in a loop. Preserve a resumable placeholder; removing the hold and
+    // clicking Resume remains an explicit human action.
+    if (isHeldForHuman(task)) {
+      if (record.status === 'orphaned' || record.status === 'exited') {
+        const upgraded = markRecordSuspended(sessionRepo, record.id, 'system');
+        if (!upgraded) {
+          skipped++;
+          continue;
+        }
+      }
+      sessionManager.registerSuspendedPlaceholder({
+        taskId: record.task_id,
+        projectId,
+        cwd: record.cwd,
+      });
+      if (task.session_id) {
+        taskRepo.update({ id: task.id, session_id: null });
+      }
+      skipped++;
+      continue;
+    }
+
     // When auto-resume-on-restart is OFF, don't spawn. Register a suspended
     // placeholder so the renderer shows a Resume button. The record stays
     // marked 'system' (not 'user') so dragging the task through columns
@@ -335,6 +372,21 @@ export async function resumeSuspendedSessions(
       }
 
       const swimlane = laneMap.get(task.swimlane_id) ?? null;
+      const resolvedPromptLane = laneForTask(task);
+      const templateVars = resolveTaskTemplateVars({
+        task,
+        defaultBaseBranch: config.git?.defaultBaseBranch ?? 'main',
+        attachmentPaths: [],
+        devPort: null,
+        projectPath,
+      });
+      const taskPrompt = interpolateTaskTemplate(DEFAULT_SPAWN_PROMPT_TEMPLATE, templateVars);
+      const columnPrompt = resolvedPromptLane?.auto_command
+        ? interpolateTemplate(resolvedPromptLane.auto_command, templateVars).trim()
+        : '';
+      const recoveryPrompt = [taskPrompt, columnPrompt, AUTO_RESUME_CONTINUATION_PROMPT]
+        .filter(Boolean)
+        .join('\n\n');
 
       // Decide whether to resume or start fresh. Uses type-AND-isolation-aware
       // lookup so cross-agent and main-vs-isolated resume mismatches are
@@ -374,6 +426,10 @@ export async function resumeSuspendedSessions(
         hasSessionRecord: true,
         tasks: taskRepo,
         boardProfiles,
+        // autoResumeSessionsOnRestart is an explicit request to keep approved
+        // work moving. Supplying the continuation as an argv prompt is reliable
+        // across TUIs and cannot accidentally answer a modal/permission prompt.
+        resumePrompt: recoveryPrompt,
       });
 
       if (!prep.ok) {

@@ -39,7 +39,7 @@ export interface CodexCommandOptions {
  *   plan        → Safe read-only browsing (model can request escalation)
  *   dontAsk     → Read-only non-interactive (CI; failures returned to model)
  *   default     → Workspace-write, ask when Codex needs approval
- *   acceptEdits → Workspace-write, never ask (replaces old --full-auto)
+ *   acceptEdits → Workspace-write, automatic approval review (no human modal)
  *   auto        → Workspace-write, model decides when to ask
  *   bypass      → Dangerous full access (no sandbox, no approval)
  */
@@ -55,7 +55,11 @@ function mapPermissionMode(mode: PermissionMode): string[] {
       // ordinary workspace edits.
       return ['--sandbox', 'workspace-write', '--ask-for-approval', 'on-request'];
     case 'acceptEdits':
-      return ['--sandbox', 'workspace-write', '--ask-for-approval', 'never'];
+      // `never` suppresses the UI but also hard-rejects every mutating MCP
+      // call, including Kangentic's own stage-completion tool. Codex's native
+      // automatic reviewer keeps the workspace sandbox and resolves approval
+      // requests without parking the session on a human modal.
+      return ['--approve-for-me'];
     case 'auto':
       return ['--sandbox', 'workspace-write', '--ask-for-approval', 'on-request'];
     case 'bypassPermissions':
@@ -206,10 +210,11 @@ export class CodexCommandBuilder {
     // Codex's grammar is `codex [OPTIONS] [PROMPT]`.
     parts.push(...buildMcpConfigArgs(options));
 
-    // Prompt as positional argument. Deliberately skipped when resuming: the
-    // resumed conversation already contains it, and re-sending would re-ask
-    // the task prompt on every resume.
-    if (!isResume && options.prompt) {
+    // Optional prompt as positional argument. Ordinary resumes pass no prompt,
+    // so the original task is never re-sent. Explicit recovery/continuation
+    // paths may provide one; `codex resume [SESSION_ID] [PROMPT]` supports this
+    // natively and starts the recovered turn atomically with CLI startup.
+    if (options.prompt) {
       const needsDoubleQuoteReplacement = shell
         ? !isUnixLikeShell(shell)
         : process.platform === 'win32';

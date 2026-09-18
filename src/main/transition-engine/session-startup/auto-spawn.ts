@@ -13,6 +13,8 @@ import { resolveIsolatedSwimlaneId } from '../session-isolation';
 import { prepareAgentSpawn, type PreparedSpawn } from './prepare-spawn';
 import { demoteMissingWorktree } from './missing-worktree';
 import { startStartupTimer } from './timing';
+import { DEFAULT_SPAWN_PROMPT_TEMPLATE } from '../../../shared/task-template-vars';
+import { interpolateTaskTemplate, interpolateTemplate, resolveTaskTemplateVars } from '../../agent/shared';
 
 /**
  * Enforce the auto-spawn invariant on project open: find tasks in
@@ -119,7 +121,11 @@ export async function autoSpawnTasks(
   // swimlane id for an 'isolated' column). Resumable isolated sessions are already
   // handled by resumeSuspendedSessions, which runs first, so this pass only ever
   // spawns fresh - it just records the correct isolation on that fresh row.
-  const spawnInputs: Array<PreparedSpawn & { task: Task; isolatedSwimlaneId: string | null }> = [];
+  const spawnInputs: Array<PreparedSpawn & {
+    task: Task;
+    isolatedSwimlaneId: string | null;
+    initialPrompt: string;
+  }> = [];
 
   for (const { lane, task } of candidates) {
     // Defensive re-check: a session may have been registered for this task
@@ -156,6 +162,26 @@ export async function autoSpawnTasks(
         continue;
       }
 
+      // A startup auto-spawn must never create a silent agent. This path is
+      // used precisely when an active-column task has no recoverable PTY (for
+      // example, Codex exited cleanly before shutdown could mark it suspended).
+      // Rebuild the normal task envelope and append the destination column's
+      // instruction so a fresh conversation can continue the stage correctly.
+      const templateVars = resolveTaskTemplateVars({
+        // Runtime rows always contain both fields. The defensive fallbacks
+        // also keep startup recovery resilient to imported/legacy rows.
+        task: { ...task, title: task.title ?? '', description: task.description ?? '' },
+        defaultBaseBranch: config.git?.defaultBaseBranch ?? 'main',
+        attachmentPaths: [],
+        devPort: null,
+        projectPath,
+      });
+      const taskPrompt = interpolateTaskTemplate(DEFAULT_SPAWN_PROMPT_TEMPLATE, templateVars);
+      const columnPrompt = lane.auto_command
+        ? interpolateTemplate(lane.auto_command, templateVars).trim()
+        : '';
+      const initialPrompt = columnPrompt ? `${taskPrompt}\n\n${columnPrompt}` : taskPrompt;
+
       const prep = await prepareAgentSpawn({
         task,
         swimlane: lane,
@@ -169,6 +195,7 @@ export async function autoSpawnTasks(
         resolvedShell,
         mcpServerHandle,
         resume: null,
+        resumePrompt: initialPrompt,
         // First-ever-spawn detection for the override lock: a task placed in
         // an auto_spawn lane that never spawned anywhere gets its Advanced
         // overrides locked by this startup spawn, exactly like a board spawn.
@@ -186,7 +213,7 @@ export async function autoSpawnTasks(
         continue;
       }
 
-      spawnInputs.push({ task, isolatedSwimlaneId: resolveIsolatedSwimlaneId(lane), ...prep.data });
+      spawnInputs.push({ task, isolatedSwimlaneId: resolveIsolatedSwimlaneId(lane), initialPrompt, ...prep.data });
     } catch (err) {
       console.error(`[AUTO_SPAWN] Preparation failed for task ${task.id}:`, err);
     }
@@ -242,7 +269,7 @@ export async function autoSpawnTasks(
         command: input.command,
         cwd: input.cwd,
         permission_mode: input.permissionMode,
-        prompt: null,
+        prompt: input.initialPrompt,
         status: 'running',
         exit_code: null,
         started_at: now,

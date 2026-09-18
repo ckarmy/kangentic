@@ -350,6 +350,37 @@ describe('resumeSuspendedSessions: auto-resume-disabled branch (autoResumeSessio
     expect(sessionManager.spawn).not.toHaveBeenCalled();
   });
 
+  it('human-held tasks stay suspended when automatic restart recovery is enabled', async () => {
+    sessionRepoGetOrphaned.mockReturnValue([makeOrphanedRecord()]);
+    taskRepoList.mockReturnValue([makeTask({
+      session_id: 'stale-pty-id',
+      labels: ['approved', 'needs-human'],
+    })]);
+
+    const sessionManager = makeSessionManager();
+    const configManager = makeConfigManager(true);
+
+    await resumeSuspendedSessions(
+      'proj-1',
+      '/project',
+      sessionManager as never,
+      configManager as never,
+    );
+
+    expect(markRecordSuspendedMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'record-1',
+      'system',
+    );
+    expect(sessionManager.registerSuspendedPlaceholder).toHaveBeenCalledWith({
+      taskId: 'task-1',
+      projectId: 'proj-1',
+      cwd: '/project/cwd',
+    });
+    expect(taskRepoUpdateMock).toHaveBeenCalledWith({ id: 'task-1', session_id: null });
+    expect(sessionManager.spawn).not.toHaveBeenCalled();
+  });
+
   it('guard-flip: when autoResumeSessionsOnRestart=true, orphaned record skips the disabled branch', async () => {
     // Arrange: setting is true (default). The orphaned record must NOT be
     // transitioned via the disabled branch. It enters toProcess and the

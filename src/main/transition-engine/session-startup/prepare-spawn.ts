@@ -103,6 +103,13 @@ export async function prepareAgentSpawn(input: {
    * differs from the spawn `cwd` (falls back to the spawn cwd).
    */
   resume: { agentSessionId: string; recordId?: string; recordCwd?: string } | null;
+  /**
+   * Optional prompt delivered atomically with a recovered resume command.
+   * Startup recovery normally leaves the CLI idle; when auto-resume is
+   * explicitly enabled, callers can use this to continue the interrupted
+   * turn without racing terminal keystrokes against the TUI.
+   */
+  resumePrompt?: string;
   /** Persists a reconciled agent session id. Only consulted when `resume.recordId` is set. */
   sessionRepo?: Pick<SessionRepository, 'updateAgentSessionId'>;
   /**
@@ -175,7 +182,7 @@ export async function prepareAgentSpawn(input: {
   const launch = await resolveShimLaunch({
     agentPath: detection.path,
     shell: input.resolvedShell,
-    prompt: undefined,
+    prompt: input.resumePrompt,
   });
 
   // "Plan always wins, else task -> lane -> global" - the rule lives in
@@ -232,7 +239,7 @@ export async function prepareAgentSpawn(input: {
   const commandOptions = {
     agentPath: launch.agentPath,
     taskId: task.id,
-    prompt: undefined,
+    prompt: input.resumePrompt,
     cwd,
     permissionMode,
     projectRoot: projectPath,

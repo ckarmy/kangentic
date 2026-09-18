@@ -5,9 +5,8 @@
  * On Windows an npm-installed CLI resolves to its `.cmd` shim, which a
  * PowerShell or Git Bash host launches through cmd.exe, and cmd.exe keeps only
  * the first line of a multi-line prompt (#353). resolveShimLaunch swaps in the
- * sibling shim the host can run. This path never carries a prompt, but a
- * crash-recovered session must launch through the same head the board spawn
- * used, so the swap has to happen here too.
+ * sibling shim the host can run. Recovery can carry a continuation prompt, so
+ * both the executable head and prompt must flow through the same resolver.
  *
  * The helper is mocked with a pass-through default so the REAL
  * prepareAgentSpawn runs end to end on every OS; one test swaps the head to
@@ -141,7 +140,7 @@ function makeEffectiveConfig(): AppConfig {
   } as unknown as AppConfig;
 }
 
-async function runPrepare() {
+async function runPrepare(resumePrompt?: string) {
   return prepareAgentSpawn({
     task: makeTask(),
     swimlane: makeSwimlane(),
@@ -155,6 +154,7 @@ async function runPrepare() {
     resolvedShell: PWSH,
     mcpServerHandle: null,
     resume: null,
+    resumePrompt,
     hasSessionRecord: true,
     tasks: { update: vi.fn() },
   });
@@ -181,6 +181,16 @@ describe('prepareAgentSpawn: Windows .cmd shim launch resolution wiring', () => 
     expect(result.ok).toBe(true);
     expect(buildCommandMock).toHaveBeenCalledTimes(1);
     expect(buildCommandMock.mock.calls[0][0]).toMatchObject({ agentPath: PS1_SIBLING, shell: PWSH, prompt: undefined });
+  });
+
+  it('passes an auto-resume continuation prompt through shim resolution into the command', async () => {
+    const prompt = 'Continue exactly where the interrupted turn stopped.';
+
+    const result = await runPrepare(prompt);
+
+    expect(result.ok).toBe(true);
+    expect(resolveShimLaunchMock).toHaveBeenCalledWith({ agentPath: CMD_HEAD, shell: PWSH, prompt });
+    expect(buildCommandMock.mock.calls[0][0]).toMatchObject({ prompt });
   });
 
   it('resolves after ensureTrust and before buildCommand', async () => {
