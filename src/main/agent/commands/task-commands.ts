@@ -428,8 +428,11 @@ export const handleUpdateTask: CommandHandler = (
   context: CommandContext,
 ): CommandResponse => {
   const taskId = params.taskId as string;
-  const newTitle = params.title as string | null;
-  const newDescription = params.description as string | null;
+  // The MCP schema normally supplies explicit nulls, while the mobile bridge
+  // sends a sparse patch. Normalize both shapes here so an omitted numeric
+  // field never becomes Number(undefined) -> NaN -> SQLite NULL.
+  const newTitle = (params.title as string | null | undefined) ?? null;
+  const newDescription = (params.description as string | null | undefined) ?? null;
   const newDescriptionEdits = (params.descriptionEdits ?? null) as DescriptionEdit[] | null;
   const newAppendDescription = (params.appendDescription ?? null) as string | null;
   // Normalized to null so an omitted key reads the same as the explicit `null`
@@ -439,17 +442,17 @@ export const handleUpdateTask: CommandHandler = (
   // into pr_number, since `undefined !== null` passes the gates below.
   const newPrUrl = (params.prUrl as string | null | undefined) ?? null;
   const newPrNumber = (params.prNumber as number | null | undefined) ?? null;
-  const newAgent = params.agent as string | null;
-  const newPriority = params.priority as number | null;
-  const newLabels = params.labels as string[] | null;
-  const newBaseBranch = params.baseBranch as string | null;
-  const newUseWorktree = params.useWorktree as boolean | null;
+  const newAgent = (params.agent as string | null | undefined) ?? null;
+  const newPriority = (params.priority as number | null | undefined) ?? null;
+  const newLabels = (params.labels as string[] | null | undefined) ?? null;
+  const newBaseBranch = (params.baseBranch as string | null | undefined) ?? null;
+  const newUseWorktree = (params.useWorktree as boolean | null | undefined) ?? null;
   const newModel = params.model as string | null | undefined;
   const newEffort = params.effort as string | null | undefined;
   const newPermissionMode = params.permissionMode as PermissionMode | null | undefined;
   const newProfileSelector = params.profile as string | null | undefined;
   const newRunMode = params.runMode as TaskRunMode | undefined;
-  const newAttachments = params.attachments as Array<{ filePath: string; filename?: string }> | null;
+  const newAttachments = (params.attachments as Array<{ filePath: string; filename?: string }> | null | undefined) ?? null;
 
   // Observability for the "labels dropped on a large description" bug
   // (task #229). See the matching note in handleCreateTask.
@@ -475,7 +478,7 @@ export const handleUpdateTask: CommandHandler = (
     return { success: false, error: 'Agents may not edit a Trello Draft mirror; promote it by human UI action first' };
   }
 
-  const currentGuardLabels = task.labels.map((label) => label.trim().toLowerCase());
+  const currentGuardLabels = (task.labels ?? []).map((label) => label.trim().toLowerCase());
   const isHumanAction = context.actor === 'human';
   if (!isHumanAction
       && (routerTaskHeld(currentGuardLabels) || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`))) {

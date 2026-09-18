@@ -318,16 +318,13 @@ describe('atomic task router contract', () => {
       labels: ['pedro', 'manual-hold', 'risky'], swimlane_id: draftId,
     });
 
-    // The mobile form sends the nullable MCP-shaped fields explicitly; keep
-    // that real payload shape here so this test isolates actor provenance.
-    const edited = handleUpdateTask({
-      taskId: held.id, title: '[Pedro] Edited by CK', description: null,
-      descriptionEdits: null, appendDescription: null, prUrl: null, prNumber: null,
-      agent: null, priority: null, labels: null, baseBranch: null,
-      useWorktree: null, attachments: null,
-    }, context);
+    // The mobile form sends a sparse patch, unlike the MCP schema which fills
+    // omitted optional fields with null. Priority and labels must be preserved.
+    const edited = handleUpdateTask({ taskId: held.id, title: '[Pedro] Edited by CK' }, context);
     expect(edited).toMatchObject({ success: true, data: { title: '[Pedro] Edited by CK' } });
-    expect(tasks.getById(held.id)?.title).toBe('[Pedro] Edited by CK');
+    expect(tasks.getById(held.id)).toMatchObject({
+      title: '[Pedro] Edited by CK', priority: held.priority, labels: held.labels,
+    });
     expect(onTaskUpdated).toHaveBeenCalledOnce();
 
     const deleted = handleDeleteTask({ taskId: held.id }, context);
