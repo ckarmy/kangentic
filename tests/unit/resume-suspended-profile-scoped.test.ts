@@ -302,6 +302,24 @@ describe('resumeSuspendedSessions: auto_spawn is resolved per task, not per lane
     expect(prepareAgentSpawn).toHaveBeenCalledTimes(1);
   });
 
+  it('delivers the column auto_command again when recovering a suspended session', async () => {
+    swimlaneListMock.mockReturnValue([{
+      ...lane(LOUD_LANE, true),
+      auto_command: 'PLAN_ONLY: finish with complete_route_stage Planning',
+    }]);
+    sessionRepoGetResumable.mockReturnValue([makeRecord({ isolated_swimlane_id: null })]);
+    taskRepoList.mockReturnValue([makeTask({
+      title: 'Plan the change', description: 'Scoped task',
+      swimlane_id: LOUD_LANE, profile_id: null,
+    })]);
+
+    await runResume([]);
+
+    const input = vi.mocked(prepareAgentSpawn).mock.calls[0][0] as unknown as { resumePrompt: string };
+    expect(input.resumePrompt).toContain('Plan the change');
+    expect(input.resumePrompt).toContain('PLAN_ONLY: finish with complete_route_stage Planning');
+  });
+
   it('preserves (does not resume) an orphaned record whose column has auto_spawn ON but the profile turns it OFF', async () => {
     swimlaneListMock.mockReturnValue([lane(LOUD_LANE, true)]);
     const orphaned = makeRecord({ id: 'record-orphaned', isolated_swimlane_id: null, status: 'orphaned' });

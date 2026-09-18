@@ -118,6 +118,23 @@ describe('autoSpawnTasks: auto_spawn is resolved per task, not per lane', () => 
     expect(mockPrepareAgentSpawn).toHaveBeenCalledTimes(1);
   });
 
+  it('delivers the column auto_command to a fresh startup spawn', async () => {
+    mockSwimlaneList.mockReturnValue([{
+      ...lane(LOUD_LANE, true),
+      auto_command: 'PLAN_ONLY: finish with complete_route_stage Planning',
+    }]);
+    mockTaskList.mockReturnValue([{
+      id: TASK_ID, title: 'Plan the change', description: 'Scoped task',
+      swimlane_id: LOUD_LANE, profile_id: null, worktree_path: null,
+    }]);
+
+    await runAutoSpawn([]);
+
+    const input = mockPrepareAgentSpawn.mock.calls[0][0] as unknown as { resumePrompt: string };
+    expect(input.resumePrompt).toContain('Plan the change');
+    expect(input.resumePrompt).toContain('PLAN_ONLY: finish with complete_route_stage Planning');
+  });
+
   it('skips a profiled task whose profile turns auto_spawn OFF for an otherwise-active column', async () => {
     mockSwimlaneList.mockReturnValue([lane(LOUD_LANE, true)]);
     mockTaskList.mockReturnValue([
