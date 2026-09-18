@@ -481,7 +481,7 @@ export const handleUpdateTask: CommandHandler = (
   const currentGuardLabels = (task.labels ?? []).map((label) => label.trim().toLowerCase());
   const isHumanAction = context.actor === 'human';
   if (!isHumanAction
-      && (routerTaskHeld(currentGuardLabels) || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`))) {
+      && (routerTaskHeld(currentGuardLabels) || routerTextSensitive(`${task.title}\n${task.description}`))) {
     return { success: false, error: 'Agents may not mutate a held or sensitive task; human action is required' };
   }
   if (!isHumanAction && newLabels !== null) {
@@ -1064,7 +1064,7 @@ export const handleMoveTask: CommandHandler = (
     return { success: false, error: 'Agents may not move tasks to Done; human approval is required' };
   }
   const normalizedLabels = (task.labels ?? []).map((label) => label.trim().toLowerCase());
-  if (routerTaskHeld(normalizedLabels) || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`)) {
+  if (routerTaskHeld(normalizedLabels) || routerTextSensitive(`${task.title}\n${task.description}`)) {
     return { success: false, error: 'Server guard refused an agent move for held or sensitive work' };
   }
 
@@ -1094,7 +1094,18 @@ export const handleMoveTask: CommandHandler = (
   };
 };
 
-const ROUTER_SENSITIVE = /\b(prod(?:uction)?|main|deploy|secret|credential|migrat(?:e|ion)|drop|delete data|borrar datos|terraform destroy)\b/i;
+const ROUTER_SENSITIVE = /\b(prod(?:uction)?|producci[oó]n|main|deploy|secret|credential|migrat(?:e|ion)|drop|delete data|borrar datos|terraform destroy)\b/i;
+const ROUTER_NEGATED_SENSITIVE_CLAUSE = /\b(?:sin|no)\s+(?:(?![.!;\n]).){0,100}\b(?:prod(?:uction)?|producci[oó]n|main|deploy|secret(?:s|os)?|credential(?:s|es)?|migrat(?:e|ion)|drop|delete data|borrar datos|terraform destroy)\b/gi;
+const ROUTER_NO_PRODUCTION_FIELD = /^\s*Requiere\s+producci[oó]n\s*:\s*no\s*$/gim;
+const ROUTER_NEGATED_SENSITIVE_TOKEN = /\bno[-_](?:prod(?:uction)?|deploy|secret(?:s)?|credential(?:s)?|migration)\b/gi;
+
+export function routerTextSensitive(text: string): boolean {
+  const actionableText = text
+    .replace(ROUTER_NO_PRODUCTION_FIELD, '')
+    .replace(ROUTER_NEGATED_SENSITIVE_TOKEN, '')
+    .replace(ROUTER_NEGATED_SENSITIVE_CLAUSE, '');
+  return ROUTER_SENSITIVE.test(actionableText);
+}
 const ROUTER_HOLD_LABELS = new Set([
   'pedro', 'no-auto', 'manual-hold', 'production', 'risky',
   // Set atomically by kangentic_request_human_input. Both labels are holds so
@@ -1138,7 +1149,7 @@ export const handleRouteTask: CommandHandler = async (
   if (!task) return { success: false, error: `Task "${taskIdParam}" not found` };
   const normalizedLabels = task.labels.map((label) => label.trim().toLowerCase());
   const text = `${task.title}\n${task.description}`;
-  if (routerTaskHeld(normalizedLabels) || ROUTER_SENSITIVE.test(text)) {
+  if (routerTaskHeld(normalizedLabels) || routerTextSensitive(text)) {
     return { success: false, error: 'Server guard refused automatic routing for a held or sensitive task' };
   }
 
@@ -1216,7 +1227,7 @@ export const handleCompleteRouteStage: CommandHandler = (
   if (!task) return { success: false, error: `Task "${taskIdParam}" not found` };
   const labels = task.labels.map((label) => label.trim().toLowerCase());
   if (routerTaskHeld(labels)
-      || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`)) {
+      || routerTextSensitive(`${task.title}\n${task.description}`)) {
     return { success: false, error: 'Server guard refused automatic stage completion for held or sensitive work' };
   }
   const current = db.prepare('SELECT id, name FROM swimlanes WHERE id = ?')
@@ -1500,7 +1511,7 @@ export function handleMoveTaskToProject(
     return { success: false, error: `Task #${task.display_id} still has a worktree on disk and cannot be moved to another project.` };
   }
   const normalizedLabels = (task.labels ?? []).map((label) => label.trim().toLowerCase());
-  if (routerTaskHeld(normalizedLabels) || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`)) {
+  if (routerTaskHeld(normalizedLabels) || routerTextSensitive(`${task.title}\n${task.description}`)) {
     return { success: false, error: 'Server guard refused relocation of held or sensitive work' };
   }
 
@@ -1600,7 +1611,7 @@ export const handleDeleteTask: CommandHandler = (
   const deleteGuardLabels = task.labels.map((label) => label.trim().toLowerCase());
   if (context.actor !== 'human'
       && (sourceLane?.name === 'Draft' || routerTaskHeld(deleteGuardLabels)
-        || ROUTER_SENSITIVE.test(`${task.title}\n${task.description}`))) {
+        || routerTextSensitive(`${task.title}\n${task.description}`))) {
     return { success: false, error: 'Agents may not delete Draft, held, or sensitive tasks; human action is required' };
   }
 

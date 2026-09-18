@@ -1,11 +1,11 @@
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { vi } from 'vitest';
-import { handleCompleteRouteStage, handleCreateTask, handleDeleteTask, handleMoveTask, handlePrepareDraft, handleRequestHumanInput, handleRouteTask, handleSyncExternalDraft, handleUpdateTask, nextRouteStage } from '../../src/main/agent/commands/task-commands';
+import { handleCompleteRouteStage, handleCreateTask, handleDeleteTask, handleMoveTask, handlePrepareDraft, handleRequestHumanInput, handleRouteTask, handleSyncExternalDraft, handleUpdateTask, nextRouteStage, routerTextSensitive } from '../../src/main/agent/commands/task-commands';
 import { runProjectMigrations } from '../../src/main/db/migrations/project-schema';
 import { SessionRepository } from '../../src/main/db/repositories/session-repository';
 import { TaskRepository, taskFingerprint } from '../../src/main/db/repositories/task-repository';
-import { restorePendingRouteDestination, retireOrphanTaskSessions, routeLifecycleNeedsRecovery } from '../../src/main/ipc/handlers/task-move';
+import { labelsAfterHumanDraftApproval, restorePendingRouteDestination, retireOrphanTaskSessions, routeLifecycleNeedsRecovery } from '../../src/main/ipc/handlers/task-move';
 import { handleCreateBacklogTask, handlePromoteBacklog, handleUpdateBacklogItem } from '../../src/main/agent/commands/backlog-commands';
 import { SwimlaneRepository } from '../../src/main/db/repositories/swimlane-repository';
 
@@ -137,6 +137,24 @@ describe('atomic task router contract', () => {
     expect(onTaskRoute.mock.calls[0][0]).toMatchObject({
       taskId: safe.id, targetSwimlaneId: planningId, profileId: profile.id, workflow: 'review-test', projectId: 'project-1',
     });
+  });
+
+  it('records approval only for a human Draft -> Approved move', () => {
+    expect(labelsAfterHumanDraftApproval(['pedro'], 'Draft', 'Approved', 'mobile'))
+      .toEqual(['pedro', 'approved']);
+    expect(labelsAfterHumanDraftApproval(['pedro'], 'Draft', 'Approved', 'renderer'))
+      .toEqual(['pedro', 'approved']);
+    expect(labelsAfterHumanDraftApproval(['pedro'], 'Draft', 'Approved', 'agent'))
+      .toEqual(['pedro']);
+    expect(labelsAfterHumanDraftApproval(['pedro', 'manual-hold'], 'Draft', 'Approved', 'mobile'))
+      .toEqual(['pedro', 'manual-hold', 'approved']);
+  });
+
+  it('does not treat an explicit prohibition on production as sensitive work', () => {
+    expect(routerTextSensitive('Investiga el error. Sin tocar código ni PROD hasta que CK revise.\nRequiere producción: no\nTags: no-prod, no-code-change'))
+      .toBe(false);
+    expect(routerTextSensitive('Haz deploy a production y migra la DB.')).toBe(true);
+    expect(routerTextSensitive('No tocar staging; deploy production después.')).toBe(true);
   });
 
   it('records one bounded human question without moving the active task', () => {

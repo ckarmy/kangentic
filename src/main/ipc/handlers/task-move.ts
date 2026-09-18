@@ -271,6 +271,22 @@ const MOVE_PUSH_BY_ORIGIN: Record<
     sendToRenderer(context.mainWindow, IPC.TASK_AUTO_MOVED, input.taskId, input.targetSwimlaneId, title, projectId),
 };
 
+/** Persist the human GO represented by Draft -> Approved. */
+export function labelsAfterHumanDraftApproval(
+  labels: string[],
+  fromLaneName: string | null | undefined,
+  toLaneName: string | null | undefined,
+  origin: TaskMoveOrigin,
+): string[] {
+  if (!['renderer', 'mobile'].includes(origin)
+      || fromLaneName !== 'Draft'
+      || toLaneName !== 'Approved'
+      || labels.some((label) => label.trim().toLowerCase() === 'approved')) {
+    return labels;
+  }
+  return [...labels, 'approved'];
+}
+
 export async function handleTaskMove(
   context: IpcContext,
   input: {
@@ -449,6 +465,16 @@ export async function handleTaskMove(
       } else {
         // Ordinary UI/MCP moves retain the established repository path.
         tasks.move(input);
+        const approvedLabels = labelsAfterHumanDraftApproval(
+          task.labels,
+          fromLane?.name,
+          rawToLane?.name,
+          origin,
+        );
+        if (approvedLabels !== task.labels) {
+          task = tasks.update({ id: task.id, labels: approvedLabels });
+          console.log(`[TASK_MOVE] Recorded human approval for task ${task.id.slice(0, 8)} (Draft -> Approved)`);
+        }
         // Leaving the quiet Draft is the human GO boundary. Detach the Trello
         // mirror in the same locked lifecycle before any worktree/session work,
         // so a scheduled sync can never reclaim or overwrite the active task.
