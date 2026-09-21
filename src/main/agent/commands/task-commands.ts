@@ -490,6 +490,9 @@ export const handleUpdateTask: CommandHandler = (
     if (!currentGuardLabels.includes('approved') && requestedLabels.includes('approved')) {
       return { success: false, error: 'Agents may not grant the approved label; human action is required' };
     }
+    if (!currentGuardLabels.includes(HUMAN_GO_LABEL) && requestedLabels.includes(HUMAN_GO_LABEL)) {
+      return { success: false, error: 'Agents may not grant the go-ck label; only CK recorded GO sets it' };
+    }
   }
 
   const updates: Record<string, unknown> = { id: task.id };
@@ -1108,20 +1111,36 @@ export function routerTextSensitive(text: string): boolean {
   return ROUTER_SENSITIVE.test(actionableText);
 }
 const ROUTER_HOLD_LABELS = new Set([
-  'pedro', 'no-auto', 'manual-hold', 'production', 'risky',
+  'pedro', 'no-auto', 'manual-hold', 'production', 'prod-deploy',
   // Set atomically by kangentic_request_human_input. Both labels are holds so
   // neither the routed completion tool nor native plan-exit can advance work
   // while a material human answer is outstanding.
   'needs-info', 'needs-human',
 ]);
+// `risky` no longer holds (0.41.0-luuk.26): like the external router, it only
+// raises the review path. Deletion by an agent still refuses it.
+const DELETE_GUARD_LABELS = new Set([...ROUTER_HOLD_LABELS, 'risky']);
 
 /**
  * `go-ck` is CK's recorded GO (kangentic_record_human_go, admin transport only).
- * It lifts the risk labels and the sensitive-word text guard for that card, but
- * never a pending question or a manual pause, and never deletion or relocation.
+ * It lifts the production hold (label or declared deliverable) and Pedro's
+ * origin hold for that card, but never a pending question or a manual pause,
+ * and never deletion.
  */
 export const HUMAN_GO_LABEL = 'go-ck';
-const ROUTER_GO_LIFTS = new Set(['production', 'risky', 'pedro']);
+const ROUTER_GO_LIFTS = new Set(['production', 'prod-deploy', 'pedro']);
+
+// A PROD deliverable is declared, not guessed from words (same rule as the
+// router's isProductionDeliverable): the `Requiere producción: sí` line, or the
+// router Draft block field `Entregable en vivo: sí` (`Entregable PROD: sí`
+// before 21-sep). Loose words such as «main.js» or «sin deploy» never hold.
+const PRODUCTION_REQUIRED_FIELD = /^\s*(?:-\s*)?(?:\*\*)?Requiere\s+producci[oó]n\s*:(?:\*\*)?\s*s[ií](?![a-záéíóúñ])/im;
+const PRODUCTION_DELIVERABLE_FIELD = /^\s*(?:-\s*)?(?:\*\*)?Entregable\s+(?:en\s+vivo|prod)\s*:(?:\*\*)?\s*(?:s[ií]|yes|true)(?![a-záéíóúñ])/im;
+
+export function routerProductionDeliverable(labels: string[], text: string): boolean {
+  return labels.includes('production') || labels.includes('prod-deploy')
+    || PRODUCTION_REQUIRED_FIELD.test(text) || PRODUCTION_DELIVERABLE_FIELD.test(text);
+}
 
 export function routerTaskHeld(labels: string[]): boolean {
   const approved = labels.includes('approved');
@@ -1131,9 +1150,19 @@ export function routerTaskHeld(labels: string[]): boolean {
     && !(go && ROUTER_GO_LIFTS.has(label)));
 }
 
-/** Held, or sensitive text without CK's recorded GO. */
+/** Held, or a declared PROD deliverable without CK's recorded GO. */
 export function routerGuarded(labels: string[], text: string): boolean {
-  return routerTaskHeld(labels) || (!labels.includes(HUMAN_GO_LABEL) && routerTextSensitive(text));
+  return routerTaskHeld(labels)
+    || (!labels.includes(HUMAN_GO_LABEL) && routerProductionDeliverable(labels, text));
+}
+
+/**
+ * Agent deletion never honors go-ck: a Draft, any hold or risk label, a
+ * declared PROD deliverable, or sensitive wording all require a human.
+ */
+export function routerDeleteGuarded(labels: string[], text: string): boolean {
+  return labels.some((label) => DELETE_GUARD_LABELS.has(label))
+    || routerProductionDeliverable(labels, text) || routerTextSensitive(text);
 }
 
 /**
@@ -1662,8 +1691,8 @@ export const handleDeleteTask: CommandHandler = (
   const sourceLane = new SwimlaneRepository(db).getById(task.swimlane_id);
   const deleteGuardLabels = task.labels.map((label) => label.trim().toLowerCase());
   if (context.actor !== 'human'
-      && (sourceLane?.name === 'Draft' || routerTaskHeld(deleteGuardLabels)
-        || routerTextSensitive(`${task.title}\n${task.description}`))) {
+      && (sourceLane?.name === 'Draft'
+        || routerDeleteGuarded(deleteGuardLabels, `${task.title}\n${task.description}`))) {
     return { success: false, error: 'Agents may not delete Draft, held, or sensitive tasks; human action is required' };
   }
 
