@@ -1,10 +1,11 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import { Plus, X } from 'lucide-react';
 import { useBoardStore } from '../../stores/board-store';
 import { useConfigStore } from '../../stores/config-store';
 import { useProjectStore } from '../../stores/project-store';
 import { useSessionStore } from '../../stores/session-store';
 import { useToastStore } from '../../stores/toast-store';
+import { describeIpcError } from '../../lib/ipc-error';
 import { useKeybinding } from '../../hooks/useKeybinding';
 import { NameFromPromptButton } from '../NameFromPromptButton';
 import { BaseDialog } from './BaseDialog';
@@ -155,8 +156,12 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
   // unmount-only cleanup revokes the CURRENT set: a [] dep captures the
   // mount-time (empty) array and leaks later previews, while an `attachments`
   // dep would revoke URLs still on screen on every add/remove.
+  // Written on commit (a layout effect), never during render, which the
+  // compiler rules forbid.
   const attachmentsRef = useRef(attachments);
-  attachmentsRef.current = attachments;
+  useLayoutEffect(() => {
+    attachmentsRef.current = attachments;
+  });
   useEffect(() => {
     return () => {
       attachmentsRef.current.forEach((a) => URL.revokeObjectURL(a.previewUrl));
@@ -316,6 +321,17 @@ export function NewTaskDialog({ swimlaneId, onClose }: NewTaskDialogProps) {
         variant: 'info',
       });
       onClose();
+    } catch (error) {
+      // Previously unhandled: a rejected create (including a pending
+      // attachment write failing inside it) reached only the global
+      // unhandledrejection analytics listener, with nothing shown to the
+      // user. The dialog stays open so the title/description/attachments
+      // are not lost and the user can retry.
+      console.error('[NewTaskDialog] Failed to create task:', error);
+      useToastStore.getState().addToast({
+        message: `Couldn't create task: ${describeIpcError(error)}`,
+        variant: 'error',
+      });
     } finally {
       setSubmitting(false);
     }

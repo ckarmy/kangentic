@@ -1,8 +1,7 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { app, BrowserWindow, ipcMain, Notification, dialog, shell, globalShortcut, clipboard } from 'electron';
+import { app, BrowserWindow, ipcMain, Notification, dialog, shell, globalShortcut, clipboard, nativeImage } from 'electron';
 import { IPC } from '../../../shared/ipc-channels';
 import { comboToAccelerator } from '../../../shared/keybindings';
 import { WorktreeManager } from '../../git/worktree-manager';
@@ -19,7 +18,7 @@ import { agentCliNotFoundMessage } from '../../agent/shared/agent-cli-not-found'
 import { broadcast } from '../../pop-out/window-broadcast';
 import { resolveRelayUrl } from '../../../shared/relay';
 import { EXTERNAL_OPEN_SCHEMES, isAllowedExternalUrl } from '../../../shared/external-url';
-import { capClipboardImage, pruneClipboardTempDir } from '../helpers/clipboard-image';
+import { writePastedImage } from '../helpers/clipboard-image';
 import { openPathBounded } from '../helpers/open-path';
 import type {
   NotificationInput,
@@ -149,6 +148,11 @@ export function registerSystemHandlers(context: IpcContext): void {
     // stays in theme/settings sync (they subscribe through config.onChanged in
     // usePopOutBootstrap). The main window is a harmless extra recipient: it does not
     // subscribe, updating its own config store optimistically at the config.set call site.
+    //
+    // Fires regardless of whether the write reached disk: the in-memory config changed
+    // either way (configManager.save() keeps serving it - see write-failure-notice.ts),
+    // so every window's optimistic read should still match. A write failure is reported
+    // separately, through config:writeFailed, not by skipping this broadcast.
     broadcast(context.mainWindow, IPC.CONFIG_CHANGED);
   });
 
@@ -157,9 +161,14 @@ export function registerSystemHandlers(context: IpcContext): void {
   // so the final window-layout write goes through sendSync, which blocks the renderer until
   // configManager.save() (a synchronous fs write) has persisted it. Intentionally minimal:
   // no runtime re-apply or detection invalidation, both irrelevant during shutdown.
+  //
+  // returnValue carries whether the write actually reached disk (previously hardcoded
+  // true): a throw here used to leave returnValue unassigned, so the channel reported
+  // success and failure identically. Nothing reads it yet: the preload bridge discards the
+  // sendSync result and `ElectronAPI.config.setSync` returns void. The user-facing half is
+  // the CONFIG_WRITE_FAILED toast safeWriteJson already pushes.
   ipcMain.on(IPC.CONFIG_SET_SYNC, (event, config) => {
-    context.configManager.save(config);
-    event.returnValue = true;
+    event.returnValue = context.configManager.save(config);
   });
 
   ipcMain.handle(IPC.CONFIG_GET_PROJECT, () => {
@@ -174,6 +183,7 @@ export function registerSystemHandlers(context: IpcContext): void {
     // A per-project override changes the EFFECTIVE config open pop-outs read (the Changes
     // surface reads git.defaultBaseBranch, which is project-overridable), so fan the same
     // bare signal CONFIG_SET does so they re-fetch instead of diffing a stale base branch.
+    // Same "fires either way" reasoning as CONFIG_SET's broadcast above.
     broadcast(context.mainWindow, IPC.CONFIG_CHANGED);
   });
 
@@ -220,8 +230,13 @@ export function registerSystemHandlers(context: IpcContext): void {
     for (const project of projects) {
       const existing = context.configManager.loadProjectOverrides(project.path) || {};
       const merged = deepMergeConfig(existing, partial);
-      context.configManager.saveProjectOverrides(project.path, merged);
-      updatedCount++;
+      // One unwritable project's directory must not abort the sync for its siblings,
+      // and must not count as "updated" - saveProjectOverrides() no longer throws
+      // (see write-failure-notice.ts), so this loop needs its own per-project check
+      // to keep the returned count honest.
+      if (context.configManager.saveProjectOverrides(project.path, merged)) {
+        updatedCount++;
+      }
     }
     if (context.currentProjectPath) {
       applyRuntimeConfig(context.sessionManager, context.configManager, context.currentProjectPath);
@@ -654,24 +669,28 @@ export function registerSystemHandlers(context: IpcContext): void {
   ipcMain.handle(IPC.CLIPBOARD_READ_IMAGE, (): string | null => {
     const image = clipboard.readImage();
     if (image.isEmpty()) return null;
-    const tempDir = path.join(os.tmpdir(), 'kangentic-clipboard');
-    try {
-      fs.mkdirSync(tempDir, { recursive: true });
-      // Nothing used to delete these, so the directory grew for the life of the
-      // install. Disk hygiene only - it does not change what an agent is billed.
-      pruneClipboardTempDir(tempDir);
-      const filePath = path.join(tempDir, `pasted-image-${Date.now()}.png`);
-      fs.writeFileSync(filePath, capClipboardImage(image).toPNG());
-      return filePath;
-    } catch (error) {
-      // Degrade to the same null an empty clipboard returns rather than
-      // rejecting the renderer's invoke. The disk can be full, a Windows
-      // antivirus scanner can hold a just-created temp file, and on a shared
-      // Linux /tmp the directory can already belong to another user. None of
-      // those should turn a Ctrl+V into an unhandled rejection.
-      console.error('[clipboard] Failed to save pasted image:', error);
-      return null;
-    }
+    // A write failure degrades to the same null an empty clipboard returns
+    // rather than rejecting the renderer's invoke (see writePastedImage).
+    return writePastedImage(image);
+  });
+
+  // Save PNG bytes the renderer decoded from a dropped image file into the same
+  // temp directory, under the same cap and prune, and return the path. This is
+  // the drop-path twin of CLIPBOARD_READ_IMAGE for a format the agent CLI cannot
+  // take from a path (a bmp: outside Claude Code's native paste scan, and its
+  // Read tool refuses the file as binary). The renderer decodes because it
+  // already holds the dropped File and Chromium reads every format `<img>`
+  // does; main's `nativeImage` decodes only PNG and JPEG, so the bytes arrive
+  // here already PNG and the decode below is a validity check, not a
+  // conversion. Null for anything that is not a decodable image, so the
+  // renderer falls back to the path it had.
+  ipcMain.handle(IPC.CLIPBOARD_SAVE_IMAGE, (_event, pngBytes: unknown): string | null => {
+    if (!(pngBytes instanceof Uint8Array) || pngBytes.byteLength === 0) return null;
+    const image = nativeImage.createFromBuffer(
+      Buffer.from(pngBytes.buffer, pngBytes.byteOffset, pngBytes.byteLength),
+    );
+    if (image.isEmpty()) return null;
+    return writePastedImage(image);
   });
 
   // Write text to the clipboard natively in the main process rather than via the web

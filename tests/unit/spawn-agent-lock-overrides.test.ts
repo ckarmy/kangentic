@@ -145,8 +145,22 @@ function makeDeps(args: { latestSession: unknown; task: Task }) {
     getLatestForTask: vi.fn(() => args.latestSession),
     getLatestForTaskByTypeAndIsolation: vi.fn(() => undefined),
   };
+  // `executeTransition` takes an options object now, not a positional
+  // `agentOverride`. The resolved agent still reaches this leg, inside the
+  // `legacySpawnAgent` closure the runner calls for a legacy `spawn_agent` row,
+  // so the fake invokes that closure and records the agent it forwards.
+  const runLegacySpawnAgent = vi.fn(async () => {});
   const engine = {
-    executeTransition: vi.fn(async () => {}),
+    executeTransition: vi.fn(async (
+      _task: unknown,
+      _lane: unknown,
+      _trigger: string,
+      runOptions: { legacySpawnAgent: (config: Record<string, unknown>) => Promise<void> },
+    ) => {
+      await runOptions.legacySpawnAgent({});
+      return { outcomes: [], failures: [], startedAgent: false };
+    }),
+    runLegacySpawnAgent,
     resumeSuspendedSession: vi.fn(async () => {}),
   };
   const context = {
@@ -190,6 +204,41 @@ async function runSpawn(
     ...extraOptions,
   });
 }
+
+describe('spawnAgent: a To Do or Done column never spawns, whatever its flag says', () => {
+  // Lives here for the harness: this file runs the real spawnAgent end to
+  // end. The flag can land on a role lane over MCP (`update_column` has no
+  // role guard) or through a Board Profile fold, and this chokepoint used to
+  // honor it for a task created, promoted, or restored straight into To Do,
+  // spawning a live agent behind a card the renderer treats as sessionless
+  // (#661). The move path never reaches here for a todo target
+  // (task-move.ts branches on role first), so this is the create-shaped hole.
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each([['todo'], ['done']] as const)('neither spawns nor locks overrides into a %s column with auto_spawn on', async (role) => {
+    const task = makeTask({ model_override: 'fable-5' });
+    const deps = makeDeps({ latestSession: undefined, task });
+
+    await runSpawn(task, makeSwimlane({ name: 'Role lane', role, auto_spawn: true }), deps);
+
+    // Pre-fix both fired: the engine spawned and the preamble locked the
+    // task's overrides on what it took to be a first spawn.
+    expect(deps.engine.executeTransition).not.toHaveBeenCalled();
+    expect(deps.engine.resumeSuspendedSession).not.toHaveBeenCalled();
+    expect(deps.tasks.update).not.toHaveBeenCalled();
+  });
+
+  it('still spawns into a custom column (role null) with auto_spawn on', async () => {
+    const task = makeTask();
+    const deps = makeDeps({ latestSession: undefined, task });
+
+    await runSpawn(task, makeDestinationLane(), deps);
+
+    expect(deps.engine.executeTransition).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('spawnAgent lock-Advanced-overrides-on-first-spawn', () => {
   beforeEach(() => {
@@ -403,10 +452,11 @@ describe('spawnAgent lock-Advanced-overrides-on-first-spawn', () => {
     expect(deps.tasks.update).toHaveBeenCalledWith(
       expect.objectContaining({ id: TASK_ID, agent_override: 'codex' }),
     );
-    // The resolved agent reaches the engine on BOTH legs: the transition
-    // (agentOverride is the 7th argument) and the fallback resume (6th).
+    // The resolved agent reaches the engine on BOTH legs: the transition (now
+    // through the legacySpawnAgent closure, 5th argument) and the fallback
+    // resume (6th).
     expect(deps.engine.executeTransition).toHaveBeenCalledTimes(1);
-    expect(deps.engine.executeTransition.mock.calls[0][6]).toBe('codex');
+    expect(deps.engine.runLegacySpawnAgent.mock.calls[0][4]).toBe('codex');
     expect(deps.engine.resumeSuspendedSession).toHaveBeenCalledTimes(1);
     expect(deps.engine.resumeSuspendedSession.mock.calls[0][5]).toBe('codex');
   });
@@ -427,7 +477,7 @@ describe('spawnAgent lock-Advanced-overrides-on-first-spawn', () => {
 
     expect(deps.tasks.update).not.toHaveBeenCalled();
     expect(deps.engine.executeTransition).toHaveBeenCalledTimes(1);
-    expect(deps.engine.executeTransition.mock.calls[0][6]).toBe('claude');
+    expect(deps.engine.runLegacySpawnAgent.mock.calls[0][4]).toBe('claude');
     expect(deps.engine.resumeSuspendedSession).toHaveBeenCalledTimes(1);
     expect(deps.engine.resumeSuspendedSession.mock.calls[0][5]).toBe('claude');
   });

@@ -8,6 +8,7 @@ import { getSwimlaneIcon } from '../../utils/swimlane-icons';
 import { useBoardStore } from '../../stores/board-store';
 import { useColumnWidthClass } from './column-width';
 import { CountBadge } from '../CountBadge';
+import { AutomationGlyph } from './AutomationGlyph';
 import type { Swimlane as SwimlaneType, Task } from '../../../shared/types';
 
 export interface SwimlaneProps {
@@ -65,11 +66,18 @@ export const Swimlane = React.memo(function Swimlane({ swimlane, tasks, dragHand
       >
         {/* Drag handle for custom columns */}
         {isDraggable && (
+          // `dragHandleProps` carries dnd-kit's attributes too (tabindex, role,
+          // aria-*), so this is the column's one focus stop and the shared
+          // keyboard sensor lifts the column from here. It draws no text, so it
+          // names itself.
           // select-none-ok: the handle draws a grip icon and no text, and it
           // inherits the header's `select-none` anyway.
           <div
             {...dragHandleProps}
             onClick={(e: React.MouseEvent) => e.stopPropagation()}
+            aria-label={`Reorder ${swimlane.name} column`}
+            title="Drag to reorder"
+            data-testid="column-drag-handle"
             className="text-fg-disabled hover:text-fg-muted cursor-grab active:cursor-grabbing transition-colors -ml-1"
           >
             <GripVertical size={14} />
@@ -97,6 +105,8 @@ export const Swimlane = React.memo(function Swimlane({ swimlane, tasks, dragHand
         </span>
 
         <CountBadge count={tasks.length} />
+
+        <AutomationGlyph swimlaneId={swimlane.id} />
 
         <button
           type="button"

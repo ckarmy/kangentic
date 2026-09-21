@@ -129,10 +129,38 @@ Reading a native event, in order of what trips people up:
   whether the release or the app context was corrected. Absence means one of two things: the event
   predates that filter, or its dump could not be parsed and was therefore kept untouched. Either
   way the two traps below still apply to it in full.
+- **On an Electron OOM (`exit.reason: oom`, `mechanism: minidump`), read
+  `contexts.chromium_stability_report.system_memory_state` before anything else.** It carries
+  `system_commit_limit` and `system_commit_remaining` - the Windows commit charge, not physical
+  RAM - alongside the crashing process's own `process_states[0].memory_state.windows_memory`
+  (`process_private_usage`, `process_peak_pagefile_usage`, `process_allocation_attempt`). This one
+  field answers "did the process grow, or did the host run out" without touching a single stack
+  frame: DESKTOP-16 was a renderer holding 179 MB (smaller than a healthy long session) that died
+  because the MACHINE had 2.15 MB of commit left out of an 89.8 GB limit, with 4.66 GB of physical
+  RAM still free. Chromium's own OOM frames (`PartitionsOutOfMemoryUsingLessThan16M`,
+  `PartitionOutOfMemoryCommitFailure`) name which allocation-size bucket failed and that it was a
+  commit refusal, but they say nothing about whose growth caused it - `system_commit_remaining`
+  is the only field that separates "renderer leak" from "host exhausted" and it takes one read to
+  check. Also see `contexts.host_memory` if the event postdates DESKTOP-16's fix
+  (`src/main/diagnostics/host-memory.ts`), which carries main's own periodic sample of the same
+  Windows commit figures via a different, verified route (`process.getSystemMemoryInfo()`).
 - **On an older event, the release tag is the UPLOADING build's, not the crashed one's.**
   Crashpad writes the dump and the next launch uploads it; if the user upgraded in between, the
   tag is a build that never crashed. `contexts.crashpad._version` is the build that did.
   DESKTOP-M cost a triage sweep a wrong conclusion this way.
+- **A shifted stack re-groups into a new issue, so "no new event on this issue" does not mean
+  the crash class is gone.** Native grouping keys off stack frames, and inlining, a different
+  thread interleaving, or an ASLR-shifted offset can move the same underlying bug into a fresh
+  shortId. Verifying a fix held on a later release needs a `release:Kangentic@X` query, not
+  `firstRelease:`, which misses a group born on an older release that still carries events on X.
+  Drop the `is:unresolved` and the `statsPeriod` that this skill's query examples carry. Both hide
+  events the release genuinely produced, which breaks the count. Sum every returned group and
+  check the total against that release's own event count from the releases endpoint. A match
+  means every event the release produced is accounted for by a named group; read each group's
+  title to confirm none is the crash class in question. A mismatch means the search was
+  incomplete, not that a recurrence is hiding. Widen it and count again. Task #669
+  (DESKTOP-Y/DESKTOP-Z) is where this mattered: 0.41.0's six new groups summed to its entire
+  16-event volume, and none was a teardown crash.
 - **Breadcrumbs on a startup-found dump are not the crashed session's.** On an older event they
   are the uploading launch's, wholly or partly; on a corrected one they are removed rather than
   left to mislead. Breadcrumbs on an event tagged `exit.reason` are trustworthy: that tag marks
@@ -194,8 +222,10 @@ says a human has looked at this and it has a home. Rules:
   issue must keep meaning "nobody has dealt with this".
 - Resolve nothing here. Assignment leaves the issue in the unresolved stream where a recurrence
   is still visible, which is the whole point: a fix that does not hold shows up as new events on
-  an assigned issue rather than disappearing. That holds until the fix actually ships, so
-  resolution is a release-time act, not a triage one. See Resolution markers below.
+  an assigned issue rather than disappearing. A native crash is the exception, because a shifted
+  stack re-groups into a fresh shortId and the assigned issue stays silent (see Native minidumps
+  above). Assignment holds until the fix actually ships, so resolution is a release-time act, not
+  a triage one. See Resolution markers below.
 
 ## Resolution markers
 

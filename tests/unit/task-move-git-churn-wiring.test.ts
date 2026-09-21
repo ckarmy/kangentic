@@ -190,6 +190,11 @@ function makeContext(taskRepo: unknown, swimlaneRepo: unknown) {
     killByTaskId: vi.fn(),
     listSessions: vi.fn(() => []),
     suspend: vi.fn(async () => {}),
+    // Phase 1 reconciles task.session_id against the registry before the
+    // Priority ladder; a live row for the pointed-at id keeps these fixtures
+    // on the live-session branches they exercise.
+    getSession: vi.fn((id: string) => ({ id, status: 'running' })),
+    findLiveSessionByTaskId: vi.fn(() => null),
     // Read by resolveLiveEffort; empty means the agent reports no effort.
     getUsageCache: vi.fn((): Record<string, unknown> => ({})),
   };
@@ -208,6 +213,10 @@ function makeContext(taskRepo: unknown, swimlaneRepo: unknown) {
     tasks: taskRepo,
     swimlanes: swimlaneRepo,
     actions: { getTransitionsFor: vi.fn(() => []) },
+    // The column's message lives in its automations now, so every move reads
+    // them. Empty: these cases are about git churn, not messages.
+    automations: { listForColumn: vi.fn(() => []), getForTrigger: vi.fn(() => []) },
+    automationRuns: { start: vi.fn(), finish: vi.fn(), recordSkipped: vi.fn() },
     attachments: { deleteByTaskId: vi.fn() },
   });
   return context;

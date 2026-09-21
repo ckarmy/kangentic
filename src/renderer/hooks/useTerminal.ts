@@ -1,12 +1,11 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import { Terminal } from '@xterm/xterm';
-import { FitAddon, type FitOutcome } from '../addons/fit-addon';
+import { FitAddon, CONFORM_FONT_STEP_PX, CONFORM_MIN_FONT_PX, type CellSize, type FitOutcome } from '../addons/fit-addon';
 import { attachWebglRenderer, notifyFontChanged } from '../utils/terminal-webgl';
 import { copySelectionToClipboard, enableTerminalClipboard, stripOsc52Sequences } from '../utils/terminal-clipboard';
 import { createTerminalLinkHandler } from '../utils/terminal-link-handler';
 import { createWriteBatcher, type WriteBatcher } from '../utils/write-batcher';
 import { createIncomingWriteQueue, writeChunkedToTerminal } from '../utils/incoming-write-queue';
-import { onBoardDragEnd } from '../lib/session-update-coalescer';
 import { isTerminalParked, onTerminalReveal } from '../utils/parked-terminals';
 import { onTerminalRefocus } from '../utils/focused-terminals';
 import { noteTerminalFocus } from '../utils/dictation-target';
@@ -20,7 +19,7 @@ import {
 import { createRepaintNudge, isUserInputData, isMouseReport, mouseReportLane, type RepaintNudgeController } from '../utils/repaint-nudge';
 import { registerMountedTerminal } from '../utils/terminal-mount-registry';
 import { registerTerminalAnchor } from '../utils/terminal-anchor-registry';
-import type { PtyResizeOrigin, TerminalColorOverrides } from '../../shared/types';
+import type { PastedImageCapability, PtyResizeOrigin, SessionResizeResult, TerminalColorOverrides } from '../../shared/types';
 // Type only, so this creates no runtime edge to the arbiter (the hook stays
 // surface-agnostic and never reads the policy - it only labels its own paths).
 import type { ArrivalFocusSite } from '../utils/terminal-arrival-focus';
@@ -261,15 +260,16 @@ interface UseTerminalOptions {
   /** Let Escape bubble (to close the containing dialog) when the mouse pointer
    *  is outside the terminal. Used by the task detail dialog. */
   releaseEscapeWhenPointerOutside?: boolean;
-  /** Adapter-declared template (see `AgentDetectionInfo.pastedImageReferenceTemplate`) for
-   *  the text injected when a pasted/dropped image is captured to a temp PNG. Read live via
-   *  a ref (not captured at attach time) since the agent list loads asynchronously and can
-   *  resolve after `enableTerminalClipboard` has already attached its key handler. */
-  pasteImageTemplate?: string;
+  /** Adapter-declared image-paste capability (`PastedImageCapability`: the extensions the
+   *  CLI attaches natively from a pasted path, and the fallback template for the rest),
+   *  which decides the text pasted when a clipboard image is captured to a temp PNG. Read
+   *  live via a ref (not captured at attach time) since the agent list loads asynchronously
+   *  and can resolve after `enableTerminalClipboard` has already attached its key handler. */
+  pasteImageCapability?: PastedImageCapability;
   /** When true, plain Backspace sends Ctrl+H (0x08) instead of xterm's default
    *  DEL (0x7f), matching native Windows conhost so Claude Code's TUI deletes
    *  the previous word. Read live via a ref (same pattern as
-   *  pasteImageTemplate) so a settings toggle applies without remount. */
+   *  pasteImageCapability) so a settings toggle applies without remount. */
   backspaceSendsCtrlH?: boolean;
   /** Fired every time a scrollback operation (mount replay, reload, watchdog
    *  force-recovery, or IPC-rejection recovery) settles, i.e. whenever
@@ -541,6 +541,17 @@ export function resolveReplayWidthAction(input: ReplayWidthInput): ReplayWidthDe
   return { action: 'replay', nextAttempts: input.attempts + 1 };
 }
 
+/** How many quarter-pixel steps conformToHeldGrid takes below its proposal
+ *  before giving up on a grid the box will not hold. */
+const CONFORM_MAX_STEPS = 4;
+/** A held grid is never shown above the configured font. Scaling DOWN is the
+ *  point of conforming (the whole held grid fits a pane too small for it);
+ *  scaling UP would put a terminal in bigger type than the panel beside it,
+ *  which read as two font sizes on one screen the first time it was seen. A
+ *  pane larger than the held grid needs shows it at the normal size,
+ *  letterboxed. */
+export const CONFORM_MAX_SCALE = 1;
+
 export function useTerminal(options: UseTerminalOptions) {
   const terminalRef = useRef<HTMLDivElement>(null);
   const xtermRef = useRef<Terminal | null>(null);
@@ -630,25 +641,289 @@ export function useTerminal(options: UseTerminalOptions) {
    *  a glyph-atlas re-rasterization) apart from a cursor/scrollback/color-only
    *  change (which reuses the existing atlas and applies synchronously). */
   const lastAppliedFontRef = useRef<{ family: string; size: number } | null>(null);
-  /** Updated every render so the paste handler (attached once by initTerminal)
-   *  always reads the current template, even though the agent list resolves
-   *  asynchronously after the terminal has already initialized. */
-  const pasteImageTemplateRef = useRef(options.pasteImageTemplate);
-  pasteImageTemplateRef.current = options.pasteImageTemplate;
-  /** Updated every render (same pattern as pasteImageTemplateRef) so the key
+  /** Updated on every commit (see the layout effect below) so the paste handler
+   *  (attached once by initTerminal) always reads the current capability, even
+   *  though the agent list resolves asynchronously after the terminal has
+   *  already initialized. */
+  const pasteImageCapabilityRef = useRef(options.pasteImageCapability);
+  /** Updated on every commit (same pattern as pasteImageCapabilityRef) so the key
    *  handler attached once by initTerminal always reads the current setting. */
   const backspaceSendsCtrlHRef = useRef(options.backspaceSendsCtrlH);
-  backspaceSendsCtrlHRef.current = options.backspaceSendsCtrlH;
-  /** Updated every render (same pattern as pasteImageTemplateRef) so the settle
-   *  paths attached by initTerminal/reloadScrollback always call the caller's
-   *  current callback. */
+  /** The grid main is holding this session at (SessionResizeResult.held), or
+   *  null while the terminal runs its own container fit. See conformToHeldGrid. */
+  const heldGridRef = useRef<{ cols: number; rows: number } | null>(null);
+  /** The font size the terminal runs at while conformed, so the display-settings
+   *  effect re-derives it on a font change instead of clobbering it. */
+  const conformedFontRef = useRef<number | null>(null);
+  /** The configured font size and the session, updated on every commit, so the
+   *  conform callbacks below (stable, ref-reading) scale from the size the user
+   *  chose and label their traces with the session they serve. */
+  const configuredFontRef = useRef(options.fontSize || 14);
+  const sessionIdRef = useRef(options.sessionId ?? null);
+  // The latest-value refs above are written in a layout effect, on commit,
+  // never during render: the compiler rules forbid a render-time ref write,
+  // and a listener must never see a value from a render that was discarded.
+  // Every reader (the xterm handlers, the IPC and settle callbacks, the fit and
+  // conform paths, the watchdog) runs after commit, and neither this hook nor
+  // its hosts reads them from a layout effect, so the ordering is safe.
+  useLayoutEffect(() => {
+    pasteImageCapabilityRef.current = options.pasteImageCapability;
+    backspaceSendsCtrlHRef.current = options.backspaceSendsCtrlH;
+    configuredFontRef.current = options.fontSize || 14;
+    sessionIdRef.current = options.sessionId ?? null;
+  });
+  /** The cell measured at the configured font, taken by every unheld fit, so a
+   *  held terminal can say what grid it would fit on its own (fitTerminal's
+   *  probe) without touching the font it is conformed to. */
+  const naturalCellRef = useRef<CellSize | null>(null);
+  /** The cell measured right after the last conform, at the conformed font,
+   *  under the renderer of that moment: what a renderer swap is measured
+   *  against to rescale the natural-cell memo (handleRendererChange). */
+  const conformedCellRef = useRef<CellSize | null>(null);
+  /** Bumped per outgoing grid request. Several can be in flight at once (every
+   *  refit probes while held) and they resolve in whatever order main answers,
+   *  so an answer acts only if no later request has been sent since. Without
+   *  this, an early probe still carrying `held` can land after a later one was
+   *  accepted and re-establish the hold that was just correctly released. */
+  const gridRequestGenerationRef = useRef(0);
+
+  /**
+   * Show the grid main is HOLDING instead of our own container fit.
+   *
+   * A resize can come back `held` (SessionResizeResult): main keeps the PTY at a
+   * grid of its own (a phone streaming it, or a replay whose bytes address the
+   * grid they were recorded at) and the frame it paints addresses that grid. A
+   * terminal that kept its natural fit would show that frame wrapped or clipped
+   * inside a grid the bytes were never laid out for. So the terminal takes the
+   * held grid as its own and picks the font size that fits it into the pane,
+   * letterboxed; the picture is then the PTY's picture, scaled. The size is
+   * proposed from the current cell metrics and checked after applying, stepping
+   * down while rounding still leaves the grid a pixel over the box.
+   *
+   * Returns false, and leaves the hold unset, when the pane cannot show the grid
+   * at CONFORM_MIN_FONT_PX or the terminal cannot be measured; the caller keeps
+   * its own fit then.
+   */
+  const conformToHeldGrid = useCallback((grid: { cols: number; rows: number }, origin: string): boolean => {
+    const terminal = xtermRef.current;
+    const fitAddon = fitAddonRef.current;
+    const sessionId = sessionIdRef.current;
+    if (!terminal || !fitAddon) return false;
+    const currentFont = typeof terminal.options.fontSize === 'number' && terminal.options.fontSize > 0
+      ? terminal.options.fontSize
+      : configuredFontRef.current;
+    const fontSize = fitAddon.proposeFontSizeForGrid(grid.cols, grid.rows, currentFont);
+    if (fontSize === null) {
+      traceTerminalRenderer(sessionId, 'conform-declined', { cols: grid.cols, rows: grid.rows, origin });
+      return false;
+    }
+    let candidateFontSize = Math.min(fontSize, configuredFontRef.current * CONFORM_MAX_SCALE);
+    // The size the loop actually VERIFIED against the box. It stays null until a
+    // measurement says the grid fits, so every way out of the loop that did not
+    // prove a fit declines below rather than committing a size nothing checked.
+    let verifiedFontSize: number | null = null;
+    let declineReason = 'steps';
+    for (let attempt = 0; attempt < CONFORM_MAX_STEPS; attempt++) {
+      // xterm re-measures the cell as soon as the option is assigned, so the
+      // proposal right after reads the new metrics.
+      if (terminal.options.fontSize !== candidateFontSize) terminal.options.fontSize = candidateFontSize;
+      const check = fitAddon.proposeDimensions();
+      // An unmeasurable box is a decline, not a fit: committing here would hold
+      // the grid at a size nothing verified, which is the clipped frame this
+      // whole path exists to avoid.
+      if (!check) {
+        declineReason = 'unmeasurable';
+        break;
+      }
+      if (check.cols >= grid.cols && check.rows >= grid.rows) {
+        verifiedFontSize = candidateFontSize;
+        break;
+      }
+      candidateFontSize -= CONFORM_FONT_STEP_PX;
+      if (candidateFontSize < CONFORM_MIN_FONT_PX) {
+        declineReason = 'floor';
+        break;
+      }
+    }
+    if (verifiedFontSize === null) {
+      // Floor, an unmeasurable box, or a step budget that ran out before the
+      // grid fit. All three mean this pane cannot show the held grid, so the
+      // caller keeps its own fit instead of showing the frame clipped.
+      terminal.options.fontSize = conformedFontRef.current ?? configuredFontRef.current;
+      traceTerminalRenderer(sessionId, 'conform-declined', { cols: grid.cols, rows: grid.rows, origin, reason: declineReason });
+      return false;
+    }
+    heldGridRef.current = { cols: grid.cols, rows: grid.rows };
+    conformedFontRef.current = verifiedFontSize;
+    conformedCellRef.current = fitAddon.measureCell();
+    terminal.resize(grid.cols, grid.rows);
+    // Record what xterm now runs at, WITHOUT notifying. The display-settings
+    // effect gates its atlas clear on this terminal's own applied font having
+    // moved, which is only safe if the ref tracks every move. A size changed
+    // HERE and left unrecorded is seen by that effect later, on an unrelated
+    // theme or cursor change, and clears a SHARED atlas while re-rendering only
+    // this terminal - garbling every sibling on it, which is the bug the gate
+    // exists to prevent. Only the size moves; conform never touches the family.
+    // Left null when null: the effect has not run yet, and writing it here
+    // would suppress a first-mount clear that is genuinely due.
+    if (lastAppliedFontRef.current) {
+      lastAppliedFontRef.current = { ...lastAppliedFontRef.current, size: verifiedFontSize };
+    }
+    // No notifyFontChanged here, deliberately. The WebGL glyph atlas is SHARED:
+    // @xterm/addon-webgl's CharAtlasCache is a module-level list, and
+    // acquireTextureAtlas hands the SAME atlas to every terminal whose config
+    // matches (configEquals compares the font family and size, the measured
+    // char size, the device pixel ratio and the palette). clearTextureAtlas()
+    // then wipes that shared texture but re-renders only the caller
+    // (`_charAtlas.clearTexture()` plus `_clearModel(true)` on this renderer
+    // alone), so every other terminal on the atlas keeps glyph coordinates into
+    // a texture that no longer holds those glyphs and paints garbage. The
+    // bottom panel did exactly that, the moment a window conformed to the same
+    // 12 px it runs at. A size change needs no clear anyway: the size is part
+    // of the config, so the conformed terminal acquires its own atlas. The
+    // display-settings effect still clears on a global font change, where every
+    // terminal's effect fires and each one re-renders its own model.
+    traceTerminalRenderer(sessionId, 'conform', { cols: grid.cols, rows: grid.rows, fontSize: verifiedFontSize, origin });
+    return true;
+  }, []);
+
+  /** Drop the hold: back to the configured font, and the caller's own fit. */
+  const releaseHeldGrid = useCallback((origin: string): void => {
+    if (!heldGridRef.current) return;
+    heldGridRef.current = null;
+    conformedFontRef.current = null;
+    // The conformed cell belonged to the font the hold ran at, so it is stale
+    // the moment the hold ends. Every read is gated on heldGridRef today, but
+    // clearing it keeps that gate from being the only thing standing between a
+    // future reader and a cell measured at a size nothing is running at.
+    conformedCellRef.current = null;
+    const terminal = xtermRef.current;
+    if (terminal && terminal.options.fontSize !== configuredFontRef.current) {
+      // Same reason as conformToHeldGrid: no atlas clear on a size change, and
+      // the same duty to record it so the display-settings effect does not see
+      // this move later and clear a shared atlas on an unrelated change.
+      terminal.options.fontSize = configuredFontRef.current;
+      if (lastAppliedFontRef.current) {
+        lastAppliedFontRef.current = { ...lastAppliedFontRef.current, size: configuredFontRef.current };
+      }
+    }
+    traceTerminalRenderer(sessionIdRef.current, 'unhold', { origin });
+  }, []);
+
+  /**
+   * Send a grid to main and act on the answer. `held` names a grid main keeps,
+   * so the terminal conforms to it (a new one; the same one is already shown).
+   * An accepted grid that was NOT the held one is a probe main let through, so
+   * the hold is over and the terminal goes back to its own fit. A plain refusal
+   * (no `held`) is left to the echo re-assert, as before.
+   */
+  const requestGrid = useCallback((sessionId: string, cols: number, rows: number, origin: string): Promise<SessionResizeResult | undefined> => {
+    traceTerminalRenderer(sessionId, 'resize-request', { cols, rows, origin });
+    const generation = ++gridRequestGenerationRef.current;
+    return window.electronAPI.sessions.resize(sessionId, cols, rows).then((result) => {
+      if (sessionIdRef.current !== sessionId || !xtermRef.current) return result;
+      // A later request has already been sent, so this answer describes a grid
+      // question that is no longer the one being asked. Acting on it would
+      // re-conform to a hold a newer answer released.
+      if (generation !== gridRequestGenerationRef.current) return result;
+      const held = heldGridRef.current;
+      if (result?.held) {
+        if (!held || held.cols !== result.held.cols || held.rows !== result.held.rows) {
+          // A decline means this pane cannot show the grid main is holding, so
+          // the terminal must not keep claiming the hold it had. Falling through
+          // with a stale heldGridRef leaves it conformed to a grid main has
+          // moved on from, showing a frame the PTY is no longer painting.
+          if (!conformToHeldGrid(result.held, origin)) releaseHeldGrid(origin);
+        }
+        return result;
+      }
+      if (!result?.refused && held && (cols !== held.cols || rows !== held.rows)) {
+        releaseHeldGrid(origin);
+        // The same pin the hook's fit() keeps: a terminal at its bottom stays there
+        // through the grid change, rather than landing a row or two up.
+        const wasAtBottom = isAtBottomRef.current;
+        const outcome = fitAddonRef.current?.fit();
+        if (outcome?.applied) {
+          naturalCellRef.current = fitAddonRef.current?.measureCell() ?? null;
+          if (wasAtBottom) xtermRef.current?.scrollToBottom();
+        }
+      }
+      return result;
+    });
+  }, [conformToHeldGrid, releaseHeldGrid]);
+
+  /**
+   * Every fit goes through here. Unheld, it is the container fit. Held, the
+   * terminal keeps main's grid and re-derives the font for the container's
+   * current box; with `probe`, it also tells main the grid it would take on its
+   * own at the configured font, so main can let the hold go once its reason has
+   * passed (the phone unsubscribed, a boot recorded at another width fits).
+   */
+  const fitTerminal = useCallback((origin: string, probe: boolean): FitOutcome => {
+    const fitAddon = fitAddonRef.current;
+    const terminal = xtermRef.current;
+    if (!fitAddon || !terminal) return { applied: false, reason: 'no-element' };
+    const held = heldGridRef.current;
+    if (!held) {
+      const outcome = fitAddon.fit();
+      if (outcome.applied && terminal.options.fontSize === configuredFontRef.current) {
+        naturalCellRef.current = fitAddon.measureCell();
+      }
+      return outcome;
+    }
+    const sessionId = sessionIdRef.current;
+    if (probe && sessionId && naturalCellRef.current) {
+      const natural = fitAddon.proposeDimensionsForCell(naturalCellRef.current);
+      if (natural) void requestGrid(sessionId, natural.cols, natural.rows, `${origin}-probe`);
+    }
+    if (!conformToHeldGrid(held, origin)) {
+      releaseHeldGrid(origin);
+      return fitAddon.fit();
+    }
+    return { applied: true, cols: held.cols, rows: held.rows };
+  }, [conformToHeldGrid, releaseHeldGrid, requestGrid]);
+
+  /**
+   * The renderer swapped (WebGL attached, lost, budget-suspended, or resumed),
+   * and the DOM renderer measures a wider cell than WebGL for the same font. An
+   * unheld terminal at the configured font just re-measures its natural cell. A
+   * held one cannot (its font is the conformed one), so the memo is rescaled by
+   * how much the conformed cell moved across the swap, and the held grid is
+   * conformed again for the new metrics.
+   */
+  const handleRendererChange = useCallback((): void => {
+    const fitAddon = fitAddonRef.current;
+    const terminal = xtermRef.current;
+    if (!fitAddon || !terminal) return;
+    if (!heldGridRef.current) {
+      if (terminal.options.fontSize === configuredFontRef.current) {
+        naturalCellRef.current = fitAddon.measureCell() ?? naturalCellRef.current;
+      }
+      return;
+    }
+    const before = conformedCellRef.current;
+    const after = fitAddon.measureCell();
+    const natural = naturalCellRef.current;
+    if (before && after && natural && before.width > 0 && before.height > 0) {
+      naturalCellRef.current = {
+        width: natural.width * (after.width / before.width),
+        height: natural.height * (after.height / before.height),
+      };
+    }
+    fitTerminal('renderer-change', false);
+  }, [fitTerminal]);
+  /** Updated on every commit (same pattern as pasteImageCapabilityRef) so the
+   *  settle paths attached by initTerminal/reloadScrollback always call the
+   *  caller's current callback. */
   const onScrollbackSettledRef = useRef(options.onScrollbackSettled);
-  onScrollbackSettledRef.current = options.onScrollbackSettled;
-  /** Updated every render (same pattern as onScrollbackSettledRef) so the single
-   *  arrival-focus frame below (`focusOnArrival`, reached from all five discharge
-   *  sites) asks the host's CURRENT policy. */
+  /** Updated on every commit (same pattern as onScrollbackSettledRef) so the
+   *  single arrival-focus frame below (`focusOnArrival`, reached from all five
+   *  discharge sites) asks the host's CURRENT policy. */
   const mayTakeArrivalFocusRef = useRef(options.mayTakeArrivalFocus);
-  mayTakeArrivalFocusRef.current = options.mayTakeArrivalFocus;
+  useLayoutEffect(() => {
+    onScrollbackSettledRef.current = options.onScrollbackSettled;
+    mayTakeArrivalFocusRef.current = options.mayTakeArrivalFocus;
+  });
 
   /** Single chokepoint for "a scrollback operation has settled". Ordering is
    *  load-bearing: pending must clear BEFORE the kick (the incoming queue's
@@ -902,6 +1177,18 @@ export function useTerminal(options: UseTerminalOptions) {
       cursor: customCursor,
     });
 
+    // Seed the applied-font memo with what the terminal is CONSTRUCTED with, so
+    // the display-settings effect's first run compares against the truth rather
+    // than against null. Null reads as "my font moved" and fires the shared
+    // atlas clear on a terminal that has applied nothing yet: opening a task
+    // window while the bottom panel already runs at the same font wiped the
+    // atlas they share and re-rendered only the new terminal, garbling the
+    // panel. The effect recomputes these two expressions exactly, so a fresh
+    // mount now notifies nothing and a genuine font change still does.
+    lastAppliedFontRef.current = {
+      family: options.fontFamily || 'Menlo, Consolas, "Courier New", monospace',
+      size: options.fontSize || 14,
+    };
     const terminal = new Terminal({
       fontFamily: options.fontFamily || 'Menlo, Consolas, "Courier New", monospace',
       fontSize: options.fontSize || 14,
@@ -958,7 +1245,7 @@ export function useTerminal(options: UseTerminalOptions) {
       options.shellName,
       options.sessionId ?? undefined,
       options.releaseEscapeWhenPointerOutside,
-      () => pasteImageTemplateRef.current,
+      () => pasteImageCapabilityRef.current,
       () => backspaceSendsCtrlHRef.current ?? false,
     );
 
@@ -972,7 +1259,7 @@ export function useTerminal(options: UseTerminalOptions) {
     // key for a session-less pane so the devtools report can distinguish them.
     const rendererKey = options.sessionId ?? `transient-${nextTransientRendererKey()}`;
     const webglStartedAt = readClock();
-    disposeWebglRef.current = attachWebglRenderer(terminal, rendererKey);
+    disposeWebglRef.current = attachWebglRenderer(terminal, rendererKey, { onRendererChange: handleRendererChange });
     webglElapsedMs = readClock() - webglStartedAt;
     rendererKeyRef.current = rendererKey;
 
@@ -1047,8 +1334,7 @@ export function useTerminal(options: UseTerminalOptions) {
         if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
         resizeTimerRef.current = setTimeout(() => {
           resizeTimerRef.current = null;
-          traceTerminalRenderer(sid, 'resize-request', { cols, rows, origin: 'debounced-onResize' });
-          window.electronAPI.sessions.resize(sid, cols, rows);
+          void requestGrid(sid, cols, rows, 'debounced-onResize');
         }, PTY_RESIZE_DEBOUNCE_MS);
       });
 
@@ -1072,6 +1358,8 @@ export function useTerminal(options: UseTerminalOptions) {
       const fitOutcome = fitAddon.fit();
       fitElapsedMs = readClock() - fitStartedAt;
       const { cols, rows } = terminal;
+      // The cell at the configured font, for the probe a later hold sends.
+      if (fitOutcome.applied) naturalCellRef.current = fitAddon.measureCell();
       // The container geometry this fit was computed against, recorded next to its
       // result. A second fit later producing a DIFFERENT cols is what forces an
       // extra PTY resize (and so an extra agent repaint) on a mount; comparing the
@@ -1089,9 +1377,10 @@ export function useTerminal(options: UseTerminalOptions) {
       // (PtyBufferManager.waitForResizeRepaint), so the replay is at the fitted
       // geometry - no stale frame, no compensating resize needed here. The
       // colsChanged field of the resize result is therefore intentionally
-      // unused by the renderer.
-      traceTerminalRenderer(sid, 'resize-request', { cols, rows, origin: 'mount' });
-      const resizePromise = window.electronAPI.sessions.resize(sid, cols, rows);
+      // unused by the renderer. A `held` answer is acted on inside requestGrid
+      // before this promise resolves, so the replay below lands on the held
+      // grid (see conformToHeldGrid).
+      const resizePromise = requestGrid(sid, cols, rows, 'mount');
       const scrollbackPromise = suppressScrollback
         ? Promise.resolve<string | null>(null)
         : window.electronAPI.sessions.getScrollback(sid);
@@ -1132,7 +1421,7 @@ export function useTerminal(options: UseTerminalOptions) {
             // agent repaints twice and the user sees the second one land.
             if (fitAddonRef.current) {
               const colsBeforeRefit = xtermRef.current?.cols ?? null;
-              const refitOutcome = fitAddonRef.current.fit();
+              const refitOutcome = fitTerminal('after-replay', false);
               traceTerminalRenderer(options.sessionId, 'fit', () =>
                 describeFit(xtermRef.current, 'after-replay', colsBeforeRefit, refitOutcome));
             }
@@ -1213,7 +1502,7 @@ export function useTerminal(options: UseTerminalOptions) {
       fitElapsedMs = readClock() - fitStartedAt;
       traceInitTiming('session-less');
     }
-  }, [options.sessionId, options.fontFamily, options.fontSize, options.cursorStyle, customBackground, customForeground, customCursor, options.shellName, options.releaseEscapeWhenPointerOutside, settleScrollback, armScrollbackWatchdog, traceReplay, dropHeldBytesSupersededBySample, focusOnArrival]);
+  }, [options.sessionId, options.fontFamily, options.fontSize, options.cursorStyle, customBackground, customForeground, customCursor, options.shellName, options.releaseEscapeWhenPointerOutside, settleScrollback, armScrollbackWatchdog, traceReplay, dropHeldBytesSupersededBySample, focusOnArrival, fitTerminal, requestGrid, handleRendererChange]);
 
   // Set up data listener. Inbound PTY data flows through a bounded queue that
   // writes capped slices paced by xterm.write's completion callback, yielding
@@ -1235,15 +1524,14 @@ export function useTerminal(options: UseTerminalOptions) {
       // dropped bytes in the per-session scrollback ring. Dropped slices are
       // still acked inside the queue.
       shouldDrop: () => suppressDataRef.current || isTerminalParked(sessionId),
-      // While a board drag OR a scrollback replay is in flight, HOLD (not
-      // drop) inbound writes. For a replay, getScrollback() drains the
-      // server-side pending buffer, so anything still arriving here is either
-      // an in-flight duplicate of the replay (harmless to re-apply) or
-      // genuinely new live output (e.g. a diff frame) that must not be lost -
-      // dropping it (the prior behavior) could silently discard a selection
-      // highlight in a fullscreen TUI. Held bytes are retained and resumed via
-      // kick() on drag end, at the end of afterWrite, or by the stuck-replay
-      // watchdog.
+      // While a scrollback replay is in flight, HOLD (not drop) inbound writes.
+      // getScrollback() drains the server-side pending buffer, so anything still
+      // arriving here is either an in-flight duplicate of the replay (harmless to
+      // re-apply) or genuinely new live output (e.g. a diff frame) that must not
+      // be lost - dropping it (the prior behavior) could silently discard a
+      // selection highlight in a fullscreen TUI. Held bytes are retained and
+      // resumed via kick() at the end of afterWrite or by the stuck-replay
+      // watchdog (both through settleScrollback).
       // Deliberately NOT gated on a board drag any more. `TerminalPanel` is a SIBLING
       // of `KanbanBoard`, outside the <DndContext> subtree, and xterm writes to its own
       // canvas without producing a single React render - so holding here never
@@ -1295,17 +1583,12 @@ export function useTerminal(options: UseTerminalOptions) {
       repaintNudge.noteOutput();
       queue.push(data);
     });
-    // Resume the held drain the moment a board drag ends (also via the
-    // coalescer's watchdog / window-blur backstops, which route through here).
-    const unsubscribeDragEnd = onBoardDragEnd(() => queue.kick());
-
     cleanupRef.current = cleanup;
     return () => {
       cleanup();
       cleanupRef.current = null;
       incomingResumeRef.current = null;
       incomingResetRef.current = null;
-      unsubscribeDragEnd();
       queue.reset();
       repaintNudge.dispose();
       repaintNudgeRef.current = null;
@@ -1325,8 +1608,11 @@ export function useTerminal(options: UseTerminalOptions) {
     // parked terminal must not reshape a grid it is not showing.
     if (scrollbackPendingRef.current || isTerminalParked(sessionId)) return;
     // Re-fit first: the container may have moved during the debounce, and our
-    // OWN fitted grid is the thing being re-asserted.
+    // OWN fitted grid is the thing being re-asserted. A hold is dropped for it:
+    // the PTY's grid moved under us, so main is asked afresh, and a `held`
+    // answer conforms again inside requestGrid.
     const wasAtBottom = isAtBottomRef.current;
+    releaseHeldGrid('echo-reassert');
     fitAddonRef.current.fit();
     if (wasAtBottom) terminal.scrollToBottom();
     const { cols, rows } = terminal;
@@ -1336,9 +1622,8 @@ export function useTerminal(options: UseTerminalOptions) {
       clearTimeout(resizeTimerRef.current);
       resizeTimerRef.current = null;
     }
-    traceTerminalRenderer(sessionId, 'resize-request', { cols, rows, origin: 'echo-reassert' });
     try {
-      const result = await window.electronAPI.sessions.resize(sessionId, cols, rows);
+      const result = await requestGrid(sessionId, cols, rows, 'echo-reassert');
       if (result?.refused) {
         // Main is deliberately holding this grid (the mobile sub-floor guard).
         // Arm the time-stamped refusal hold so later echoes stop after this
@@ -1371,7 +1656,7 @@ export function useTerminal(options: UseTerminalOptions) {
     // history either way.
     traceTerminalRenderer(sessionId, 'echo-reassert', { cols, rows });
     reloadScrollbackRef.current?.({ skipResize: true, skipFocus: true });
-  }, []);
+  }, [releaseHeldGrid, requestGrid]);
 
   // The width-drift self-heal. Main broadcasts SESSION_PTY_RESIZED whenever
   // the PTY's dims actually change, from any origin. xterm re-sends its
@@ -1505,6 +1790,14 @@ export function useTerminal(options: UseTerminalOptions) {
       releaseTerminalAnchorRef.current = null;
       rendererKeyRef.current = null;
       lastAppliedFontRef.current = null;
+      heldGridRef.current = null;
+      conformedFontRef.current = null;
+      // The two cell memos belong to the terminal being disposed, measured under
+      // its font and renderer. Cleared with the rest of the hold state so the
+      // whole family resets together and a next mount cannot read a cell from
+      // the last one.
+      conformedCellRef.current = null;
+      naturalCellRef.current = null;
       xtermRef.current?.dispose();
       xtermRef.current = null;
       fitAddonRef.current = null;
@@ -1547,15 +1840,17 @@ export function useTerminal(options: UseTerminalOptions) {
   }, [options.sessionId]);
 
   // fit() only refits xterm visually. The debounced onResize callback
-  // forwards dimensions to the PTY automatically when cols/rows change.
+  // forwards dimensions to the PTY automatically when cols/rows change. While
+  // main holds the grid, fitTerminal keeps that grid and re-derives the font,
+  // and probes main with the natural grid so the hold can end.
   const fit = useCallback(() => {
     if (!fitAddonRef.current || !xtermRef.current) return;
     const wasAtBottom = isAtBottomRef.current;
-    fitAddonRef.current.fit();
+    fitTerminal('fit', true);
     if (wasAtBottom) {
       xtermRef.current.scrollToBottom();
     }
-  }, []);
+  }, [fitTerminal]);
 
   // Live-apply display settings to an already-mounted terminal, mirroring how
   // an app theme change applies immediately (rather than requiring the
@@ -1583,10 +1878,17 @@ export function useTerminal(options: UseTerminalOptions) {
     // which also stops per-keystroke atlas thrash while a font name is being
     // typed in Settings (onChange commits per character, across every mounted
     // terminal).
+    //
+    // The comparison is against the size this terminal will APPLY, not the one
+    // configured: while main holds its grid the two diverge (the conformed size
+    // is what xterm runs at), and a configured-size change that leaves the
+    // conformed size where it was changes nothing here. That distinction is
+    // load-bearing for the atlas clear below - see applyOptions.
+    const appliedFontSize = conformedFontRef.current ?? fontSize;
     const fontChanged =
       !lastAppliedFontRef.current ||
       lastAppliedFontRef.current.family !== fontFamily ||
-      lastAppliedFontRef.current.size !== fontSize;
+      lastAppliedFontRef.current.size !== appliedFontSize;
     let cancelled = false;
 
     const applyOptions = () => {
@@ -1594,9 +1896,15 @@ export function useTerminal(options: UseTerminalOptions) {
       // below was in flight (see the cleanup below), or if the terminal was
       // torn down in the meantime.
       if (cancelled || !xtermRef.current) return;
+      // Read fresh rather than from the effect's capture: a conform can land in
+      // the document.fonts.load gap, and what is recorded below has to be what
+      // was actually assigned here.
+      const applied = conformedFontRef.current ?? fontSize;
       xtermRef.current.options = {
         fontFamily,
-        fontSize,
+        // While main holds the grid the size is the conformed one; the fit()
+        // below re-derives it for the new family's metrics.
+        fontSize: applied,
         cursorStyle: options.cursorStyle || 'block',
         scrollback: TERMINAL_SCROLLBACK_LINES,
         theme: buildTerminalTheme({
@@ -1606,12 +1914,23 @@ export function useTerminal(options: UseTerminalOptions) {
         }),
       };
       fit();
-      if (fontChanged) {
-        lastAppliedFontRef.current = { family: fontFamily, size: fontSize };
+      const previousFont = lastAppliedFontRef.current;
+      // The gate is MY OWN applied font moving, which is what makes the clear
+      // below safe by construction rather than by which call site reaches it.
+      // The WebGL glyph atlas is shared between every terminal whose font
+      // config matches, and clearing it re-renders only the caller, so a clear
+      // by a terminal whose font did NOT move paints garbage in every other
+      // terminal on that atlas (see conformToHeldGrid). A held terminal is
+      // exactly where that can happen: a global size change from 12 to 13
+      // leaves its conformed 9 px alone, and a sibling window conformed to the
+      // same 9 px is on the same atlas.
+      if (!previousFont || previousFont.family !== fontFamily || previousFont.size !== applied) {
+        lastAppliedFontRef.current = { family: fontFamily, size: applied };
         // xterm re-measures character size as soon as `options.fontFamily` is
         // assigned above. Force the WebGL renderer to re-rasterize every glyph
         // under the new metrics rather than risk it reusing a stale cache entry
-        // from the previous font.
+        // from the previous font. Safe here because a genuine font change fires
+        // every mounted terminal's effect, so each one re-renders its own model.
         if (rendererKeyRef.current) notifyFontChanged(rendererKeyRef.current);
       }
     };
@@ -1650,9 +1969,8 @@ export function useTerminal(options: UseTerminalOptions) {
     clearTimeout(resizeTimerRef.current);
     resizeTimerRef.current = null;
     const { cols, rows } = xtermRef.current;
-    traceTerminalRenderer(options.sessionId, 'resize-request', { cols, rows, origin: 'flush' });
-    window.electronAPI.sessions.resize(options.sessionId, cols, rows);
-  }, [options.sessionId]);
+    void requestGrid(options.sessionId, cols, rows, 'flush');
+  }, [options.sessionId, requestGrid]);
 
   // Re-fetch scrollback from the PTY and write it to xterm. Called when
   // the loading overlay lifts so that suppressed TUI output is recovered.
@@ -1714,7 +2032,7 @@ export function useTerminal(options: UseTerminalOptions) {
     // skipResize, the PTY is already synced; fit() is a no-op at the stable
     // width and we send no SIGWINCH.
     const colsBeforeFit = xtermRef.current.cols;
-    const fitOutcome = fitAddonRef.current.fit();
+    const fitOutcome = fitTerminal('reload-initial', false);
     const { cols, rows } = xtermRef.current;
     const sessionId = options.sessionId;
     // Traced for the same reason as the mount path's two fits, and for one more:
@@ -1730,10 +2048,9 @@ export function useTerminal(options: UseTerminalOptions) {
     // the frame drawn at the fitted geometry.
     // skipResize sends no SIGWINCH: the window manager calls it once resizing
     // has already settled, so there is nothing to wait for.
-    if (!skipResize) traceTerminalRenderer(sessionId, 'resize-request', { cols, rows, origin: 'reload' });
     const resizePromise = skipResize
       ? Promise.resolve(undefined)
-      : window.electronAPI.sessions.resize(sessionId, cols, rows);
+      : requestGrid(sessionId, cols, rows, 'reload');
     const scrollbackPromise = window.electronAPI.sessions.getScrollback(sessionId);
 
     Promise.all([resizePromise, scrollbackPromise])
@@ -1773,7 +2090,7 @@ export function useTerminal(options: UseTerminalOptions) {
           }
           if (fitAddonRef.current) {
             const colsBeforeRefit = xtermRef.current?.cols ?? null;
-            const refitOutcome = fitAddonRef.current.fit();
+            const refitOutcome = fitTerminal('reload-after-replay', false);
             traceTerminalRenderer(sessionId, 'fit', () =>
               describeFit(xtermRef.current, 'reload-after-replay', colsBeforeRefit, refitOutcome));
           }
@@ -1912,11 +2229,14 @@ export function useTerminal(options: UseTerminalOptions) {
         // replay short of its focus frame, so it answers any outstanding arrival.
         focusOnArrival('replay-error');
       });
-  }, [options.sessionId, settleScrollback, armScrollbackWatchdog, traceReplay, dropHeldBytesSupersededBySample, focusOnArrival]);
+  }, [options.sessionId, settleScrollback, armScrollbackWatchdog, traceReplay, dropHeldBytesSupersededBySample, focusOnArrival, fitTerminal, requestGrid]);
 
   // Let the watchdog (armed from initTerminal, declared above this callback)
-  // re-issue a stuck replay without a circular declaration.
-  reloadScrollbackRef.current = reloadScrollback;
+  // re-issue a stuck replay without a circular declaration. Written on commit;
+  // the watchdog is a timer, so it never reads this before the commit lands.
+  useLayoutEffect(() => {
+    reloadScrollbackRef.current = reloadScrollback;
+  });
 
   // Reveal catch-up: when this session's terminal transitions parked ->
   // visible, repaint from scrollback. While parked, main dropped the session's
@@ -1971,6 +2291,21 @@ export function useTerminal(options: UseTerminalOptions) {
     xtermRef.current?.focus();
   }, []);
 
+  // Paste text into the terminal through xterm's own paste(), which brackets it
+  // (ESC[200~ ... ESC[201~) exactly when the foreground app enabled mode 2004
+  // and feeds onData, so the bytes ride the same batcher as typed input. This is
+  // the one route the file-drop hook may use: a raw sessions.write bypasses the
+  // bracketing, and an agent TUI's path scan (Claude Code's [Image #N] attach)
+  // runs only on a paste packet. Returns false when no xterm is mounted yet
+  // (TerminalTab's LaunchOverlay window, before its deferred initTerminal), so a
+  // caller can tell a delivered paste from one that had nowhere to go.
+  const paste = useCallback((text: string): boolean => {
+    const terminal = xtermRef.current;
+    if (!terminal) return false;
+    terminal.paste(text);
+    return true;
+  }, []);
+
   // The terminal's current grid, read live off the xterm instance (the same
   // read flushResize already does). Used to seed a respawned PTY's dimensions
   // (e.g. a Command Terminal branch switch) so the new session starts at the
@@ -1986,6 +2321,7 @@ export function useTerminal(options: UseTerminalOptions) {
     fit,
     flushResize,
     focus,
+    paste,
     reloadScrollback,
     scrollbackPending: scrollbackPendingRef,
     suppressDataRef,

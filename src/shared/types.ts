@@ -117,9 +117,14 @@ export interface AgentDetectionInfo {
   /** True if the adapter streams account-wide rate-limit windows; gates the ContextBar
    *  rate-limit pill so any session of this agent shows the shared global snapshot. */
   reportsRateLimits?: boolean;
-  /** Template for the text injected when a clipboard/dropped image is captured to a temp PNG
-   *  (e.g. "Read this image: {path} "), so the agent reliably reads it as an image instead of
-   *  treating a bare file path as inert text. Undefined = inject the bare quoted path. */
+  /** Image extensions (lowercase, no dot) the CLI attaches natively when the file's path
+   *  arrives as a bracketed paste (Claude Code: png, jpg, jpeg, gif, webp become an
+   *  `[Image #N]` chip). The renderer pastes the bare shell-quoted path for these. A string
+   *  array, never a RegExp: this crosses IPC. Undefined = the CLI attaches nothing from a path. */
+  pastedImageNativeExtensions?: readonly string[];
+  /** Fallback text pasted for an image outside `pastedImageNativeExtensions` (or for every
+   *  image when that set is undefined), e.g. "Read this image: {path} ", so the agent reads an
+   *  explicit instruction instead of an inert path. Undefined = paste the bare quoted path. */
   pastedImageReferenceTemplate?: string;
   /** True if the adapter exposes a one-shot summarize capability (used by auto-name task title). */
   supportsSummarize?: boolean;
@@ -133,6 +138,18 @@ export interface AgentDetectionInfo {
    *  Apps"). Absent/empty = this agent declares none; the Agent settings tab renders nothing. */
   launchOptions?: readonly AgentLaunchOptionInfo[];
 }
+
+/**
+ * The two adapter-declared facts the terminal needs to deliver a captured (pasted or
+ * dropped) image: which extensions the CLI attaches natively from a pasted path, and the
+ * fallback text for the rest. An `AgentDetectionInfo` entry satisfies it directly, so a
+ * terminal host passes the agent's entry and never branches on agent name
+ * (agent-adapters-boundary.md).
+ */
+export type PastedImageCapability = Pick<
+  AgentDetectionInfo,
+  'pastedImageNativeExtensions' | 'pastedImageReferenceTemplate'
+>;
 
 /**
  * Renderer-facing description of a single adapter-declared launch-option toggle
@@ -800,6 +817,179 @@ export interface SwimlaneTransition {
   execution_order: number;
 }
 
+// === Column Automations ===
+
+/**
+ * An automation type id. Each one is an adapter under `src/main/automations/`,
+ * declared once in `AUTOMATION_MANIFEST` (`src/shared/automation-manifest.ts`).
+ *
+ * `spawn_agent` is the ONE legacy id: it is never offered for a new automation,
+ * but a migrated row carrying a custom `promptTemplate` still runs, because a
+ * custom prompt has no other home. The three other retired action types
+ * (`kill_session`, `create_worktree`, `cleanup_worktree`) are not here at all -
+ * each was a no-op or a duplicate of the move path, so the migration drops
+ * their rows rather than keeping an adapter alive for them.
+ */
+export type AutomationType =
+  | 'send_message'
+  | 'run_script'
+  | 'webhook'
+  | 'notify'
+  | 'spawn_agent';
+
+/**
+ * When an automation runs, relative to the column that owns it. There is
+ * deliberately no 'both': every both-ends workflow needs different settings per
+ * direction, so it is two automations, and without it a column's two group
+ * counts always sum to its total.
+ */
+export type AutomationTrigger = 'enter' | 'exit';
+
+/**
+ * An automation's per-type payload. Keys are declared by the adapter's manifest
+ * `fields`; anything the chosen type does not declare is dropped on save. Keys
+ * may be shared across types on purpose (`body` is both the webhook payload and
+ * the notification text), so switching a draft's type and back keeps what was
+ * typed.
+ */
+export interface AutomationConfig {
+  // send_message
+  message?: string;
+  mode?: AutoCommandMode;
+  /** Legacy `send_command` key, read on migration as the message. Never written. */
+  command?: string;
+
+  // run_script
+  script?: string;
+  /** Per-automation budget. Exit rows are additionally capped by the group cap. */
+  timeoutMinutes?: number;
+  /** Legacy key. A script now always runs task-relative; ignored and dropped on save. */
+  workingDir?: 'worktree' | 'project';
+
+  // webhook
+  url?: string;
+  method?: 'GET' | 'POST' | 'PUT';
+  headers?: Record<string, string>;
+
+  // notify
+  title?: string;
+
+  /** webhook payload, and the notification's body. */
+  body?: string;
+
+  // legacy spawn_agent
+  agent?: string;
+  promptTemplate?: string;
+  nonInteractive?: boolean;
+}
+
+/** One automation on one column. An automation belongs to exactly one column. */
+export interface ColumnAutomation {
+  id: string;
+  swimlane_id: string;
+  name: string;
+  type: AutomationType;
+  trigger: AutomationTrigger;
+  /** 0..n WITHIN (swimlane_id, trigger), so the two groups never interleave. */
+  position: number;
+  enabled: boolean;
+  config: AutomationConfig;
+  created_at: string;
+  updated_at: string;
+}
+
+/** What the renderer sends when saving a column's list. `id` is kept when supplied. */
+export interface AutomationWriteInput {
+  id?: string;
+  name: string;
+  type: AutomationType;
+  trigger: AutomationTrigger;
+  enabled: boolean;
+  config: AutomationConfig;
+}
+
+/**
+ * The rationed interruption when an automation fails or is interrupted.
+ *
+ * Mirrors `auto-command-outcome.ts`: the DB row is the durable record and this
+ * push is the interruption, so nothing is sent on success and a failure is
+ * cooled down per project. Carries what a toast needs to name the thing and
+ * offer to run it again.
+ */
+export interface AutomationRunFailure {
+  runId: string;
+  automationId: string;
+  automationName: string;
+  columnName: string;
+  taskId: string;
+  taskTitle: string;
+  projectId: string;
+  status: 'failed' | 'interrupted';
+  detail: string | null;
+}
+
+/**
+ * Terminal state of one automation execution.
+ *
+ * `interrupted` is not a failure the automation caused: the shutdown path is
+ * synchronous by rule (`.claude/rules/synchronous-shutdown.md`), so an in-flight
+ * run cannot be drained on quit. A row left `running` is a known orphan, and the
+ * project-open sweep marks it interrupted so "did this run" always has an answer.
+ */
+export type AutomationRunStatus = 'running' | 'succeeded' | 'failed' | 'skipped' | 'interrupted';
+
+/**
+ * The durable record of one execution. `automation_name` and `type` are
+ * DENORMALIZED and there is no foreign key to `column_automations` on purpose:
+ * a run log that empties itself when you rename or delete the automation is not
+ * a log.
+ */
+export interface AutomationRun {
+  id: string;
+  automation_id: string;
+  automation_name: string;
+  type: AutomationType;
+  task_id: string;
+  swimlane_id: string;
+  trigger: AutomationTrigger;
+  status: AutomationRunStatus;
+  /** The skip reason, the error, or a one-line success ("HTTP 204", "exit 0"). */
+  detail: string | null;
+  attempts: number;
+  started_at: string;
+  finished_at: string | null;
+}
+
+/**
+ * What `IPC.AUTOMATION_RUN_AGAIN` answers.
+ *
+ * A discriminated result rather than a throw, because both callers report it to
+ * a person: the toast's Run again action and the MCP tool. `ok: false` means the
+ * run never started (a deleted automation, a closed project); a run that STARTED
+ * and failed is `ok: true` with `status: 'failed'`, because the run row exists
+ * and the detail is the automation's own.
+ */
+export type AutomationRunAgainResult =
+  | {
+      ok: true;
+      runId: string;
+      automationName: string;
+      columnName: string;
+      status: AutomationRunStatus;
+      detail: string | null;
+    }
+  | { ok: false; error: string };
+
+/**
+ * Payload of `IPC.AUTOMATION_RUNS_INTERRUPTED`: the project-open sweep's count
+ * of runs a quit left mid-flight. One notice per project open, never one per
+ * row, and only when the count is above zero.
+ */
+export interface AutomationInterruptedSummary {
+  projectId: string;
+  count: number;
+}
+
 // === Session Management ===
 
 export type SessionStatus = 'running' | 'queued' | 'exited' | 'suspended';
@@ -975,6 +1165,22 @@ export interface HandoffRecord {
  * record an attempt only.
  */
 export type SentSessionMessageStatus = 'delivered' | 'queued' | 'refused' | 'failed';
+
+/**
+ * What main answers a `sessions.resize`. `refused` is set only when main
+ * deliberately held the PTY's grid against the requested one (the mobile
+ * sub-floor guard, or a replay whose bytes address a fixed grid), and `held`
+ * then names the grid it kept. A terminal that is refused conforms to `held`:
+ * it resizes its own grid to it and picks the font size that fits that grid
+ * into its pane, so the frame the PTY paints is the frame the user sees
+ * (useTerminal's conform path). The echo re-assert reads `refused` alone to
+ * stop healing attempts immediately instead of retrying to its cap.
+ */
+export interface SessionResizeResult {
+  colsChanged: boolean;
+  refused?: true;
+  held?: { cols: number; rows: number };
+}
 
 /**
  * One message sent into a session via `kangentic_send_session_message`, by
@@ -2202,15 +2408,20 @@ export function resolvePermissionForAgent(agentList: AgentDetectionInfo[], agent
   return agentInfo.defaultPermission;
 }
 
+/**
+ * `dark` and `light` are the neutral defaults (labelled Graphite and Paper); their ids
+ * predate the names and live in every config file, so they stay. `rust` and `clay` are
+ * the product pair.
+ */
 export type ThemeMode = 'dark' | 'light'
-  | 'kangentic-light' | 'kangentic-dark'
+  | 'rust' | 'clay'
   | 'moon' | 'forest' | 'ocean' | 'ember'
   | 'sand' | 'mint' | 'sky' | 'peach';
 
 /** Background colors for BrowserWindow (prevents flash on launch). */
 export const THEME_BACKGROUNDS: Record<ThemeMode, string> = {
   dark: '#18181b', light: '#f5f5f4',
-  'kangentic-light': '#f6f1e8', 'kangentic-dark': '#2d2017',
+  rust: '#2d2017', clay: '#f6f1e8',
   moon: '#1a1d2e', forest: '#1a2318', ocean: '#0f1923', ember: '#1f1a17',
   sand: '#f5f0e8', mint: '#eef5f0', sky: '#edf3f8', peach: '#f8f0ec',
 };
@@ -2223,7 +2434,7 @@ export const THEME_BACKGROUNDS: Record<ThemeMode, string> = {
  *  before the terminal had its own fixed color scheme. */
 export const THEME_FOREGROUNDS: Record<ThemeMode, string> = {
   dark: '#e4e4e7', light: '#292524',
-  'kangentic-light': '#332e27', 'kangentic-dark': '#ded4c8',
+  rust: '#ded4c8', clay: '#332e27',
   moon: '#c6c8d0', forest: '#c6cac4', ocean: '#c0c6ce', ember: '#ccc8c4',
   sand: '#3d3228', mint: '#1e3028', sky: '#1a2a3a', peach: '#3a2520',
 };
@@ -2232,43 +2443,68 @@ export const THEME_FOREGROUNDS: Record<ThemeMode, string> = {
  * Whether each theme is light or dark underneath. `Record<ThemeMode, ...>`, so tsc
  * refuses a new theme that does not answer the question.
  *
- * This exists because the answer used to be read off NAMED_THEMES, which lists only
- * the NAMED themes: `dark` and `light` are hardcoded in the settings dropdown and are
- * not in it. `DiffViewer` resolved Monaco's theme with a `?? 'dark'` fallback for an
- * unlisted id, so the shipped Light theme rendered a BLACK diff pane inside an
- * otherwise light app, and any future theme would have inherited the same trap by
- * omission. A total record cannot be omitted from.
+ * This exists because the answer used to be read off NAMED_THEMES, which at the time
+ * listed only the NAMED themes: `dark` and `light` were hardcoded in the settings
+ * dropdown and not in it. `DiffViewer` resolved Monaco's theme with a `?? 'dark'`
+ * fallback for an unlisted id, so the shipped Light theme rendered a BLACK diff pane
+ * inside an otherwise light app, and any future theme would have inherited the same
+ * trap by omission. NAMED_THEMES is total now, but only a test holds it there; a
+ * total record cannot be omitted from, so this stays the light-or-dark source.
  */
 export const THEME_BASES: Record<ThemeMode, 'dark' | 'light'> = {
   dark: 'dark', light: 'light',
-  'kangentic-light': 'light', 'kangentic-dark': 'dark',
+  rust: 'dark', clay: 'light',
   moon: 'dark', forest: 'dark', ocean: 'dark', ember: 'dark',
   sand: 'light', mint: 'light', sky: 'light', peach: 'light',
 };
 
+/** The three keys the theme resolves from; a `Pick` so main can pass a parsed config file. */
+export type ThemeChoice = Pick<AppConfig, 'theme' | 'themeFollowsSystem' | 'themeLight' | 'themeDark'>;
+
 /**
- * UI metadata for the settings dropdown. The light-or-dark question is answered by
- * THEME_BASES above, not here, so a theme missing from this list costs it a dropdown
- * entry and nothing else.
+ * The theme the app paints, given the OS appearance. With `themeFollowsSystem` off it
+ * is the hand-picked `theme`; on, it is the pair member for the system's side. Shared
+ * by the renderer (the html class, the diff pane, the terminal's theme-match preset)
+ * and by main (the launch background), so the two cannot disagree on what "following
+ * the system" means. Guards against a pair member of the wrong base, which an edited
+ * config file can carry: a light theme in the dark slot falls back to the default pair.
+ */
+export function resolveTheme(choice: ThemeChoice, systemPrefersDark: boolean): ThemeMode {
+  if (!choice.themeFollowsSystem) return choice.theme;
+  if (systemPrefersDark) return THEME_BASES[choice.themeDark] === 'dark' ? choice.themeDark : 'dark';
+  return THEME_BASES[choice.themeLight] === 'light' ? choice.themeLight : 'light';
+}
+
+/**
+ * The Theme tab's picker list: one tile per theme, in the order the grid shows them.
+ * The light-or-dark question is answered by THEME_BASES above, not by position here;
+ * the grid groups by THEME_BASES and only keeps this order within each group. A theme
+ * missing from this list has no tile, so `theme-registry-parity.test.ts` requires the
+ * list to name every `ThemeMode` exactly once.
  *
- * `group` lifts a theme out of the by-base palette lists into its own optgroup. The
- * product theme gets one because every other group label answers "what are these?":
- * Standard is the two neutrals, Dark/Light Palette are variations picked for taste.
- * Folding Kangentic into Standard made that label describe nothing in particular, and
- * split the pair's identity across two entries that only a shared prefix tied together.
+ * Within a base the default comes first, then the product theme, then the palettes
+ * picked for taste. Every label is one word for what the swatch shows, like the
+ * eight palettes always were: the two defaults used to be "Dark" and "Light", which
+ * under a grid grouped by base said nothing twice, and the product pair used to be
+ * "Kangentic Dark" / "Kangentic Light", which inside Kangentic's own settings read as
+ * "Default". Those two were renamed id and all (`rust`, `clay`) before any release
+ * carried them; `dark` and `light` keep their ids because every config file has them.
  *
- * It ships as a light/dark PAIR rather than one theme because a lone "Kangentic" reads
- * as if it follows your light/dark preference. It does not, and a dark-mode user picking
- * the product's own theme would get a bright app.
+ * `group: 'kangentic'` marks the product pair, which the grid draws with the brand
+ * mark so the pair reads as the product's own without a group of its own or a shared
+ * name. It ships as a light/dark PAIR rather than one theme because a lone product
+ * theme reads as if it follows your light/dark preference. It does not, and a
+ * dark-mode user picking the product's own theme would get a bright app.
  */
 export const NAMED_THEMES: { id: ThemeMode; label: string; group?: 'kangentic' }[] = [
-  // Dark before light, matching the Standard group above it, so both read the same way down.
-  { id: 'kangentic-dark', label: 'Kangentic Dark', group: 'kangentic' },
-  { id: 'kangentic-light', label: 'Kangentic Light', group: 'kangentic' },
+  { id: 'dark', label: 'Graphite' },
+  { id: 'rust', label: 'Rust', group: 'kangentic' },
   { id: 'moon', label: 'Moon' },
   { id: 'forest', label: 'Forest' },
   { id: 'ocean', label: 'Ocean' },
   { id: 'ember', label: 'Ember' },
+  { id: 'light', label: 'Paper' },
+  { id: 'clay', label: 'Clay', group: 'kangentic' },
   { id: 'sand', label: 'Sand' },
   { id: 'mint', label: 'Mint' },
   { id: 'sky', label: 'Sky' },
@@ -2436,6 +2672,13 @@ export interface DictationInfo {
   /** The resolved live + final model ids for the current selection. */
   selectedLiveModelId: string | null;
   selectedFinalModelId: string | null;
+  /** True once the `kangentic-dictation` utilityProcess worker has crashed
+   *  repeatedly and the restart policy has given up for this decay window -
+   *  push-to-talk has no fallback engine, so the settings panel surfaces
+   *  this rather than leaving it a silent dead end. */
+  workerUnavailable: boolean;
+  /** The newest crash's exit code + first error line, when `workerUnavailable`. */
+  workerError?: string;
 }
 
 /** Progress event for an in-flight model download. */
@@ -2733,7 +2976,20 @@ export interface MonitorView {
 }
 
 export interface AppConfig {
+  /** The theme picked by hand. What the app paints when `themeFollowsSystem` is off. */
   theme: ThemeMode;
+  /**
+   * Follow the OS appearance: paint `themeDark` while the system is dark and
+   * `themeLight` while it is light, ignoring `theme`. Off by default. The three keys
+   * are project-scoped together with `theme` (the Theme tab), and the OS reading is
+   * never written to config: the renderer resolves it live (`resolveTheme`), and main
+   * resolves the launch background the same way from `nativeTheme`.
+   */
+  themeFollowsSystem: boolean;
+  /** The theme for a light system appearance when following. Must be a light base. */
+  themeLight: ThemeMode;
+  /** The theme for a dark system appearance when following. Must be a dark base. */
+  themeDark: ThemeMode;
   sidebarVisible: boolean;
   boardLayout: 'horizontal' | 'vertical';
   cardDensity: 'compact' | 'default' | 'comfortable';
@@ -3290,6 +3546,9 @@ export type SerializedTileNode =
 
 export const DEFAULT_CONFIG: AppConfig = {
   theme: 'dark',
+  themeFollowsSystem: false,
+  themeLight: 'light',
+  themeDark: 'dark',
   sidebarVisible: true,
   boardLayout: 'horizontal',
   cardDensity: 'default',
@@ -3489,6 +3748,30 @@ export interface UpdateDownloadedInfo {
   version: string;
   /** Markdown release notes for this version, normalized to a flat string. Empty if none. */
   releaseNotes: string;
+}
+
+// === Host memory pressure (Sentry DESKTOP-16) ===
+
+/** A single reading of host-level memory. See `src/main/diagnostics/host-memory.ts`
+ *  for what `commitLimitBytes` / `commitRemainingBytes` mean and why they are
+ *  null on every platform but Windows. */
+export interface HostMemorySample {
+  ts: string;
+  platform: NodeJS.Platform;
+  /** Windows commit limit; null on every other platform. */
+  commitLimitBytes: number | null;
+  /** Windows commit remaining; null on every other platform. */
+  commitRemainingBytes: number | null;
+  physicalTotalBytes: number;
+  physicalFreeBytes: number;
+}
+
+/** Pushed when host commit headroom crosses below the warning threshold (an
+ *  edge-triggered, hysteresis-gated event - see `evaluateHostMemoryPressure`).
+ *  Not a per-tick heartbeat. */
+export interface HostMemoryPressureEvent {
+  sample: HostMemorySample;
+  activeAgentCount: number;
 }
 
 // === Backlog ===
@@ -3755,6 +4038,7 @@ export const MOBILE_CAPABILITY_VERBS = [
   'board-tool-read',
   'board-tool-write',
   'register-push',
+  'start-session',
 ] as const;
 export type MobileCapabilityVerb = (typeof MOBILE_CAPABILITY_VERBS)[number];
 
@@ -3809,6 +4093,8 @@ export interface MobilePairedDevice {
   pairedAt: string;
   /** Live, not persisted - this device's own connection state (transport refined by whether the phone is actually attached), not the panel-wide aggregate. */
   connectionState: MobileDeviceConnectionState;
+  /** ISO 8601, live, not persisted - when `connectionState` last changed, so a row can say "Offline since 3:17 PM" rather than only "Offline". Null before the device's session has opened. */
+  connectionStateSince: string | null;
 }
 
 export interface MobilePairingSasPayload {
@@ -4801,9 +5087,23 @@ export interface BoardColumnConfig {
   permissionMode?: PermissionMode | null;
   planExitTarget?: string; // name of target column
   archived?: boolean;
+  /**
+   * LEGACY. The column's message to its agent, before automations existed.
+   * Read on apply and converted into a `send_message` automation on the column's
+   * On enter group; never written any more. See `columns[].automations`.
+   */
   autoCommand?: string | null;
-  /** When the auto-command fires (see AutoCommandMode). Omitted means 'immediate'. */
+  /** LEGACY companion to `autoCommand`. Read on apply, never written. */
   autoCommandMode?: AutoCommandMode;
+  /**
+   * What happens when a task enters or leaves this column.
+   *
+   * Two named arrays rather than one list with an `on` key per row: it mirrors
+   * the two groups the UI shows, array order IS each row's `position` within
+   * its group, and adding an exit automation touches only the `onExit` array in
+   * a diff. An empty group is an absent key.
+   */
+  automations?: BoardColumnAutomations;
   agentOverride?: string | null;
   /** Adapter-specific model identifier passed at spawn time (e.g. Claude `--model`). Null inherits the agent default. */
   modelOverride?: string | null;
@@ -4814,6 +5114,29 @@ export interface BoardColumnConfig {
   sessionTarget?: SessionTarget;
   /** What to do with that track on entry (see SessionSpawnStrategy). Omitted = 'create_or_resume'. */
   sessionSpawnStrategy?: SessionSpawnStrategy;
+}
+
+/**
+ * One automation as it appears in `kangentic.json`.
+ *
+ * The type's own fields sit FLAT on the row rather than under a `with` object:
+ * `{ "name": "Ping", "type": "webhook", "url": "..." }` reads better in a file
+ * a team reviews in diffs than wrapping a single field. The price is that a
+ * field key could collide with a key the row shape owns, which is why
+ * `name`, `type` and `enabled` are reserved and
+ * `tests/unit/automation-manifest-reserved-keys.test.ts` fails an adapter that
+ * declares one of them.
+ */
+export type BoardAutomationConfig = {
+  name: string;
+  type: string;
+  /** Omitted means enabled. Only `false` is ever written. */
+  enabled?: boolean;
+} & Record<string, unknown>;
+
+export interface BoardColumnAutomations {
+  onEnter?: BoardAutomationConfig[];
+  onExit?: BoardAutomationConfig[];
 }
 
 export interface BoardActionConfig {
@@ -4910,8 +5233,13 @@ export interface BoardProfile {
 export interface BoardConfig {
   version: number;
   columns: BoardColumnConfig[];
-  actions: BoardActionConfig[];
-  transitions: BoardTransitionConfig[];
+  /**
+   * LEGACY, read-only. Named actions and `from -> to` transitions, from before
+   * automations belonged to a column. Still READ on apply so a file written by
+   * an older build converts; never written again.
+   */
+  actions?: BoardActionConfig[];
+  transitions?: BoardTransitionConfig[];
   shortcuts?: ShortcutConfig[];
   /**
    * Named alternate strategy ladders (see BoardProfile). Absent / empty means
@@ -5078,6 +5406,13 @@ export interface ElectronAPI {
     onMoveProgress: (callback: (progress: ProjectMoveProgress) => void) => () => void;
     onAutoOpened: (callback: (project: Project) => void) => () => void;
     onPathMissing: (callback: (project: Project) => void) => () => void;
+    /**
+     * Main deleted or reconciled project rows the renderer's list did not
+     * know about (a dev-only boot prune, or a global-DB recovery that
+     * reopened onto a different file). Carries no payload; the renderer
+     * refetches `list()` and `getCurrent()` in response. See Sentry DESKTOP-V.
+     */
+    onListChanged: (callback: () => void) => () => void;
   };
 
   // Project Groups
@@ -5223,18 +5558,28 @@ export interface ElectronAPI {
   };
 
   // Actions
-  actions: {
-    list: () => Promise<Action[]>;
-    create: (input: ActionCreateInput) => Promise<Action>;
-    update: (input: ActionUpdateInput) => Promise<Action>;
-    delete: (id: string) => Promise<void>;
-  };
-
-  // Transitions
-  transitions: {
-    list: () => Promise<SwimlaneTransition[]>;
-    set: (fromId: string, toId: string, actionIds: string[]) => Promise<void>;
-    getForTransition: (fromId: string, toId: string) => Promise<SwimlaneTransition[]>;
+  // Column automations. `replaceForColumn` carries an interaction-time
+  // projectId because it mutates rows; the reads do not. See
+  // .claude/rules/project-scoped-ipc.md.
+  automations: {
+    list: (projectId?: string | null) => Promise<ColumnAutomation[]>;
+    replaceForColumn: (
+      swimlaneId: string,
+      rows: AutomationWriteInput[],
+      projectId?: string | null,
+    ) => Promise<ColumnAutomation[]>;
+    runsForTask: (taskId: string, projectId?: string | null) => Promise<AutomationRun[]>;
+    /**
+     * Re-run ONE automation against the task's CURRENT state. Mutating, so it
+     * carries the interaction-time projectId.
+     */
+    runAgain: (
+      automationId: string,
+      taskId: string,
+      projectId?: string | null,
+    ) => Promise<AutomationRunAgainResult>;
+    onRunFailed: (callback: (notice: AutomationRunFailure) => void) => () => void;
+    onRunsInterrupted: (callback: (summary: AutomationInterruptedSummary) => void) => () => void;
   };
 
   // Sessions (PTY)
@@ -5262,12 +5607,10 @@ export interface ElectronAPI {
     /**
      * `colsChanged` is intentionally unused by the renderer (main orders the
      * geometry change ahead of any scrollback sample on its own - see the
-     * parallel-IPC note in useTerminal's mount path). `refused` is set only
-     * when main deliberately held the grid against this resize (the mobile
-     * sub-floor guard) and is consumed only by the echo re-assert, which uses
-     * it to stop healing attempts immediately instead of retrying to its cap.
+     * parallel-IPC note in useTerminal's mount path). See SessionResizeResult
+     * for `refused` and `held`.
      */
-    resize: (sessionId: string, cols: number, rows: number) => Promise<{ colsChanged: boolean; refused?: true }>;
+    resize: (sessionId: string, cols: number, rows: number) => Promise<SessionResizeResult>;
     list: () => Promise<Session[]>;
     getScrollback: (sessionId: string) => Promise<string>;
     /**
@@ -5302,6 +5645,16 @@ export interface ElectronAPI {
     onFirstOutput: (callback: (sessionId: string, projectId?: string) => void) => () => void;
     onExit: (callback: (sessionId: string, exitCode: number, projectId?: string, intentional?: boolean) => void) => () => void;
     onStatus: (callback: (sessionId: string, session: Session, projectId?: string) => void) => () => void;
+    /**
+     * The session left main's registry for good (`SessionManager.remove()`):
+     * a task reset to To Do, a task or project delete, a session reset, an
+     * aborted spawn. The renderer drops the row and every per-session map
+     * entry keyed on it. Distinct from `onStatus` on purpose: that handler can
+     * only upsert, so a removal announced there re-seeded the row (#661).
+     * The `Session` is the row's last snapshot, for consumers that need its
+     * `taskId`.
+     */
+    onRemoved: (callback: (sessionId: string, session: Session, projectId?: string) => void) => () => void;
     onUsage: (callback: (sessionId: string, data: SessionUsage, projectId?: string) => void) => () => void;
     getActivity: (projectId?: string) => Promise<Record<string, ActivityState>>;
     onActivity: (callback: (sessionId: string, state: ActivityState, reason: ActivityReason, projectId?: string, taskId?: string) => void) => () => void;
@@ -5449,6 +5802,11 @@ export interface ElectronAPI {
      *  re-fetch via config.get()/loadConfig() to pick up the new effective config. Lets
      *  pop-out windows (and the main window) live-sync theme/settings across windows. */
     onChanged: (callback: () => void) => () => void;
+    /** A sync write to the data directory (config or one of the other small
+     *  per-machine/per-project state files) failed - DESKTOP-14/DESKTOP-13. Fires at
+     *  most once per failing source until a later write to that source succeeds;
+     *  `message` is the whole user-facing sentence, composed in main. */
+    onWriteFailed: (callback: (message: string) => void) => () => void;
   };
 
   // Keybindings
@@ -5508,6 +5866,16 @@ export interface ElectronAPI {
     unsubscribeDiff: (worktreePath: string) => void;
     onDiffChanged: (callback: () => void) => () => void;
     checkPendingChanges: (input: GitPendingChangesInput) => Promise<GitPendingChangesResult>;
+    /**
+     * Warm the throttled all-remotes fetch for a worktree, so a `checkPendingChanges`
+     * that follows within the throttle window either skips its own fetch or joins the
+     * one already in flight and pays only its remainder. Fire-and-forget: never rejects,
+     * never prompts (non-interactive git), and shares the background scheduler's cache
+     * and its `git.autoFetchIntervalMinutes` setting, so it is a no-op when the user has
+     * turned background fetching off. The board calls it when a drag of a worktree-backed
+     * card begins, so a Done drop's probe is not starting a fetch after the release.
+     */
+    prefetchRemotes: (checkPath: string) => Promise<void>;
     branchSummary: (input: GitBranchSummaryInput) => Promise<GitBranchSummaryResult>;
     worktreeHead: (input: GitWorktreeHeadInput) => Promise<GitWorktreeHeadResult>;
     commitGraph: (input: GitCommitGraphInput) => Promise<GitCommitGraphResult>;
@@ -5574,6 +5942,12 @@ export interface ElectronAPI {
     checkForUpdate: () => Promise<void>;
     installUpdate: () => Promise<void>;
     onUpdateDownloaded: (callback: (info: UpdateDownloadedInfo) => void) => () => void;
+  };
+
+  // Host memory pressure (Sentry DESKTOP-16): a push-only notification, no
+  // corresponding invoke - main owns the sampler and decides when to fire.
+  hostMemory: {
+    onPressure: (callback: (event: HostMemoryPressureEvent) => void) => () => void;
   };
 
   // Announcements (remote feed; active = filtered for this client in main.
@@ -5770,7 +6144,14 @@ export interface ElectronAPI {
 
   // Clipboard
   clipboard: {
+    /** Save the OS clipboard image as a capped temp PNG; its path, or null when
+     *  the clipboard holds no image (or the write failed). */
     readImage: () => Promise<string | null>;
+    /** Save PNG bytes the renderer decoded from a dropped image into the same
+     *  temp directory as `readImage`; its path, or null when the bytes are not
+     *  a decodable image (or the write failed). The drop path uses it for a
+     *  format the agent CLI cannot take from a path. */
+    saveImage: (pngBytes: Uint8Array) => Promise<string | null>;
     writeText: (text: string) => Promise<void>;
   };
 
@@ -6271,7 +6652,8 @@ export interface CrashRecord {
   stack: string | null;
   /** Renderer-window URL or main-process module path at the time of error. */
   origin: string | null;
-  /** Additional context (e.g. render-process-gone reason+exitCode). */
+  /** Additional context (e.g. render-process-gone reason+exitCode, plus the
+   *  last `HostMemorySample` for a render-process-gone record). */
   context: Record<string, unknown> | null;
   /** Versions captured for bug-report reproducibility. */
   versions: { kangentic: string; electron: string; node: string; chrome: string };

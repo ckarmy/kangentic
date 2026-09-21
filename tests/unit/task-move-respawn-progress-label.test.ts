@@ -204,6 +204,11 @@ function makeContext(taskRepo: unknown, swimlaneRepo: unknown) {
     killByTaskId: vi.fn(),
     listSessions: vi.fn(() => []),
     suspend: vi.fn(async () => {}),
+    // Phase 1 reconciles task.session_id against the registry before the
+    // Priority ladder; a live row for the pointed-at id keeps these fixtures
+    // on the respawn branches they exercise.
+    getSession: vi.fn((id: string) => ({ id, taskId: TASK_ID, status: 'running' })),
+    findLiveSessionByTaskId: vi.fn(() => null),
     // Read by resolveLiveEffort; empty means the agent reports no effort, so
     // the effort-delta test sources from the session record as intended.
     getUsageCache: vi.fn((): Record<string, unknown> => ({})),
@@ -222,7 +227,12 @@ function makeContext(taskRepo: unknown, swimlaneRepo: unknown) {
   mockGetProjectRepos.mockReturnValue({
     tasks: taskRepo,
     swimlanes: swimlaneRepo,
-    actions: { getTransitionsFor: vi.fn(() => []) },
+    // The column's message moved out of `swimlanes.auto_command` and into the
+    // column's first enabled `send_message` enter automation, so Phase 3 reads
+    // it through this repo rather than the retired `actions` one. These
+    // fixtures set no column message, so an empty list is the right shape.
+    automations: { listForColumn: vi.fn(() => []) },
+    automationRuns: { listForTask: vi.fn(() => []) },
     attachments: { deleteByTaskId: vi.fn(), getPathsForTask: vi.fn(() => []) },
   });
   return context;

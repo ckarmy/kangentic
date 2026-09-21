@@ -31,8 +31,26 @@ three things staying in step, and each is enforced rather than remembered.
   and never branches on being embedded. The one renderer concession is a `data-testid` on the
   window-controls cluster so the demo can hide it by selector.
 - **A scene is data.** Config overrides, task-row patches, session activity, `__mock*` seeds, and
-  at most a short list of synthetic clicks. No code travels through a scene or a `state=` URL.
-  A scene the demo cannot build (`reach: 'driver'`) is refused loudly, never approximated.
+  at most a short list of boot steps: a click, a typed query, or a held hotkey, each a state and
+  none a choreography (no timing, no narration). No code travels through a scene or a `state=`
+  URL. A scene the demo cannot build (`reach: 'driver'`) is refused loudly, never approximated;
+  its gesture (a `hover`, a `contextmenu`, a `drag` that may `hold`) is data too, and only the
+  capture rig plays it.
+- **A surface Electron alone provides is mocked as a surface, never faked as content.** The
+  `<webview>` tag has an iframe standing in for it (`demo/webview-shim.js`), loading a bundled
+  copy of what the project really renders at its dev URL; the microphone is a silent stream so
+  dictation's real pipeline runs, and no transcript is authored because the desktop draws the
+  words through the CLI's echo. Git history is a real repository built from a commit plan and
+  read with git. The line is the same one the terminal rule draws: mock the bridge, record or
+  derive the content, and where content cannot be honest, show the surface without it. Every entry carries the three fields that leave this repo: `alt`, the
+  reader-facing text a docs figure carries; `ready`, the selector the frame is built at; and an
+  optional `focus`, the element whose rect the ready message reports. The registry has two
+  consumers by construction (`demo/boot.js` at `view=`, the rig at
+  `tests/captures/features/scenes.capture.ts` against the BUILT demo) and the rig keeps no
+  applier of its own, so the two cannot describe one state two ways.
+- **The site learns the list from the build, never from a copy.** The build emits `scenes.json`
+  unhashed beside `index.html`, generated from `SCENES`: name, reach, alt, description, and the
+  app version. A vendored or packaged copy can lag what is deployed; a URL cannot.
 - **The sample install is one dataset.** The marketing captures and the web build both seed
   `demo-dataset.ts`; terminal content comes from recordings in `tests/captures/fixtures/demo/`
   made by `scripts/capture-agent-scrollback.js` and sanitized at record time. There is no
@@ -67,15 +85,33 @@ three things staying in step, and each is enforced rather than remembered.
   no recording. `loop=1` restarts a finished session on its own clock and repaints a mounted
   terminal from the opening frame rather than re-feeding its history; it is off by default, and
   a still frame arms no timer at all.
-- **A terminal that cannot take the bytes plays frames, and is never left dead or finished.** A
-  recording's bytes address rows for their own grid, which no page can promise: the board's bottom
-  panel is 15 rows against a session's 37, and a grid moves with the visitor's display scale. A
-  serialized frame reflows, so every recording carries a `frameTimeline` beside its stream and any
-  other grid plays that, fitted to its width. A grid mismatch is also not an ending: main routes a
+- **A terminal is brought to the recording's grid, or plays frames; it is never left dead or
+  finished.** A recording's bytes address rows for their own grid, which no page can promise: the
+  board's bottom panel is 15 rows against a session's 37, and a grid moves with the host's frame
+  size and the visitor's display scale. Wherever the pane can show the recording's grid at a
+  readable size, the seed answers the terminal's resize the way main answers one it refuses, with
+  the grid it holds (`SessionResizeResult.held`), and the terminal conforms to it (`useTerminal`'s
+  `conformToHeldGrid`: that grid, the font scaled to fit, letterboxed), so the bytes replay
+  exactly. Where it cannot (the panel), every recording carries a `frameTimeline` beside its
+  stream, PHYSICAL rows with an absolute cursor (`scripts/lib/demo-frame-serializer.js`), and the
+  applier fits each row to the grid: cut at the edge, never wrapped; only a horizontal rule
+  stretched; gaps never grown. A grid mismatch is also not an ending: main routes a
   geometry-changed session to its parsed frame on the desktop and the agent goes on working, so a
   working session here keeps its clock, its card and its Monitor peeks. Never conflate "cannot
-  replay these bytes" with "the agent finished", and never answer a grid mismatch with a second
-  recording at that grid: the grid is not stable enough to record against.
+  replay these bytes" with "the agent finished", never answer a grid mismatch with a second
+  recording at that grid (the grid is not stable enough to record against), and never hand the
+  serialize addon's joined rows to a terminal of another width. A tiled LAYOUT is a surface, not
+  a mismatch: the matrix records a session at the tiled width too when the manifest names a
+  `tiled` sibling, at the grid `node demo/measure.mjs --geometry` measures for that surface at the
+  launch the manifest's `geometry` names, and the seed shows whichever of the two the window's
+  width asks for. The sibling is a second run of the prompt, so it supplies the terminal's bytes
+  only; the session's clock, trail, diff, and peeks stay the single recording's.
+- **The conversation viewer shows a recorded transcript, or the mock's empty answer, never a
+  written one.** A session the manifest marks `transcript` carries the agent's own transcript
+  beside its recording (`transcripts/<file>`, main's parsers over the history file the agent
+  wrote, sanitized whole, committed because the source lives on the recording machine), and the
+  seed serves it through `transcripts.get` when a viewer opens. Every other session falls through
+  to the mock's empty response, which is what the desktop shows once a history file is gone.
 - **The `demo` Playwright tier stays green**, and it runs on the exact bytes a release deploys.
 
 ## Enforcement (self-maintaining)
@@ -92,19 +128,57 @@ three things staying in step, and each is enforced rather than remembered.
   gone stale, when a line sits outside its recording's span, and when the applier or the loader
   stops reading them. It is the answer to the parity test passing on a mock that answers with
   nothing. Runs via `npm run test:unit`.
-- **Test (behavior, CI):** `tests/demo/static-demo.spec.ts` boots every bootable scene from a
-  static server and asserts the marker, the embed and theme parameters, the error card for an
+- **Test (mechanical, CI):** `tests/unit/demo-transcript-seeded.test.ts` fails when the session
+  the `conversation` scene opens has no transcript file, when the file is not a whole conversation
+  in the parser's shape, when its entries are not the run the card's trail came from (the trail's
+  uuids are transcript uuids), when a marked manifest entry has no file or a file no mark, and when
+  the build or the seed stops reading them. Runs via `npm run test:unit`.
+- **Test (mechanical, CI):** `tests/unit/demo-frame-format.test.ts` fails when any recording's
+  final frame, open frame, or timeline frame is not physical rows with a cursor suffix, or holds a
+  row wider than the recording's columns (the "run the backfill" backstop);
+  `tests/unit/demo-frame-serializer.test.ts` round-trips the serializer, including the two
+  recordings from task #673, and `tests/unit/demo-frame-fit.test.ts` runs the applier lifted out
+  of the GENERATED seed over those recordings at the grids that broke (no spill, no stripe, the
+  cursor on its row); `tests/unit/demo-cell-widths.test.ts` pins the applier's width table to
+  `wcwidthV11`. Run via `npm run test:unit`.
+- **Test (behavior, CI):** `tests/ui/terminal-held-grid-conform.spec.ts` drives the renderer's
+  conform against the mock's held answer: a held grid is taken at a smaller font, an accepted probe
+  releases it, and a plain refusal conforms nothing.
+- **Test (mechanical, CI):** `tests/unit/scene-registry.test.ts` runs over the real `SCENES`
+  and fails when a reach tag disagrees with the steps (a `state` scene with steps, a `boot` scene
+  with a rig step, a `driver` scene with none), when `alt`, `ready`, or `description` is missing
+  or an alt carries a dash or a curly quote (the writing-style scan excludes `tests/`, so this is
+  the only check the alts get), when a patched task or session id is not one the sample install
+  seeds, when a config key is not an `AppConfig` key (the mock's `Object.assign` accepts any key
+  and the renderer never reads it), when the settings scenes stop matching `SETTINGS_TABS` one to
+  one or a `setting-row-<id>` marker names a row that is not on that tab, and when `boot.js`'s
+  `STATE_KEYS` or `demo/vite.config.mts`'s `scenes.json` fields drift from the type. Runs via
+  `npm run test:unit`.
+- **Test (behavior, CI):** `tests/demo/static-demo.spec.ts` boots EVERY bootable scene in the
+  registry from a static server (the loop iterates `SCENES`, so a new entry is covered with no
+  test change, and a stale deep marker for a retired scene fails) and asserts its `ready` element
+  visible and, where the scene names a `focus`, that the element exists and covers a real region
+  of the frame (not empty, not the whole frame: the Quick Find scenes once named the palette's
+  full-frame backdrop, which crops to nothing), that a `driver` scene is refused by name, that `scenes.json` is served, lists exactly
+  the registry, and names the frame's version, that the ready message posted to an iframe host
+  carries a dialog scene's focus rect and null for a scene without one, the embed and theme
+  parameters, the error card for an
   unknown scene, a clean console, zero off-origin requests, that a still frame fetches no
   recording, that the live frame fetches its session's recording, that a live Monitor's output
   peeks change while a still frame's do not, that `loop=1` brings a finished session back and its
   absence leaves it finished, that a terminal on a grid its recording does not fit plays its
   frames and leaves its session working (including the board's bottom panel, where no grid could
-  fit), that a board card and a Monitor card draw the agent message trail in place of the
-  description and the output peek while a session with no trail still draws its peek, and that a
+  fit), that a held terminal reporting its conformed grid back is read as the conform landing
+  rather than a resize, so a session already at its recording's end receives nothing,
+  that a board card and a Monitor card draw the agent message trail in place of the
+  description and the output peek while a session with no trail still draws its peek, that a
   drag into an
   auto-spawn column and a new Command Terminal each start a session whose bytes arrive through
-  the mock's data path. Runs as the `demo` job in `.github/workflows/ci.yml` and again inside
-  `.github/workflows/deploy-demo.yml` before the Pages deploy.
+  the mock's data path, that a still whose terminal is narrower than its recording and not held
+  paints its frame cut to the grid rather than raw, that the conversation scene renders the
+  recorded transcript from one `transcripts/` fetch and no recording, and that the tiled task
+  windows take each session's tiled recording. Runs as the `demo` job in `.github/workflows/ci.yml`
+  and again inside `.github/workflows/deploy-demo.yml` before the Pages deploy.
 - **Review:** `/code-review` flags a `location` check or a demo flag inside `src/renderer`, and a
   scene entry that carries code instead of data.
 

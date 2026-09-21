@@ -57,6 +57,7 @@ The in-memory `SessionStatus` does not include `orphaned` (that is a DB-only con
 | `suspended` | `exited` | Replaced by a new session on resume (`retireRecord`) |
 | `orphaned` | `running` | Session recovery on project open |
 | `orphaned` | `exited` | Recovery dedup, or failed recovery (`retireRecord`) |
+| `exited` | `exited` | A resume replaces a record that had already ended on its own (`retireRecord`'s fallback CAS). Confirms the row is out of the way without restamping `exited_at`, so the CLI's real end time survives a later restart; only the `suspended` and `orphaned` rows above get a fresh stamp |
 | `orphaned` | `suspended` | Pause-on-restart setting upgrades a crashed session (`markRecordSuspended`) |
 | `exited` | `running` | OS-killed (abnormal `exit_code`) session resumed by recovery on project open (`getInterruptedExited`) |
 | `exited` | `suspended` | Interrupted-exited record CAS-upgraded by recovery (non-target / non-auto-spawn / auto-resume-off), or a PTY exit during app shutdown (onExit hardening) |
@@ -83,6 +84,7 @@ module's `resolveEffectivePermissionMode` (a lane forcing `plan` always wins, el
 | MCP create (`kangentic_create_task`) | `autoSpawnForTask` | `spawnAgent` |
 | Column auto-spawn switched on | a column edit or a Board Profile edit, from either the Board Manager or the MCP `update_column` / profile tools, via `reconcileAutoSpawnChange` | `autoSpawnForTask` -> `spawnAgent` (sequential, skips user-paused, active project only) |
 | Unarchive (single + bulk) | Completed Tasks restore / `TASK_UNARCHIVE` | `spawnAgent`, `skipPromptTemplate` + `suppressAutoCommand` (recovery move) |
+| Phone Start (`start-session` verb) | "Start again" from the phone's ended state, via `startTaskSession` (`handlers/session-start.ts`) | `autoSpawnForTask` -> `spawnAgent`, `explicitStart` (lifts the column's `auto_spawn` default and a user pause, as the desktop Resume button does; the role gate stays) |
 | Startup crash recovery | project open, `resumeSuspendedSessions` | `prepareAgentSpawn` (`session-startup/prepare-spawn.ts`) |
 | Startup reconcile | project open, `autoSpawnTasks` | `prepareAgentSpawn` |
 
@@ -164,13 +166,40 @@ The capture reads a snapshot the watcher already computed for its own counting, 
 - All session DB records for the task (deleted)
 - In-memory caches (usage, activity, events) for the session
 
-Before the registry row is deleted, `SessionManager.remove()` forces its status to `exited` and
-emits `session-changed`. This is load-bearing, not cosmetic: a status push landing mid-teardown
-(a `syncSessions()` call in the grace window, say) can otherwise resurrect the row via
-`withSessionUpserted` after the renderer's SESSION_EXIT handler has already ignored the
-intentional exit, leaving a ghost `running` card and panel tab for an agent that no longer exists
-anywhere in main. Pinned by `tests/unit/session-manager-remove-emit.test.ts` and
-`tests/ui/todo-reset-no-ghost-session.spec.ts`.
+Before the registry row is deleted, `SessionManager.remove()` emits `session-removed` (broadcast
+as `SESSION_REMOVED`) with the row's last snapshot. The renderer's `removeSession` drops the row,
+the task index entry, and every per-session map entry keyed on the id (`withoutSessions` in
+`session-index.ts`). Two failures shaped this:
+
+- With no push at all, a status push landing mid-teardown (a `syncSessions()` call in the grace
+  window, say) resurrected the row via `withSessionUpserted` after the renderer's SESSION_EXIT
+  handler had already ignored the intentional exit, leaving a ghost `running` card and panel tab
+  for an agent that no longer existed anywhere in main (#80).
+- Announcing the removal as a forced-`exited` `session-changed` fixed that and caused #661: the
+  status channel's only renderer handler is an upsert, so for a task moved to To Do (whose rows
+  `moveTask` evicts optimistically the instant the move starts) the removal itself re-inserted an
+  `exited` row for a PTY, worktree, and session directory that no longer existed, and its surviving
+  `sessionUsage` entry filled a context bar under a black terminal. A removal and a status change
+  cannot share one channel.
+
+The renderer also refuses to paint anything session-shaped for a task in a `todo`-role lane, whatever
+row the store holds (`laneHoldsSession` and the lane-aware `taskDetailSurfaceFor` in
+`task-progress.ts`; `useTaskSessionState` resolves such a task's session to null), and both spawn
+chokepoints refuse the To Do and Done roles regardless of `auto_spawn`, so that classification is
+true rather than assumed.
+
+The same contract covers a bare `kill()`: the renderer's `SESSION_EXIT` handler ignores an
+intentional exit, so every kill site follows up with the push that says what happened. `remove()`
+announces `session-removed`, `suspend()` announces `suspended`, and a caller that keeps the row after
+`kill()` + `awaitExit()` (the `cleanup_worktree` transition action) calls
+`SessionManager.announceSessionEnded()`, which re-emits the row on `session-changed` with its resolved
+status. `tests/unit/session-kill-followup.test.ts` scans every kill site for one of those. The full
+contract is `.claude/rules/session-replica-contract.md`; the property that ties it together is
+`tests/unit/session-store-replica-convergence.test.ts`, which drives the real store over random
+interleavings of pushes, optimistic evictions, and stale syncs and asserts it ends equal to main's
+registry. Also pinned by `tests/unit/session-manager-remove-emit.test.ts`,
+`tests/unit/session-store-remove-session.test.ts`, `tests/ui/todo-reset-no-ghost-session.spec.ts`,
+and `tests/ui/todo-stale-exited-row-opens-edit.spec.ts`.
 
 ### SessionManager.kill() and the young-session grace
 
@@ -239,8 +268,9 @@ them on exactly the slow path where the later read matters most.
 
 `SESSION_RESUME` (the task detail's Pause/Resume toggle) restarts a suspended session **in
 place**, in the task's current column. It is refused for three states, resolved by one shared
-predicate (`src/shared/session-resume-eligibility.ts`) that both the main-process handler and the
-task detail read, and whose role set startup recovery shares:
+predicate (`src/shared/session-resume-eligibility.ts`) that the main-process handler, the task
+detail, and the phone's `startTaskSession` (`handlers/session-start.ts`, the `start-session` verb)
+all read, and whose role set startup recovery shares:
 
 | State | Why |
 |---|---|
@@ -373,6 +403,19 @@ exited, queue slot freed, hooks stripped, transcript flushed, and `intentionalEx
 renderer's false "Session crashed" toast. Once the tab is gone the leftover shell is unreachable,
 so leaving it alive would only leak a process.
 
+**It first emits `agent-absent`, so a failure the CLI named is not lost with it.** The kill's
+`intentionalExit` also silences the exit listener's startup-failure read, and a CLI that ended at
+boot with its own account of why (Claude's "No conversation found with session ID" on a `--resume`
+whose transcript was cleaned up or whose project folder moved) reached the user as a card that
+went quiet: exit code 0, no toast, a dead row (#682 follow-up). The retirement therefore announces
+the absence before the kill, while the ring still holds the CLI's last words; `handlers/sessions.ts`
+asks the session's adapter to read them (`AgentAdapter.describeStartupFailure`, implemented by
+Claude) and raises `notifySpawnBlocked`'s "Agent did not start" notice when they name a failure. The
+rare direct PTY exit (the CLI was the root, or its shell ended with it) takes the same read from the
+exit listener when the exit is not intentional. A notice after the fact, deliberately not a
+pre-spawn guard: see the `isResumeConversationAbsent` section above for why a computed-path
+downgrade was reverted in #255.
+
 **It must also emit `session-changed`, and that emit is load-bearing.** Measured in a live preview:
 with `kill()` alone, main and the DB were both correct (`exited`, code 0) while the board kept
 counting the agent and the bottom panel kept its tab - the exact two symptoms the sweep exists to
@@ -424,6 +467,15 @@ respawn left the card reading "Paused" and the detail offering a manual "Resume 
 whole unlocked worktree/branch-checkout window between the suspend and the eventual
 `starting-agent` label.
 
+The in-place restart, `restartSessionForSettingsChange` (`src/main/ipc/handlers/session-reconcile.ts`),
+follows the same contract with a required `phase`: the ContextBar model pick and a Board Profile
+propagation emit `switching-model` (or `applying-settings` for an effort-only restart), and the
+auto_command escalation emits `resending-command` ("Re-sending command..."). It emits before its
+suspend and clears the label in a `finally` once the resume has returned or failed, the ordering
+task-move's Phase 3 uses. The emit is what lets the mobile bridge tell this respawn from a park
+(see [Mobile Bridge](mobile-bridge.md)); until #682 this path emitted nothing, and the phone showed
+"Session ended" for the swap.
+
 That main-side emit alone is not sufficient: `SessionManager.suspend()` pushes the session's
 `suspended` row to the renderer almost immediately, well before its own graceful-shutdown wait
 completes, and the renderer's `upsertSession` (`src/renderer/stores/session-store.ts`) used to
@@ -470,14 +522,19 @@ When a suspended task moves to an active column:
   That restart is gated on the turn-completion predicate (activity idle AND a
   quiet PTY) so it can never kill live work, is attempted at most once, and
   carries only the user's `auto_command` - never an adapter-emitted settings
-  write, which would arrive as literal message text. Unlike the ordinary
-  settings-change restart it does NOT assert idle-authoritative afterwards,
-  because a resume with a prompt starts a real turn. See
+  write, which would arrive as literal message text. While the gate waits, the
+  scheduler re-polls the verifier against the burst's original first-Enter
+  watermark, and a late confirmation cancels the restart: a command that went
+  in but confirmed late (a late transcript flush, or a submission the CLI
+  queued behind a running turn) must not be run a second time, which is what
+  happened on every observed Tests-to-Ship-It move before #682. Unlike the
+  ordinary settings-change restart it does NOT assert idle-authoritative
+  afterwards, because a resume with a prompt starts a real turn. See
   [Command Injection](command-injection.md) for the full delivery ladder.
 - The **first move OUT of Done** (the recovery / restore move, whatever the
-  destination column) resumes the session WITHOUT injecting the destination
-  column's `auto_command`. Restoring a Done task is usually to inspect the
-  session or ask a question, so the column automation (e.g. `/merge-pull-request`)
+  destination column) resumes the session WITHOUT delivering the destination
+  column's message. Restoring a Done task is usually to inspect the
+  session or ask a question, so the message (e.g. `/merge-pull-request`)
   sits idle until the next move. This is unconditional and matches crash
   recovery, which also resumes command-free. Every Done-out path goes through
   `spawnAgent`'s `suppressAutoCommand`: the unarchive handlers
@@ -485,7 +542,16 @@ When a suspended task moves to an active column:
   calls, and a non-archived Done-out move (MCP `move_task`, legacy rows) gets
   it from `handleTaskMove` when `fromLane.role === 'done'`. Model / effort /
   permission-mode settings still apply on the recovery move. The next move
-  injects per column config as usual.
+  delivers per column config as usual.
+
+  **Only rows that need the agent are suppressed.** The destination's On enter
+  group still runs, so a script, a webhook or a notification fires as it
+  normally would; a recovery move is not a reason to stop telling a webhook the
+  task moved. The flag reaches the runner as `suppressAgentMessages` and each
+  suppressed row is recorded `skipped` with the reason, rather than being
+  allowed to run against a `deliverToAgent` that silently does nothing and then
+  report a success for a message nobody received. See
+  [Transition Engine](transition-engine.md#command-injection).
 
 ## Crash Recovery (Session Recovery)
 
@@ -506,7 +572,7 @@ On project open (`src/main/transition-engine/session-startup/`):
 
 ## Isolated Sessions (Per-Column Session Model)
 
-A task can run on multiple parallel, independently-resumable sessions. Two orthogonal column fields (set on the Automation tab of the Board Manager) control the behavior; the pure rules live in `src/main/transition-engine/session-isolation.ts`:
+A task can run on multiple parallel, independently-resumable sessions. Two orthogonal column fields control the behavior; the pure rules live in `src/main/transition-engine/session-isolation.ts`. Only the first is offered in the UI, on the Column Manager's Conversation card: `session_spawn_strategy` is derived from it by `resolveForceFresh` and is settable by hand in `kangentic.json` only (see [configuration.md](configuration.md#swimlane-level-configuration) for why the two combinations that derivation does not reach are both bad).
 
 - **`session_target`** (`main` | `isolated`, default `main`) - which session track a task runs on. `main` is the task's shared main conversation (resumed as the task moves between normal columns); `isolated` is this column's own separate, context-isolated session, keyed by the swimlane id. Resolved by `resolveSessionTarget` / `resolveIsolatedSwimlaneId`; the discriminator is `sessions.isolated_swimlane_id` (`NULL` = main, swimlane id = isolated).
 - **`session_spawn_strategy`** (`create_or_resume` | `always_spawn_new`, default `create_or_resume`) - what to do with that track on entry. `create_or_resume` resumes the track's session if one exists, else spawns it; `always_spawn_new` always spawns fresh, retiring the prior session for that `(task, target)`. Read by `resolveForceFresh`, which is a plain comparison for any stored column: the DB column is `NOT NULL DEFAULT 'create_or_resume'` and `SwimlaneRepository.create` writes a concrete string, so the context-aware fallback in that function never evaluates for a real lane and survives only for a partial object.
@@ -617,7 +683,7 @@ Sessions are resumable on next launch via `--resume <agent_session_id>` from the
 
 Sessions from non-active projects must not interfere with the active project's terminal panel, activity icons, or store state. This is enforced at three levels:
 
-1. **IPC event forwarding** -- All session events (`data`, `usage`, `activity`, `event`, `status`, `exit`) include the session's `projectId`. The renderer filters events by comparing against the current project.
+1. **IPC event forwarding** -- All session events (`data`, `usage`, `activity`, `event`, `status`, `removed`, `exit`) include the session's `projectId`. The renderer filters events by comparing against the current project.
 2. **Cache getters** -- `getUsage`, `getActivity`, and `getEventsCache` accept an optional `projectId` parameter. When provided, `SessionManager` returns only data for sessions belonging to that project.
 3. **Store scoping** -- `syncSessions()` fetches usage and events scoped to the current project, but activity unscoped (sidebar badges need cross-project data). On project switch, `activeSessionId`, `dialogSessionIds`, `openTaskId`, `sessionUsage`, and `sessionEvents` are cleared; `sessions` and `sessionActivity` are preserved for the sidebar. A generation counter invalidates any in-flight `syncSessions()` calls from the previous project, and a snapshot-based merge preserves IPC-delivered status updates that arrive during the async gap.
 
@@ -746,6 +812,15 @@ The handoff is transparent to the user - the task card shows spawn progress phas
   `tests/ui/window-reveal-grid-width.spec.ts`, which deliberately keeps WebGL on and asserts on the
   renderer trace ring, because the specs that read terminal CONTENT pass `--disable-webgl` and so
   cannot reproduce a renderer swap at all.
+
+  A terminal CONFORMED to a held grid (above) needs a third answer here, because the two above
+  cannot reach it: it runs at a derived font, so it cannot simply re-measure its natural cell at
+  the configured size the way an unheld terminal does, and the grid it probes main with would
+  drift by that same ~10% across a swap. `attachWebglRenderer` therefore takes an
+  `onRendererChange` callback, fired on each real flip (attach, context loss, budget suspend,
+  resume), and `handleRendererChange` answers it: an unheld terminal re-measures, while a held one
+  rescales its remembered natural cell by how far its conformed cell moved across the swap and
+  re-conforms the held grid for the new metrics.
 - **A session nobody is showing goes back to the spawn grid (the resting grid).** A PTY has ONE
   grid and every surface fits it to its own box, so a session last shown in the bottom panel was
   left at that panel's strip - measured live at 306x14 - with nothing to give it back. The agent
@@ -843,7 +918,22 @@ The handoff is transparent to the user - the task card shows spawn progress phas
   time-stamped refusal hold after a single refused IPC: no further re-asserts for the budget
   window, whatever dims later echoes carry (time-stamped rather than signature-keyed, because
   the pre-send fit can move the terminal's own dims and a burned signature would stop binding
-  exactly then). Every renderer resize sender now traces `resize-request` with an origin
+  exactly then). The refusal also names the grid main keeps (`SessionResizeResult.held`), and
+  the terminal CONFORMS to it (`conformToHeldGrid` in `useTerminal.ts`): it resizes its own
+  xterm to the held grid and scales its font DOWN to fit that grid into the pane, letterboxed
+  and never above the configured size (`CONFORM_MAX_SCALE` is 1), so the frame the PTY paints
+  is the frame the user sees rather than the taller grid clipped. A
+  held terminal keeps probing main with the grid it would fit on its own, and the first accepted
+  probe releases the hold and restores the configured font. Only the container fit probes
+  (`fitTerminal`'s probe argument, passed true by the `fit()` callback alone): a replay, a reload,
+  or a renderer swap re-conforms the held grid without asking main anything.
+  A conform that the pane cannot show (the grid needs type below the 4 px floor, the box cannot
+  be measured, or the step-down budget runs out before the grid fits) is DECLINED: the hold is
+  released and the terminal keeps its own fit, rather than committing a font size nothing
+  verified. The web demo's mock holds a replayed session at its recording's grid through the same
+  answer (demo/README.md, "Live replay"). Gated by `tests/ui/terminal-held-grid-conform.spec.ts`.
+
+  Every renderer resize sender now traces `resize-request` with an origin
   tag (`mount`/`flush`/`reload`/`echo-reassert`/`debounced-onResize`) and main traces every
   resize outcome (`resize-applied`/`resize-noop`/`resize-refused`/`resize-stash`/
   `resize-ignored`/`resize-invalid`/`resize-failed` (node-pty threw on a just-died child; main
@@ -1205,15 +1295,19 @@ When a task moves rapidly between columns (e.g. drag-and-drop corrections), spaw
 
 The `isAbortError()` utility in `src/shared/abort-utils.ts` provides a type guard for distinguishing abort errors from real errors in catch blocks.
 
+The board-driven spawn chokepoint `autoSpawnForTask` (`src/main/ipc/helpers/agent-spawn.ts`: the MCP create, the auto-spawn reconcile, and the phone's `start-session` verb) is cancellable the same way. It registers an `AbortController` on the per-task registry `SESSION_RESUME` uses (`handlers/session-resume-controllers.ts`), so `SESSION_SUSPEND`, `SESSION_RESET`, a newer `SESSION_RESUME`, and a project relocation cancel its in-flight git phase through `abortInFlightResume`, and the signal reaches `ensureTaskWorktree`, `ensureTaskBranchCheckout`, and `spawnAgent`. It registers WITHOUT aborting an existing controller first, unlike `SESSION_RESUME`: a phone Start never cancels desktop work, and two starts converge on one session through the gates below. The registry holds every in-flight controller per task (a `Set`, not one slot), so that second registration does not displace the desktop resume's controller: the next Pause reaches both. `tests/unit/session-resume-controllers.test.ts` pins that. Its lock is split the way `SESSION_RESUME`'s is: Phase 1 runs the gates (column re-check, live-session check, profile fold, `auto_spawn`, role) under `withTaskLock`, Phase 2 releases it for the worktree ensure and branch checkout (serialized per project by `WorktreeManager.projectQueues`), and Phase 3 re-acquires it, re-runs the same gates as the compare-and-swap, and spawns. Holding the lock across the fetch used to make a desktop Pause or move on the same task wait behind a phone Start. An abort is logged and swallowed, never counted as a spawn failure, and cleans up no session state: the engine's last abort checkpoint precedes the PTY spawn, and the `session_id` write follows it with no further checkpoint, so an abort never leaves a half-written session for the aborter to trip over.
+
 ## Terminal Paste Strategy
 
-Terminal paste operations use xterm.js's built-in `terminal.paste()` method, which handles bracketed paste mode for the PTY. The paste path is unified:
+Terminal paste operations use xterm.js's built-in `terminal.paste()` method, which brackets the text (`ESC[200~ ... ESC[201~`) exactly when the foreground app enabled mode 2004 and leaves it plain otherwise. The paste path is unified:
 
 - **Ctrl+V / Cmd+V** - intercepted by a custom key handler, reads clipboard, calls `terminal.paste()`
+- **Ctrl+V with a clipboard image** - the image is saved to a temp PNG by the main process (`clipboard:readImage`) and its shell-quoted path goes through the same `terminal.paste()`; what is pasted (the bare path, or the adapter's fallback template) comes from the agent's `PastedImageCapability` (`resolveImagePasteText` in `terminal-clipboard.ts`)
+- **File drop** - `useTerminalFileDrop` delivers every dropped path through `useTerminal`'s `paste` handle, one `terminal.paste()` per file so each path is its own packet under bracketed-paste mode; never a raw `sessions.write`. An image in a format the agent cannot attach from a path (`needsImageNormalization`) is first re-encoded as PNG in the renderer (`encodeImageFileAsPng`, Chromium's decoder) and saved by main through `clipboard:saveImage`, and the copy's path is what gets pasted
 - **Context menu paste** - follows the same clipboard-read-then-paste path
 - **Built-in xterm paste suppressed** - a `paste` event listener on the xterm helper textarea prevents the browser's native paste from double-sending text through xterm's `onData` handler
 
-This ensures consistent behavior across keyboard shortcuts and context menu paste.
+The bracketing is load-bearing for images: Claude Code scans a paste packet for tokens ending in png/jpg/jpeg/gif/webp and attaches the file as an `[Image #N]` chip in the user turn, so a pasted or dropped image reaches the model with no `Read` tool call. Typed bytes never reach that scan, which is why the image paths do not use a raw write. Main's write queue (`src/main/pty/write-queue.ts`) keeps a packet whole across chunk boundaries, and the PTY buffer manager re-asserts mode 2004 on replay, so a reattached session brackets the next paste correctly.
 
 ## Terminal Copy Strategy
 

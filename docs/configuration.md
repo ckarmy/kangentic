@@ -16,11 +16,22 @@ The config directory (`<configDir>`) is platform-specific:
 - **macOS:** `~/Library/Application Support/kangentic/`
 - **Linux:** `~/.config/kangentic/`
 
+A config write that cannot reach disk (an unwritable data directory - a relocated userData on a
+removable volume, say) never throws: `ConfigManager.save()` / `saveProjectOverrides()` route
+through `safeWriteJson` (`src/main/safe-write.ts`) and return `false` rather than raise. The two
+degrade differently. Global `save()` already updated its in-memory config before attempting the
+write, so it keeps serving the change for the rest of the session even though the write failed.
+`saveProjectOverrides()` holds no cache: a failed project-override write leaves
+`.kangentic/config.json` with its previous contents, so the change is lost rather than merely
+unpersisted, and a later read serves the old value until a write to that project succeeds. Either
+way, the user is told once per failing write source via the `config:writeFailed` push (below),
+latched in `src/main/config/write-failure-notice.ts` until a later write to that source succeeds.
+
 ## Settings Panel
 
 The panel uses a VS Code-style layout: a sidebar with tab navigation on the left and the active settings pane on the right. A search bar at the top filters settings by keyword. Search uses multi-token matching (all tokens must appear in the setting name or description). Results are grouped by tab with match count badges on the sidebar; tabs with zero matches are dimmed. Press Ctrl+F (Cmd+F on macOS) to focus the search bar, Escape to clear the filter.
 
-- **Settings Panel** - opened via the titlebar gear icon or the gear icon on each project row in the sidebar. A project switcher dropdown in the header allows switching between projects. Sidebar tabs are grouped by category (`SETTINGS_TABS` in `settings-tabs.ts`): the `'project'` group (General, Theme, Agent, Git, Browser, Shortcuts) is per-project settings, hidden when no project is open; the `'system'` group (Board, Task, Changes, Terminal, Behavior, Hotkeys, Notifications, Dictation, Memory, MCP Server, Agent Browser, Mobile Devices, Privacy, Developer) is shared settings that apply across all projects and remain fully usable with no project open. The system group is further split into sidebar tiers (`tier` on each tab): Core (Board through Notifications, unlabeled - the default group), Advanced (Dictation through Mobile Devices), and Other (Privacy, Developer); order within each group is curated by frequency/concept rather than alphabetical, since the search bar already covers fast lookup-by-name. The Task tab holds task-presentation settings that used to live under Board (Card Density, Ticket Numbers) and Terminal (the whole Context Bar section), grouping controls that describe how an individual task presents itself rather than board layout or terminal cosmetics; Board keeps `columnWidth` and board-level Config Sync/Window settings, and Terminal keeps shell/font/cursor/colors. Terminal is global-only (shell, font, cursor style, colors): shell in particular was never reliably project-scoped at the PTY-spawn level (`SessionManager` caches a single `configuredShell` keyed to whichever project is currently focused - `src/main/pty/session-manager.ts`), so a background project's spawn/resume could silently pick up the wrong shell. See `.claude/rules/settings-tab-scope.md` for why a setting's tab must match its persistence scope. Within the project group, General saves `project.location` to the project record in the global index database via a "Change..." button that re-points the project after its folder is moved or renamed, preserving tasks and history which are keyed by project id; Theme saves `theme` to `.kangentic/config.json`; Agent, Git, and Browser also save to `.kangentic/config.json`; Shortcuts saves to the board config files (`kangentic.json` and `kangentic.local.json`). The Agent tab exposes the `project.defaultAgent` setting (the "Agent" combobox), the agent CLI used for new sessions in this project, along with `project.defaultModel` and `project.defaultEffort` (the "Model" and "Effort" comboboxes), the project-level model and reasoning-effort defaults applied when no column or task override is set. Like `project.location`, all three are stored on the project record in the global index database rather than in `AppConfig`. When the selected agent declares remote-execution support (today: OpenCode only), the Agent tab also shows an Execution mode row right below the CLI Path row, letting the project run that agent locally (the default) or attach to a server it declares support for - see [Remote Execution](#remote-execution) below; an agent without the capability shows none of these rows. The system-group tabs save to the global config. When no project is open, only the system tabs appear. Changes save immediately. New projects inherit only the seeded settings subset (`theme`, `agent.permissionMode`, `git.*`) from the most recently configured project, falling back to defaults if none exist. Project-specific data such as `browser.defaultUrl`, `importSources`, and `agent.execution` (a remote server's working directory is specific to the project it was configured for) is stored per-project and is never cloned into a new project.
+- **Settings Panel** - opened via the titlebar gear icon or the gear icon on each project row in the sidebar. A project switcher dropdown in the header allows switching between projects. Sidebar tabs are grouped by category (`SETTINGS_TABS` in `settings-tabs.ts`): the `'project'` group (General, Theme, Agent, Git, Browser, Shortcuts) is per-project settings, hidden when no project is open; the `'system'` group (Board, Task, Changes, Terminal, Behavior, Hotkeys, Notifications, Dictation, Memory, MCP Server, Agent Browser, Mobile Devices, Privacy, Developer) is shared settings that apply across all projects and remain fully usable with no project open. The system group is further split into sidebar tiers (`tier` on each tab): Core (Board through Notifications, unlabeled - the default group), Advanced (Dictation through Mobile Devices), and Other (Privacy, Developer); order within each group is curated by frequency/concept rather than alphabetical, since the search bar already covers fast lookup-by-name. The Task tab holds task-presentation settings that used to live under Board (Card Density, Ticket Numbers) and Terminal (the whole Context Bar section), grouping controls that describe how an individual task presents itself rather than board layout or terminal cosmetics; Board keeps `columnWidth` and board-level Config Sync/Window settings, and Terminal keeps shell/font/cursor/colors. Terminal is global-only (shell, font, cursor style, colors): shell in particular was never reliably project-scoped at the PTY-spawn level (`SessionManager` caches a single `configuredShell` keyed to whichever project is currently focused - `src/main/pty/session-manager.ts`), so a background project's spawn/resume could silently pick up the wrong shell. See `.claude/rules/settings-tab-scope.md` for why a setting's tab must match its persistence scope. Within the project group, General saves `project.location` to the project record in the global index database via a "Change..." button that re-points the project after its folder is moved or renamed, preserving tasks and history which are keyed by project id; Theme saves `theme`, `themeFollowsSystem`, `themeLight`, and `themeDark` to `.kangentic/config.json`; Agent, Git, and Browser also save to `.kangentic/config.json`; Shortcuts saves to the board config files (`kangentic.json` and `kangentic.local.json`). The Agent tab exposes the `project.defaultAgent` setting (the "Agent" combobox), the agent CLI used for new sessions in this project, along with `project.defaultModel` and `project.defaultEffort` (the "Model" and "Effort" comboboxes), the project-level model and reasoning-effort defaults applied when no column or task override is set. Like `project.location`, all three are stored on the project record in the global index database rather than in `AppConfig`. When the selected agent declares remote-execution support (today: OpenCode only), the Agent tab also shows an Execution mode row right below the CLI Path row, letting the project run that agent locally (the default) or attach to a server it declares support for - see [Remote Execution](#remote-execution) below; an agent without the capability shows none of these rows. The system-group tabs save to the global config. When no project is open, only the system tabs appear. Changes save immediately. New projects inherit only the seeded settings subset (`theme`, `themeFollowsSystem`, `themeLight`, `themeDark`, `agent.permissionMode`, `git.*`) from the most recently configured project, falling back to defaults if none exist. Project-specific data such as `browser.defaultUrl`, `importSources`, and `agent.execution` (a remote server's working directory is specific to the project it was configured for) is stored per-project and is never cloned into a new project.
 
 ### App-Only Settings
 
@@ -54,13 +65,13 @@ These settings appear only in App Settings and cannot be overridden per-project:
 
 These settings appear in both App Settings (as defaults) and Project Settings (as overrides):
 
-- `theme`
+- `theme`, `themeFollowsSystem`, `themeLight`, `themeDark` (the Theme tab; the four travel together)
 - `agent.permissionMode`
 - `git.worktreesEnabled`, `git.autoCleanup`, `git.defaultBaseBranch`, `git.copyFiles`, `git.initScript`, `git.linkNodeModules`, `git.prRefreshIntervalMinutes`, `git.autoFetchIntervalMinutes`, `git.prEvaluateBranchPolicies`, `git.prBypassCountsAsReady`
 - `browser.enabled`, `browser.defaultUrl`
 - `agent.execution` (per-agent local/remote mode + server working directory; editable inline in the Agent tab for the currently-selected agent, but NOT seeded into new projects - see below)
 
-> **Seeded vs. stored.** All settings above are stored per-project in `.kangentic/config.json` and editable in Project Settings. When a *new* project is created it is seeded with only `theme`, `agent.permissionMode`, and `git.*` (via `pickOverridableSubset` in `config-manager.ts`). `browser.*`, `agent.execution`, and non-setting project data such as `importSources`, are kept per-project and never cloned, so one project's dev-server URL, remote-server directory, or import sources cannot leak into another. `terminal.*` used to be seeded here too; it moved to global-only, and `loadProjectOverrides()` (`config-manager.ts`) one-time-migrates any pre-existing per-project `terminal.{shell,fontFamily,fontSize,scrollbackLines,cursorStyle,backspaceSendsCtrlH}` out of `.kangentic/config.json` (dropped, not promoted to global) the first time that project loads.
+> **Seeded vs. stored.** All settings above are stored per-project in `.kangentic/config.json` and editable in Project Settings. When a *new* project is created it is seeded with only the Theme tab's four keys (`theme`, `themeFollowsSystem`, `themeLight`, `themeDark`), `agent.permissionMode`, and `git.*` (via `pickOverridableSubset` in `config-manager.ts`). `loadProjectOverrides()` also renames the product pair's retired theme ids (`kangentic-light` / `kangentic-dark`, which existed briefly before the pair was named `clay` / `rust`) the first time a project loads, as `load()` does for the global file. `browser.*`, `agent.execution`, and non-setting project data such as `importSources`, are kept per-project and never cloned, so one project's dev-server URL, remote-server directory, or import sources cannot leak into another. `terminal.*` used to be seeded here too; it moved to global-only, and `loadProjectOverrides()` (`config-manager.ts`) one-time-migrates any pre-existing per-project `terminal.{shell,fontFamily,fontSize,scrollbackLines,cursorStyle,backspaceSendsCtrlH}` out of `.kangentic/config.json` (dropped, not promoted to global) the first time that project loads.
 
 ## Full AppConfig Reference
 
@@ -68,7 +79,10 @@ These settings appear in both App Settings (as defaults) and Project Settings (a
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `theme` | ThemeMode | `'dark'` | UI theme. Values: `dark`, `light`, `kangentic-dark`, `kangentic-light`, `moon`, `forest`, `ocean`, `ember`, `sand`, `mint`, `sky`, `peach` |
+| `theme` | ThemeMode | `'dark'` | The hand-picked UI theme, painted while `themeFollowsSystem` is off. Values: `dark` (Graphite), `light` (Paper), `rust`, `clay`, `moon`, `forest`, `ocean`, `ember`, `sand`, `mint`, `sky`, `peach` |
+| `themeFollowsSystem` | boolean | `false` | Paint `themeDark` while the OS appearance is dark and `themeLight` while it is light, ignoring `theme`. The OS reading is never written; the renderer resolves it live from `prefers-color-scheme` and main resolves the launch background from `nativeTheme`. |
+| `themeLight` | ThemeMode | `'light'` | The theme for a light OS appearance when following the system. A dark-base value here falls back to `light`. |
+| `themeDark` | ThemeMode | `'dark'` | The theme for a dark OS appearance when following the system. A light-base value here falls back to `dark`. |
 | `sidebarVisible` | boolean | `true` | Show/hide sidebar. Global-only. |
 | `boardLayout` | `'horizontal'` \| `'vertical'` | `'horizontal'` | Board scroll direction. Global-only. |
 | `cardDensity` | `'compact'` \| `'default'` \| `'comfortable'` | `'default'` | Amount of detail shown on task cards. Global-only. |
@@ -191,7 +205,7 @@ When a project's mode for an agent is `remote`:
 | `git.initScript` | string \| null | `null` | Shell script run in each new worktree after creation (and after `node_modules` linking). Runs via the platform shell (cmd.exe on Windows, sh on POSIX). A non-zero exit, timeout (10 min cap), or cancellation fails worktree creation. |
 | `git.linkNodeModules` | boolean | `true` | Symlink the root `node_modules` into each worktree so agents skip a fresh install. Disable to let `git.initScript` install dependencies inside the worktree instead. |
 | `git.prRefreshIntervalMinutes` | number \| null | `5` | Minutes between background PR sweeps while the project is open. Each sweep refreshes linked PRs' state and merge readiness, and discovers/links a PR for an unlinked task with a live worktree. `null` = off (the on-open sweep still runs) |
-| `git.autoFetchIntervalMinutes` | number \| null | `5` | Minutes between background `git fetch --all --prune` sweeps of the open project's remotes, so ahead/behind counts and base-drift checks read current remote refs without anyone opening a panel. Fetch only, never a pull, merge, or rebase; the fetch runs with credential prompts disabled. `null` = off (the on-open sweep still runs). See [worktree-strategy.md](worktree-strategy.md#background-remote-refresh) |
+| `git.autoFetchIntervalMinutes` | number \| null | `5` | Minutes between background `git fetch --all --prune` sweeps of the open project's remotes, so ahead/behind counts and base-drift checks read current remote refs without anyone opening a panel. Fetch only, never a pull, merge, or rebase; the fetch runs with credential prompts disabled. `null` = off (the on-open sweep still runs). Off also silences the drag-start warm-up: dragging a worktree-backed card normally pre-warms the same fetch so a Done drop's pending-changes probe does not start one after the release, and that is skipped entirely when this is off. See [worktree-strategy.md](worktree-strategy.md#background-remote-refresh) |
 | `git.prEvaluateBranchPolicies` | boolean | `false` | Ask the host to evaluate branch policies when judging merge readiness, where that costs a call of its own. Azure DevOps: one `az rest` per open PR per sweep (about a second each), skipped for drafts, completed and abandoned PRs, and any merge preview other than `succeeded`; without it a clean Azure PR stays `unknown` rather than `ready`. GitHub's verdict already carries policy and ignores it. See [PR Integration](pr-integration.md#azure-devops-connector) |
 | `git.prBypassCountsAsReady` | boolean | `true` | Count the viewer's own merge bypass as `ready`. GitHub: a PR still waiting on a required review reads `BLOCKED`, or `BEHIND` once a sibling PR lands and leaves it behind the base, yet a viewer who can bypass branch protection (`viewerCanMergeAsAdmin`) merges it at once, and the board's Merge column does exactly that with `gh pr merge --admin` once every check is green. On, the GitHub connector spends one `gh api graphql` probe per such green PR per sweep and folds the answer to `ready`. Both states fold, because GitHub reports only one of them for a PR that is in both conditions. The outstanding review is required either way: a `BEHIND` PR that is already approved does not fold. The same probe reads the base branch's required status checks, so a failed, in-flight, or not-yet-reported one still reads `blocked`. Default on because the shipped Merge column already merges this way; turn it off for a team that keeps the review norm even where it could bypass. Makes `pr_merge_readiness` viewer-relative. Azure DevOps ignores it. See [PR Integration](pr-integration.md#github-connector) |
 
@@ -224,7 +238,7 @@ in Opus xhigh and Merge in Sonnet high while another runs the same board more ch
 *identity* (which columns exist, their name, order, role, color, icon) is singular across profiles;
 only strategy is profile-scoped.
 
-Profiles are authored in the Board Manager (Edit Columns) and stored under a `profiles` key in
+Profiles are authored in the Column Manager and stored under a `profiles` key in
 `kangentic.json`. Unlike shortcuts they are **team-only** - never `kangentic.local.json` - because
 `tasks.profile_id` is resolved on every machine that opens the board, so a personal-only profile
 would leave teammates with tasks pointing at an id they cannot resolve. Boards with no profiles omit
@@ -455,7 +469,7 @@ The Mobile Devices tab hosts the desktop half of the mobile companion app's pair
 
 **Tab layout:** below the master switch the tab is two peer sections, **Relay** (where this desktop connects) and **Mobile** (which phones may use it). Each is a gated control area followed by an ungated documentation link. `Relay` is a section heading only, never also a row label inside itself. The Mobile section is named for the device rather than the ceremony: "Pairing" over a `Pair a device` button and a `Paired Devices` list stacked three "pair"s deep.
 
-**Actions (not config keys):** the tab also exposes three settings-registry entries that are UI surfaces, not `AppConfig` keys. **Pair a Device** (registry id `mobileBridge.pairing`) starts the QR pairing ceremony described in [Mobile Bridge](mobile-bridge.md#pairing-ceremony), and **Paired Devices** (registry id `mobileBridge.devices`) lists currently paired phones, identified by key fingerprint, with rename and revoke actions - pairing grants all ten capability verbs uniformly, so there is no per-device capability control. Both live under the Mobile heading, which carries all three ids as its `searchIds`; `Paired Devices` renders as a sub-label rather than a third peer heading. The third entry (registry id `mobileBridge.getApp`) is the Mobile section's documentation tail: a one-line blurb plus a **How to install and pair** button linking to the Kangentic Mobile docs (`https://www.kangentic.com/mobile/`), where the install instructions live so they can change without a desktop release. It is deliberately NOT conditioned on the paired-device list being empty - the target is a docs landing page, so a paired user is most of its audience. The first two are backed by the `mobile:*` IPC channels and the signed device roster (`src/main/mobile-bridge/roster-store.ts`), not persisted in `AppConfig`; the docs tail is purely informational.
+**Actions (not config keys):** the tab also exposes three settings-registry entries that are UI surfaces, not `AppConfig` keys. **Pair a Device** (registry id `mobileBridge.pairing`) starts the QR pairing ceremony described in [Mobile Bridge](mobile-bridge.md#pairing-ceremony), and **Paired Devices** (registry id `mobileBridge.devices`) lists currently paired phones, identified by key fingerprint, with rename and revoke actions - pairing grants every capability verb uniformly, so there is no per-device capability control. Both live under the Mobile heading, which carries all three ids as its `searchIds`; `Paired Devices` renders as a sub-label rather than a third peer heading. The third entry (registry id `mobileBridge.getApp`) is the Mobile section's documentation tail: a one-line blurb plus a **How to install and pair** button linking to the Kangentic Mobile docs (`https://www.kangentic.com/mobile/`), where the install instructions live so they can change without a desktop release. It is deliberately NOT conditioned on the paired-device list being empty - the target is a docs landing page, so a paired user is most of its audience. The first two are backed by the `mobile:*` IPC channels and the signed device roster (`src/main/mobile-bridge/roster-store.ts`), not persisted in `AppConfig`; the docs tail is purely informational.
 
 ### Privacy
 
@@ -468,7 +482,7 @@ Power-user settings for diagnosing the activity engine and other internal subsys
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `developer.activityDebugOverlay` | boolean | `false` | Show the floating activity-engine debug overlay. Renders live counters (pendingToolCount, subagentDepth, bg shells), the current `ActivityReason`, and a ring buffer of recent transitions for every running session in the current project. Polls `getActivityStats` every 2 seconds while open; lazy-disables the IPC when closed. With this on, the engine also writes a per-session JSON snapshot to `<projectRoot>/.kangentic/debug/<sessionId>.json` on every state change for post-mortem reads. |
-| `developer.persistConsoleLogs` | boolean | `false` | Persist `info`, `debug`, and `log`-level console output to `<projectRoot>/.kangentic/logs/<YYYY-MM-DD>.log`. Errors and warnings are always persisted regardless of this toggle. NDJSON one file per day. Read via the `kangentic_tail_logs` MCP tool. |
+| `developer.persistConsoleLogs` | boolean | `false` | Persist `info`, `debug`, and `log`-level console output to `<projectRoot>/.kangentic/logs/<YYYY-MM-DD>.log`, or to `<configDir>/logs/<YYYY-MM-DD>.log` while no project is open (global subsystems such as the mobile bridge log either way). Errors and warnings are always persisted regardless of this toggle. NDJSON one file per day. Read via the `kangentic_tail_logs` MCP tool, which merges both locations. |
 | `developer.recordIpcTraffic` | boolean | `false` | Record IPC traffic to `<projectRoot>/.kangentic/logs/ipc-<YYYY-MM-DD>.jsonl`: inbound handler invocations (channel, args, result, durationMs, errors) plus outbound main-to-renderer pushes (the agent-driven board-invalidation events) tagged `direction: "out"`. Mutating channels (settings writes, MCP config, attachments) appear as `{ redacted: true, channel }` to keep secrets out of disk logs. Off by default - non-trivial disk impact when enabled. Read via `kangentic_get_ipc_log`. |
 | `developer.previewInspectionServer` | boolean | dev: `true`, prod: `false` (UI absent in prod) | Bind a localhost-only HTTP inspection bridge that powers the dev-only `kangentic_devtools_*` MCP tools (screenshot, click, type, drag, query DOM, React fiber walker, console, engine + renderer state). Writes a per-worktree lockfile to `<projectRoot>/.kangentic/preview.lock` for cross-instance discovery. Bound to 127.0.0.1 on a random port; no auth (localhost is the boundary). UI affordance excluded from production builds entirely; the key persists in `AppConfig` for type compatibility but has no effect in shipped binaries. |
 | `developer.previewEvalEnabled` | boolean | dev: `true`, prod: `false` (UI absent in prod) | Stricter gate on top of `previewInspectionServer`. Enables three high-risk inspection-bridge endpoints: `eval` (run any JavaScript in the renderer), `inject_session_event` (synthesize fake activity-engine events without spawning a real CLI), and `raw PTY input` (write any byte sequence directly to a session terminal, including control codes). Defaults ON in dev builds (mirrors `previewInspectionServer`) so the agent-driven workflow has these available on every `/preview` without a manual toggle; an explicit stored value still wins. Localhost-only and excluded from production builds entirely. |
@@ -494,8 +508,8 @@ Each swimlane has its own overrides (stored in the per-project DB):
 | `description` | string \| null | null | Free-form description of the column's purpose. Shown as a header tooltip and round-trips through `kangentic.json`. |
 | `permission_mode` | PermissionMode \| null | null | Permission mode override for this column |
 | `auto_spawn` | boolean | true | Whether moving a task here spawns an agent |
-| `auto_command` | string \| null | null | Command injected into running session on task arrival |
-| `auto_command_mode` | `'immediate'` \| `'deferred'` | `'immediate'` | Whether the auto-command interrupts the agent's current turn or waits for it to finish |
+| `auto_command` | string \| null | null | RETIRED. The column's message to its agent is a `send_message` automation now, in `column_automations`. The migration moved every existing value into one and nulled this field; nothing reads it. See [Column automations](#column-automations). |
+| `auto_command_mode` | `'immediate'` \| `'deferred'` | `'immediate'` | RETIRED with `auto_command`, and reset by the same migration. The delivery choice is the `send_message` automation's own `mode` field. |
 | `plan_exit_target_id` | string \| null | null | Target column when plan-mode agent exits |
 | `agent_override` | string \| null | null | Agent CLI override for sessions spawned in this column |
 | `model_override` | string \| null | null | Adapter-specific model identifier passed at spawn time (e.g. Claude `--model opus`). Live-applied via `/model` slash on column transition when supported. |
@@ -503,6 +517,40 @@ Each swimlane has its own overrides (stored in the per-project DB):
 | `handoff_context` | boolean | false | When enabled, cross-agent transitions package prior session context for the target agent |
 | `session_target` | `'main'` \| `'isolated'` | `'main'` | Which session track a task runs on in this column. `main` = the task's shared main conversation; `isolated` = this column's own context-isolated session (keyed by the swimlane id). See `SessionTarget` in `src/shared/types.ts`. |
 | `session_spawn_strategy` | `'create_or_resume'` \| `'always_spawn_new'` | `'create_or_resume'` | What to do with that session track on column entry. `create_or_resume` resumes the track's session if one exists, else spawns; `always_spawn_new` always spawns fresh, retiring the prior session. The isolated-means-fresh pairing is applied by the WRITERS, not by `resolveForceFresh`: this column is NOT NULL with a literal default, so the resolver's context-aware fallback never fires for a stored column. In the Column Manager and over MCP, setting `sessionTarget` to `isolated` carries this to `always_spawn_new` (and back), via `snapSpawnStrategyToTarget`. **Editing this file by hand does not**: `apply-config.ts` applies each key as written, so name both keys or an isolated column resumes one long session instead of running a fresh pass per entry. See `SessionSpawnStrategy`. |
+
+## Column automations
+
+What a column does when a task enters or leaves it. Each column owns one ordered list, split into
+two groups, **On enter** and **On exit**, and each row has its own switch. They are edited in the
+**Column Manager** (click a column header on the board), and they round-trip through
+`kangentic.json` under the column that owns them.
+
+Four types ship. Each is an adapter under `src/main/automations/adapters/`, declared once in
+`AUTOMATION_MANIFEST`, which is also what the editor renders its fields from.
+
+| Type | What it does | Fields |
+|------|--------------|--------|
+| `send_message` | Types a message at the column's agent | `message`, `mode` (`immediate` \| `deferred`) |
+| `run_script` | Runs a script in the task's worktree, or the project checkout when it has none | `script`, `timeoutMinutes` (default 10, file only) |
+| `webhook` | Calls a URL, retrying a transport error, 429 or 5xx up to 3 times | `url`, `method`, `body`, `headers` |
+| `notify` | Raises one desktop notification | `title`, `body` |
+
+A fifth, `spawn_agent`, is legacy: it survives on boards that already had a `spawn_agent` row
+carrying a custom prompt, and cannot be created. `kill_session`, `create_worktree` and
+`cleanup_worktree` are gone entirely, rows and all, because each was a no-op or a duplicate of
+what the move path already does.
+
+`send_command` is accepted on read as an alias for `send_message`, and its `command` field as an
+alias for `message`, so a hand-written file that predates the rename still opens. Neither alias is
+written back.
+
+A name is required and unique within its column, ignoring case. That is enforced by a unique
+index in the schema, not only by the editor, so a hand-edited file or an MCP write cannot break
+it.
+
+Every text field takes the template variables listed in
+[transition-engine.md](transition-engine.md), which is also where the per-field escaping and the
+`KANGENTIC_*` environment variables a script receives are documented.
 
 ## Board Configuration
 
@@ -513,7 +561,7 @@ Kangentic supports shareable board configuration via JSON files in the project r
 - **`kangentic.json`** -- the team file. Committed to git and shared with all collaborators. Contains the canonical board layout.
 - **`kangentic.local.json`** -- the personal overrides file. Auto-added to `.gitignore`. Contains per-user customizations (colors, icons, extra columns) that merge on top of the team file.
 
-When both files exist, `kangentic.local.json` is merged over `kangentic.json` by matching columns, actions, and transitions by ID. Unmatched local entries are appended.
+When both files exist, `kangentic.local.json` is merged over `kangentic.json` by matching columns by ID. Unmatched local entries are appended. A column's automations merge as a WHOLE list, not row by row: a local column that declares `automations` replaces the team file's list for that column outright, because an ordered list has no stable key to merge a row against once names can change.
 
 ### Board Config Sync (kangentic.json)
 
@@ -612,8 +660,6 @@ Ghost columns are invisible on the board but still exist in the database. Once a
       "color": "#10b981",
       "autoSpawn": true,
       "permissionMode": "default",
-      "autoCommand": null,
-      "autoCommandMode": "immediate",
       "planExitTarget": null,
       "agentOverride": null,
       "modelOverride": null,
@@ -621,7 +667,16 @@ Ghost columns are invisible on the board but still exist in the database. Once a
       "handoffContext": false,
       "sessionTarget": "main",
       "sessionSpawnStrategy": "create_or_resume",
-      "archived": false
+      "archived": false,
+      "automations": {
+        "onEnter": [
+          { "name": "Review", "type": "send_message", "message": "/code-review {{baseBranch}}" },
+          { "name": "Ping the channel", "type": "webhook", "url": "https://hooks.example.com/abc" }
+        ],
+        "onExit": [
+          { "name": "Archive the log", "type": "run_script", "enabled": false, "script": "scripts/archive.sh" }
+        ]
+      }
     }
   ],
   "defaultBaseBranch": "main",
@@ -635,24 +690,30 @@ Ghost columns are invisible on the board but still exist in the database. Once a
       }
     }
   ],
-  "actions": [
-    {
-      "id": "uuid",
-      "name": "Start Agent",
-      "type": "spawn_agent",
-      "config": { "promptTemplate": "{{task_xml}}{{attachments}}" }
-    }
-  ],
-  "transitions": [
-    {
-      "from": "*",
-      "to": "uuid",
-      "actions": ["uuid"]
-    }
-  ],
   "_modifiedBy": "device-id"
 }
 ```
+
+**Automations nest under the column that owns them, as two named arrays.** Array order IS the
+run order within its group, an empty group is an absent key, and the type's own fields sit flat
+on the row beside `name`, `type` and `enabled` rather than under a `with` object. Those three
+keys are reserved: `automation-manifest-reserved-keys.test.ts` fails an adapter that declares a
+field colliding with one, which is what keeps the flat shape safe as the reserved set grows.
+
+`enabled` is omitted when true, so a switched-off row is the only one that carries it. `on` is
+not written either, because the array a row sits in already says it; a hand-written `"on":
+"enter"` or `"on": "exit"` is accepted on read, and so is `"on": "both"`, which is split into two
+automations with the second's name suffixed to stay unique.
+
+**The top-level `actions` and `transitions` arrays are gone, along with `columns[].autoCommand`
+and `columns[].autoCommandMode`.** All four are still READ, and converted on apply by the same
+rules the one-time migration used, so an older file still opens. None of them is written any
+more. The first save after upgrading therefore rewrites `kangentic.json` and drops them, which
+is a real diff in a tracked file: see the release notes.
+
+A `type` outside the registry, an empty name, or a duplicate name within a column is a
+validation error. A RETIRED type (`kill_session`, `create_worktree`, `cleanup_worktree`) is
+warned and skipped instead, matching what the migration did to the same row in the database.
 
 The `defaultBaseBranch` field sets the team-shared default base branch for worktree creation. When present, it takes precedence over the per-user `git.defaultBaseBranch` in `AppConfig`. Individual users can override it via `kangentic.local.json`.
 
@@ -681,6 +742,7 @@ Config files written by hand (without `id` fields on columns) are treated as add
 | `config:getProjectByPath` | Get project-level overrides by project path |
 | `config:setProjectByPath` | Update project-level overrides by project path |
 | `config:syncDefaultToProjects` | Sync changed default values to all existing projects (deep merge) |
+| `config:writeFailed` | Event: a synchronous write to config or another small per-machine/per-project state file failed (data directory unwritable); carries the message to toast, at most once per failing source until a later write to that source succeeds |
 | `boardConfig:exists` | Check if `kangentic.json` exists for the active project |
 | `boardConfig:export` | Export current board state to `kangentic.json` (auto-runs on project open) |
 | `boardConfig:apply` | Apply pending config file changes (reconcile file into DB) |

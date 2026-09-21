@@ -38,8 +38,28 @@ contract was kept in sync across three files by prose comments alone.
   lane). When that lane is unknowable (create, promote, MCP create, unarchive), the destination
   the user chose is the fallback - never a lane no dialog ever showed.
 - In-place restarts of an EXISTING session (`SESSION_RESUME` in `handlers/sessions.ts`,
-  `restartSessionForSettingsChange` in `handlers/session-reconcile.ts`) are the only allowlisted
-  direct engine calls; they are not first-spawn entry points.
+  `restartSessionForSettingsChange` in `handlers/session-reconcile.ts`) are allowlisted direct
+  engine calls; they are not first-spawn entry points.
+- A **user-initiated start in place** (the phone's `start-session` verb, via `startTaskSession` in
+  `handlers/session-start.ts`) is NOT a third direct engine call: it routes through
+  `autoSpawnForTask` -> `spawnAgent` with `explicitStart: true`, so the column's enter automations
+  run as they do on a move. That flag lifts exactly two guards, the column's `auto_spawn` default
+  and the manually-paused check, both of which exist to stop an AUTOMATIC spawn from overriding a
+  choice the user made; the To Do / Done role gate stays. Only an explicit user gesture passes it.
+  A create, promote, unarchive, startup, or `reconcileAutoSpawnChange` caller never does, or a
+  column flip would silently un-pause a task the user paused.
+- **A column's EXIT automations** (`handlers/task-move.ts`, Phase 1) are the third allowlisted
+  direct engine call, and the only one that is not a spawn at all. They run the SOURCE column's
+  exit rows as a task leaves, pass no `startAgent`, and the runner cannot start an agent on exit:
+  a row that needs one and finds no session skips with that reason. Because the allowlist is per
+  FILE, the test additionally pins that `task-move.ts` makes exactly ONE engine call, on `'exit'`,
+  with no `startAgent` in the file, so this entry cannot quietly widen into a real spawn path.
+- **Re-running ONE automation** (`helpers/automation-run-again.ts`, the `AUTOMATION_RUN_AGAIN`
+  handler's shared path) is the fourth allowlisted direct engine call, and also not a spawn. It
+  calls `executeSingleAutomation`, which passes no `startAgent`, so a row needing an agent and
+  finding no session skips with that reason. That method is scanned alongside the two spawn sinks
+  even though it cannot spawn: it is a second public way into the engine, and an unscanned one
+  would grow callers with no test watching.
 - Every file that calls `<receiver>.buildCommand(` calls `<receiver>.ensureTrust(cwd)` on that
   same receiver first. That is the adapter's pre-spawn global-config step (trust entries; for
   Claude also the `~/.claude.json` diff-panel write in `adapters/claude/diff-panel.ts`), and it
@@ -61,13 +81,16 @@ contract was kept in sync across three files by prose comments alone.
 ## Enforcement (self-maintaining)
 
 - **Test:** `tests/unit/spawn-entry-point-parity.test.ts` statically scans `src/main` and fails
-  on (a) any `executeTransition` / `resumeSuspendedSession` call site outside the classified
-  files, (b) any `sessionManager.spawn(` call site outside the classified spawn sinks, (c) a
+  on (a) any `executeTransition` / `resumeSuspendedSession` / `executeSingleAutomation` call site
+  outside the classified files, (b) any `sessionManager.spawn(` call site outside the classified spawn sinks, (c) a
   chokepoint that stops calling `runSpawnPreamble` / `resolveEffectivePermissionMode`, (d)
   any `lockAdvancedOverridesOnFirstSpawn` call outside `spawn-preamble.ts`, (e) any
   `<receiver>.buildCommand(` call site with no earlier `<receiver>.ensureTrust(` on that same
-  receiver in the same file, and (f) any `<receiver>.buildCommand(` call site with no earlier
-  `resolveShimLaunch(` in the same file. That scan proves line order, not control flow; the runtime ordering
+  receiver in the same file, (f) any `<receiver>.buildCommand(` call site with no earlier
+  `resolveShimLaunch(` in the same file, and (g) any `explicitStart` reference outside
+  `helpers/agent-spawn.ts` (its declaration, gates, and forward) and `handlers/session-start.ts`
+  (its one user-gesture caller), with a companion assertion that the caller still passes it so
+  the scan cannot pass vacuously. That scan proves line order, not control flow; the runtime ordering
   on the Command Terminal path is pinned separately by
   `tests/unit/transient-session-spawn-ensure-trust.test.ts`, which drives the handler and fails
   if the `await` is dropped or the call is removed. An

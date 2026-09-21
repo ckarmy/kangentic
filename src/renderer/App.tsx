@@ -11,6 +11,7 @@ import { useSessionStore } from './stores/session-store';
 import { useBacklogStore } from './stores/backlog-store';
 import { useToastStore } from './stores/toast-store';
 import { useUpdaterStore } from './stores/updater-store';
+import { useHostMemoryStore } from './stores/host-memory-store';
 import { useAnnouncementsStore } from './stores/announcements-store';
 import { useUsageDashboardStore } from './stores/usage-dashboard-store';
 import { useMonitorStore } from './stores/monitor-store';
@@ -25,6 +26,7 @@ import { invalidateProject } from './stores/project-cache';
 import { resolveAutoFocusTarget } from './utils/auto-focus';
 import { derivePanelSessions } from './utils/panel-sessions';
 import { COMMAND_TERMINAL_NOTIFICATION_TASK_ID } from '../shared/notification-constants';
+import { describeAutomationFailure } from '../shared/automation-describe';
 import { bumpHmrGeneration } from './utils/hmr-generation';
 import { clearSnapPreviewDom } from './window-manager';
 import { setRebindCaptureActive } from './utils/rebind-state';
@@ -51,6 +53,7 @@ export function App() {
   const loadAgentList = useConfigStore((s) => s.loadAgentList);
   const detectGit = useConfigStore((s) => s.detectGit);
   const upsertSession = useSessionStore((s) => s.upsertSession);
+  const removeSession = useSessionStore((s) => s.removeSession);
   const updateSessionStatus = useSessionStore((s) => s.updateSessionStatus);
   const updateActivity = useSessionStore((s) => s.updateActivity);
 
@@ -116,6 +119,15 @@ export function App() {
       useProjectStore.setState({ missingPathProject: project });
     });
 
+    // Main deleted or reconciled project rows this renderer's list did not
+    // know about (a dev-only boot prune, or a global-DB recovery that
+    // reopened onto a different file): refetch rather than leaving stale
+    // rows that reject when clicked with nothing on screen. Sentry DESKTOP-V.
+    const cleanupListChanged = window.electronAPI.projects.onListChanged?.(() => {
+      loadProjects();
+      loadCurrent();
+    });
+
     // Pop-out windows: hydrate which surfaces are currently detached, then stay
     // live via the popOut:changed push. Only meaningful in the main window (a
     // pop-out window never reads this store); see stores/pop-out-store.ts.
@@ -125,6 +137,12 @@ export function App() {
     // Listen for auto-update downloaded notification
     const cleanupUpdateListener = window.electronAPI.updater?.onUpdateDownloaded((info) => {
       useUpdaterStore.getState().receiveUpdate(info);
+    });
+
+    // Host memory pressure (Sentry DESKTOP-16): a rare, edge-triggered push
+    // from main's sampler - see stores/host-memory-store.ts.
+    const cleanupHostMemoryListener = window.electronAPI.hostMemory?.onPressure((event) => {
+      useHostMemoryStore.getState().receivePressureEvent(event);
     });
 
     // Announcements: hydrate the active list (the first poll may have landed
@@ -144,8 +162,10 @@ export function App() {
       if (mountTimerRafId !== undefined) cancelAnimationFrame(mountTimerRafId);
       cleanupAutoOpen();
       cleanupPathMissing?.();
+      cleanupListChanged?.();
       cleanupPopOutChanged?.();
       cleanupUpdateListener?.();
+      cleanupHostMemoryListener?.();
       cleanupAnnouncementsChanged?.();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only bootstrap: every callee is a stable Zustand action or an IPC listener registered exactly once
@@ -222,6 +242,20 @@ export function App() {
               variant: 'info',
             });
           }
+        });
+      }));
+    }
+
+    // Session removed from main's registry for good (a To Do reset, a task or
+    // project delete, a session reset, an aborted spawn). Its own channel, and
+    // the only push that takes a row OUT: the status handler above can only
+    // upsert, so a removal announced there re-seeded the row the move had
+    // already evicted (#661). Through the same coalescer as the status push so
+    // a removal applies in arrival order with any status for the same id.
+    if (sessions.onRemoved) {
+      cleanups.push(sessions.onRemoved((sessionId) => {
+        enqueueSessionUpdate(() => {
+          removeSession(sessionId);
         });
       }));
     }
@@ -674,6 +708,7 @@ export function App() {
     // with session-lifecycle or notification concerns and remain here.
 
     const tasks = window.electronAPI?.tasks;
+    const automations = window.electronAPI?.automations;
 
     // Spawn progress (worktree creation, branch checkout phases)
     if (tasks?.onSpawnProgress) {
@@ -721,6 +756,22 @@ export function App() {
       }));
     }
 
+    // A sync write to the data directory (config or one of the other small
+    // per-machine/per-project state files) failed - DESKTOP-14/DESKTOP-13. Main
+    // composes the whole sentence and latches it per failing source, so this
+    // toasts verbatim, same as onSpawnWarning. Not project-filtered: an
+    // unwritable data directory is a machine-level condition, not one tied to
+    // whichever project happens to be open.
+    if (window.electronAPI?.config?.onWriteFailed) {
+      cleanups.push(window.electronAPI.config.onWriteFailed((message) => {
+        useToastStore.getState().addToast({
+          message,
+          variant: 'error',
+          duration: 12000,
+        });
+      }));
+    }
+
     // A column's auto_command finished delivering. Main only pushes the
     // outcomes worth acting on (see `shouldNotify` in auto-command-outcome.ts),
     // so anything arriving here is either a real failure or a success that
@@ -757,6 +808,72 @@ export function App() {
       }));
     }
 
+
+    // An automation did not do what the board says it does. Main pushes only
+    // failures, and rations them to one per automation per minute (see
+    // automation-run-outcome.ts), so anything arriving here is worth a toast.
+    // Current project only: the message names a column and a task the user
+    // cannot see from another project.
+    if (automations?.onRunFailed) {
+      cleanups.push(automations.onRunFailed((failure) => {
+        const activeProjectId = useProjectStore.getState().currentProject?.id;
+        if (failure.projectId && failure.projectId !== activeProjectId) return;
+
+        // The automation AND the column, because neither alone locates it:
+        // two columns can hold rows with the same name.
+        const detail = failure.detail ? ` ${failure.detail}` : '';
+        useToastStore.getState().addToast({
+          message: `${describeAutomationFailure(failure)}.${detail}`,
+          variant: 'warning',
+          duration: 12000,
+          // Re-runs against the task's CURRENT state, which the label says,
+          // because the task may have moved twice since the failure. An
+          // interrupted run is offered the same action: it is the one status
+          // where the work definitely did not finish.
+          action: {
+            label: 'Run again',
+            onClick: () => {
+              void useBoardStore.getState()
+                .runAutomationAgain(failure.automationId, failure.taskId)
+                .then((result) => {
+                  useToastStore.getState().addToast({
+                    message: result.ok
+                      ? `Ran "${result.automationName}" again against the task's current state. ${result.detail ?? result.status}`
+                      : result.error,
+                    variant: result.ok && result.status === 'succeeded' ? 'success' : 'warning',
+                    duration: 8000,
+                  });
+                })
+                .catch((error: unknown) => {
+                  useToastStore.getState().addToast({
+                    message: error instanceof Error ? error.message : 'The automation could not be run again.',
+                    variant: 'error',
+                    duration: 8000,
+                  });
+                });
+            },
+          },
+        });
+      }));
+    }
+
+    // Runs a quit left mid-flight, swept on project open. One notice for the
+    // whole sweep, never one per row: the shutdown path is synchronous by rule,
+    // so this is expected after any quit during a move and a per-row storm
+    // would make it noise.
+    if (automations?.onRunsInterrupted) {
+      cleanups.push(automations.onRunsInterrupted((summary) => {
+        const activeProjectId = useProjectStore.getState().currentProject?.id;
+        if (summary.projectId && summary.projectId !== activeProjectId) return;
+        useToastStore.getState().addToast({
+          message: summary.count === 1
+            ? '1 automation was still running when Kangentic last closed. It did not finish.'
+            : `${summary.count} automations were still running when Kangentic last closed. They did not finish.`,
+          variant: 'info',
+          duration: 10000,
+        });
+      }));
+    }
     // Task auto-moved (plan exit → next column)
     if (tasks?.onAutoMoved) {
       cleanups.push(tasks.onAutoMoved((autoMovedTaskId, _targetSwimlaneId, taskTitle, autoMoveProjectId) => {
@@ -796,7 +913,7 @@ export function App() {
     return () => {
       cleanups.forEach((fn) => fn());
     };
-  }, [upsertSession, updateSessionStatus, updateActivity]);
+  }, [upsertSession, removeSession, updateSessionStatus, updateActivity]);
 
   return (
     <>
@@ -883,6 +1000,7 @@ if (import.meta.hot) {
     useConfigStore.getState().detectGit();
     useBoardStore.getState().loadBoard();
     useBoardStore.getState().loadBoardProfiles();
+    useBoardStore.getState().loadAutomations();
     useBacklogStore.getState().loadBacklog();
     useMobileStore.getState().loadStatus();
     useMobileStore.getState().loadDevices();

@@ -131,7 +131,7 @@ The PowerShell case fixes a Windows PowerShell 5.1 quirk: it treats `[` / `]` in
 |--------|---------------|-----------|
 | better-sqlite3 | Rebuilt against Electron headers via `scripts/rebuild-native.js` | Included via `files` in `electron-builder.yml`, C++ source excluded |
 | node-pty | Prebuilt NAPI binaries, no rebuild needed | Included via `files`, prebuilds unpacked from asar via `asarUnpack` |
-| sherpa-onnx-node | Prebuilt platform-specific binaries (no rebuild needed) | Included via `files` (`sherpa-onnx-node/**` plus the `sherpa-onnx-*/**` platform packages), unpacked from asar via `asarUnpack: node_modules/sherpa-onnx-*/**` (voice dictation engine) |
+| sherpa-onnx-node | Prebuilt platform-specific binaries (no rebuild needed) | Included via `files` (`sherpa-onnx-node/**` plus the `sherpa-onnx-*/**` platform packages), unpacked from asar via `asarUnpack: node_modules/sherpa-onnx-*/**` (the voice dictation engine, which runs in its own `kangentic-dictation` utilityProcess - see `.claude/rules/dictation-out-of-process.md` / DESKTOP-X) |
 | font-list | Shells out to `fc-list` (Linux) / a PowerShell script (Windows) / a bundled binary (macOS); no rebuild needed | Included via `files` (`font-list/**`), unpacked from asar via `asarUnpack` since the macOS binary is spawned via `child_process` (Terminal Font Family picker) |
 | sqlite-vec | Loadable SQLite extension shipped as per-platform binary packages; no rebuild needed | Included via `files` (`sqlite-vec/**` plus the `sqlite-vec-*/**` platform packages), unpacked via `asarUnpack` because SQLite's dlopen cannot read a loadable extension inside an asar archive (conversation-memory retrieval) |
 | @huggingface/transformers | Pure JavaScript (transformers.js); no rebuild needed | Included via `files`, unpacked via `asarUnpack` so the embed worker resolves it from the unpacked tree by plain node_modules resolution |
@@ -139,13 +139,13 @@ The PowerShell case fixes a Windows PowerShell 5.1 quirk: it treats `[` / `]` in
 | onnxruntime-web | Pure JavaScript; retained only as transformers' optional peer, its wasm path currently unused | Included via `files` and unpacked alongside the others |
 | onnxruntime-common | Pure JavaScript; required at module scope by both transformers.js and onnxruntime-node | Included via `files` and unpacked, because the embed worker resolves from the unpacked tree only (see below) |
 | sharp, `@img/*`, detect-libc, semver | sharp's prebuilt libvips binding (`@img/sharp-<platform>`) plus its pure-JavaScript runtime deps; transformers.js requires sharp at module scope even though the worker never touches an image | Included via `files` and unpacked, for the same reason |
-| simple-git | Pure JavaScript, bundled by esbuild | Not in node_modules (bundled into main process) |
+| simple-git | Pure JavaScript, bundled by esbuild | Not shipped as node_modules; its code is inside `.vite/build/index.js`. A devDependency, like every other bundled package (see `.claude/rules/dependency-block-parity.md`) |
 
-The `files` array in `electron-builder.yml` explicitly whitelists `.vite/build/**`, `package.json`, `better-sqlite3`, `node-pty`, `sherpa-onnx-node`, the `sherpa-onnx-*` platform packages, `font-list`, `bindings`, `file-uri-to-path`, `sqlite-vec`, the `sqlite-vec-*` platform packages, `@huggingface/transformers`, `onnxruntime-node`, `onnxruntime-web`, `onnxruntime-common`, `sharp`, the `@img/*` packages, `detect-libc`, and `semver`. The whitelist governs the app's own files; electron-builder copies every production dependency from `package.json` into the asar on its own (a 0.39.0 install carries about 300 packages there), so for a runtime dependency the question is never whether it is in the asar but whether it is unpacked.
+The `files` array in `electron-builder.yml` explicitly whitelists `.vite/build/**`, `package.json`, `better-sqlite3`, `node-pty`, `sherpa-onnx-node`, the `sherpa-onnx-*` platform packages, `font-list`, `bindings`, `file-uri-to-path`, `sqlite-vec`, the `sqlite-vec-*` platform packages, `@huggingface/transformers`, `onnxruntime-node`, `onnxruntime-web`, `onnxruntime-common`, `sharp`, the `@img/*` packages, `detect-libc`, and `semver`. The whitelist governs the app's own files; electron-builder copies every production dependency from `package.json` into the asar on its own, so for a runtime dependency the question is never whether it is in the asar but whether it is unpacked. That also makes the `dependencies` block itself a packaging decision: it used to resolve to 302 packages, most of them already bundled into `.vite/build/**`, and now resolves to 121. `.claude/rules/dependency-block-parity.md` is what keeps it there.
 
-The embed worker's closure is the one that bites: the worker is forked from `app.asar.unpacked`, and Node resolution from a real directory never looks inside the asar, so a package the worker reaches only transitively (transformers.js requires `onnxruntime-common` and `sharp` at module scope) must be unpacked too, or the worker exits 1 at module load on every fork. 0.38.0 and 0.39.0 shipped that way (Sentry DESKTOP-6, DESKTOP-H). `build/afterPack.js` now runs `build/verify-unpacked-worker.js` after packing: it loads `@huggingface/transformers` from the unpacked tree in a child `node` whose module resolution is fenced to that tree (an unfenced probe would find the repo's own `node_modules` above `out/` and pass), and fails the package with the child's stderr when anything is missing. `npm run package` runs it too, so the gate holds locally, not only on the release matrix.
+The embed worker's closure is the one that bites: the worker is forked from `app.asar.unpacked`, and Node resolution from a real directory never looks inside the asar, so a package the worker reaches only transitively (transformers.js requires `onnxruntime-common` and `sharp` at module scope) must be unpacked too, or the worker exits 1 at module load on every fork. 0.38.0 and 0.39.0 shipped that way (Sentry DESKTOP-6, DESKTOP-H). `build/afterPack.js` now runs `build/verify-unpacked-worker.js` after packing, once per worker with an unpacked native closure to verify (embed and dictation; line-count's only import, `simple-git`, is bundled by esbuild and has no unpacked closure to check): it loads each worker's external(s) from the unpacked tree in a child `node` whose module resolution is fenced to that tree (an unfenced probe would find the repo's own `node_modules` above `out/` and pass), and fails the package with the child's stderr when anything is missing. The dictation worker (DESKTOP-X) reuses the same gate for `sherpa-onnx-node`. `npm run package` runs it too, so the gate holds locally, not only on the release matrix.
 
-Separately, how the embed and line-count workers are forked bites on Windows too.
+Separately, how the embed, line-count, and dictation workers are forked bites on Windows too.
 `UTILITY_PROCESS_STDIO` in `src/main/utility-process/stderr-tail.ts` must never mix `inherit` with
 a real handle (`pipe` or `ignore`) across the stdout and stderr slots. Electron gives an `inherit`
 slot no Windows branch, so its handle stays null, and it passes both handles to
@@ -156,13 +156,13 @@ console. `SetHandleInformation` on that null handle fails a `PCHECK` in `launch_
 the main process outright. 0.39.1 shipped `['ignore', 'inherit', 'pipe']` and crashed that way
 (Sentry DESKTOP-S); the array is now `['ignore', 'ignore', 'pipe']`. All-`inherit` (what passing no
 `stdio` gives you) and all-real are both safe, but omitting `stdio` also drops the piped stderr the
-crash reports need, so both workers pass the constant. `npm start` cannot catch this, because a dev
+crash reports need, so every worker passes the constant. `npm start` cannot catch this, because a dev
 terminal hands the process a valid stdout handle. `tests/unit/stderr-tail.test.ts` guards the
 mixing rule and also scans every `utilityProcess.fork` call site for the shared constant.
 
 ### Bridge Script Unpacking
 
-Bridge scripts (`event-bridge.js`, `status-bridge.js`) are executed by Claude Code hooks in a separate `node` process outside Electron. Plain Node.js cannot read files inside asar archives, so `asarUnpack` names them individually, alongside `embed-worker.js`, `line-count-worker.js`, and `plugins/**` (unpacked for the retrieval and embedding subsystem rather than for the hook bridges). Only those five entries under `.vite/build/` are extracted to `app.asar.unpacked/`; the rest of the directory stays inside the archive. The `resolveBridgeScript()` function in `src/main/agent/shared/bridge-utils.ts` rewrites `app.asar` to `app.asar.unpacked` in resolved paths when running in a packaged build.
+Bridge scripts (`event-bridge.js`, `status-bridge.js`) are executed by Claude Code hooks in a separate `node` process outside Electron. Plain Node.js cannot read files inside asar archives, so `asarUnpack` names them individually, alongside `embed-worker.js`, `line-count-worker.js`, `dictation-worker.js`, and `plugins/**` (unpacked for the retrieval, embedding, and dictation subsystems rather than for the hook bridges). Only those six entries under `.vite/build/` are extracted to `app.asar.unpacked/`; the rest of the directory stays inside the archive. The `resolveBridgeScript()` function in `src/main/agent/shared/bridge-utils.ts` rewrites `app.asar` to `app.asar.unpacked` in resolved paths when running in a packaged build.
 
 ## Config Directory Locations
 
@@ -201,6 +201,36 @@ macOS builds use hardened runtime with `build/entitlements.plist` providing JIT,
 ## Linux System Dependencies
 
 The deb package declares `depends` on Electron's required system libraries (`libnss3`, `libatk-bridge2.0-0`, `libgtk-3-0`, `libgbm1`, `libasound2t64 | libasound2`, `libdrm2`, `libxshmfence1`); the alternation covers Ubuntu 24.04+'s rename of `libasound2` to `libasound2t64`. The rpm package declares `depends` as `.so` soname capabilities (`libnss3.so()(64bit)`, `libatk-1.0.so.0()(64bit)`, `libgtk-3.so.0()(64bit)`, `libgbm.so.1()(64bit)`, `libasound.so.2()(64bit)`, `libdrm.so.2()(64bit)`, `libxshmfence.so.1()(64bit)`) rather than package names, because RPM package names differ per distro (Fedora `libxshmfence` vs. openSUSE `libxshmfence1`) while every distro's rpmbuild auto-generates a `Provides:` for the soname itself. See `.claude/rules/linux-package-dependencies.md`. Without these, the app crashes on launch, or fails to install at all, on fresh Linux installations.
+
+## GPU Process on Linux
+
+Two Sentry issues on one Ubuntu 24.04 install (DESKTOP-W, a `LOG(FATAL)` browser-process kill, and
+DESKTOP-15, a recovered GPU death three days later) both trace to the GPU process failing to
+*launch*, not to a crashing driver. `--disable-gpu` (what `app.disableHardwareAcceleration()`
+appends) is not a fix for that class, and was deliberately not added anywhere in the codebase for
+it - the reasoning is worth keeping so a future GPU issue does not re-derive it and ship the flag
+that does not work.
+
+Chromium's own fallback ladder (`content/browser/gpu/gpu_data_manager_impl_private.cc`,
+`GpuDataManagerImplPrivate::InitializeGpuModes`) pushes `DISPLAY_COMPOSITOR` and, if allowed,
+`SOFTWARE_GL` onto `fallback_modes_` **before** checking `--disable-gpu`, and
+`FallBackToNextGpuMode` pops from the back. So the pop order is hardware GL -> `SOFTWARE_GL` ->
+`DISPLAY_COMPOSITOR` -> empty list -> `LOG(FATAL)`
+(`IntentionallyCrashBrowserForUnusableGpuProcess`, whose message - `"GPU process isn't usable.
+Goodbye."` - is exactly what DESKTOP-W's minidump carried). Reaching the fatal means the two
+software-only modes had already been current and had already failed to launch. `--disable-gpu`
+skips straight to `SOFTWARE_GL` in that same list, so on a machine that failed there it reaches the
+identical `LOG(FATAL)`, only faster. The top frame in DESKTOP-W's stack is `OnProcessLaunchFailed`,
+not a crash handler, which points at a process-*launch* failure (sandbox, seccomp/AppArmor, a
+container or hardened kernel, a missing or broken mesa/libva) rather than a driver fault; a launch
+failure is not something a rendering-mode fallback flag can route around. The only Electron switch
+that skips a GPU child launch entirely is `--in-process-gpu`, which trades a GPU hang for an app
+hang and is a separate, higher-risk decision from anything shipped for these two issues.
+
+What did ship: `src/main/diagnostics/gpu-health.ts` counts repeated GPU `child-process-gone` deaths
+and, once they cross a threshold, writes a durable escalation for the NEXT launch to report to
+Sentry rather than live - `LOG(FATAL)` can kill the process before a live report's async transport
+completes. See "Error Reporting" in [analytics.md](analytics.md) for the full mechanism.
 
 ## Auto-Update Platform Guard
 

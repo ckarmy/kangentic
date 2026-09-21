@@ -1,9 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { PATHS, ensureDirs } from './paths';
-import type { AppConfig, DeepPartial, PermissionMode } from '../../shared/types';
+import type { AppConfig, DeepPartial, PermissionMode, ThemeMode } from '../../shared/types';
 import { DEFAULT_CONFIG } from '../../shared/types';
 import { deepMerge, deepMergeConfig } from '../../shared/object-utils';
+import { safeWriteJson } from '../safe-write';
+import { reportSyncWriteFailure } from './write-failure-notice';
 
 /** Dotted paths in AppConfig that must be REPLACED wholesale on a partial update
  *  (not deep-merged), so key/window deletion and a full-blob reset both work. This
@@ -42,6 +44,27 @@ function pruneUndefined(obj: Record<string, unknown>): Record<string, unknown> |
 }
 
 /**
+ * The product pair's ids for the three days they existed on `main` before the pair
+ * was named. No release carried them, but a dogfooding config file or a project's
+ * `.kangentic/config.json` can, and a retired id paints as the classless dark palette.
+ */
+const RETIRED_THEME_IDS: Record<string, ThemeMode> = { 'kangentic-light': 'clay', 'kangentic-dark': 'rust' };
+const THEME_ID_KEYS = ['theme', 'themeLight', 'themeDark'] as const;
+
+/** Rewrite retired theme ids in place across the three theme keys; true when any changed. */
+function renameRetiredThemeIds(target: Record<string, unknown>): boolean {
+  let changed = false;
+  for (const key of THEME_ID_KEYS) {
+    const value = target[key];
+    if (typeof value === 'string' && value in RETIRED_THEME_IDS) {
+      target[key] = RETIRED_THEME_IDS[value];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
  * Pick only the project-overridable keys from a config-like object. This is the
  * single definition of "what counts as a project setting". Both the global
  * defaults snapshot (getProjectOverridableDefaults) and new-project seeding
@@ -58,6 +81,10 @@ export function pickOverridableSubset(source: DeepPartial<AppConfig>): Partial<A
   const result: Record<string, unknown> = {};
 
   if (source.theme !== undefined) result.theme = source.theme;
+  // The follow-system trio travels with `theme`: all four are the Theme tab.
+  if (source.themeFollowsSystem !== undefined) result.themeFollowsSystem = source.themeFollowsSystem;
+  if (source.themeLight !== undefined) result.themeLight = source.themeLight;
+  if (source.themeDark !== undefined) result.themeDark = source.themeDark;
 
   // terminal.* (shell, fontSize, fontFamily, scrollbackLines, cursorStyle,
   // backspaceSendsCtrlH) used to be project-overridable but is now global-only
@@ -103,7 +130,20 @@ export class ConfigManager {
   load(): AppConfig {
     if (this.config) return this.config;
 
-    ensureDirs();
+    // A failed mkdir here (dead volume) must degrade to defaults, not throw out
+    // of load() - the readFileSync below already tolerates a missing directory
+    // (ENOENT falls into the catch and sets configFileUnreadable), so swallowing
+    // this one is enough to let the rest of the method run its normal fallback.
+    // Tagged apart from the 'config' file write below on purpose: ensureDirs()
+    // creates configDir, projectsDir AND modelsDir, and the models cache can
+    // sit on a different volume. Sharing one tag would let a later successful
+    // config-file write clear a still-broken models-directory latch, which is
+    // the cross-source interleaving write-failure-notice.ts exists to prevent.
+    try {
+      ensureDirs();
+    } catch (error) {
+      reportSyncWriteFailure(error, 'config_dirs');
+    }
     let parsed: Record<string, unknown> | null = null;
     // `parsed === null` covers two very different states: there is no config file
     // yet, or there is one and we could not read or parse it. The migrations below
@@ -162,6 +202,11 @@ export class ConfigManager {
     };
     if (pm in migrationMap) {
       this.config.agent.permissionMode = migrationMap[pm] as PermissionMode;
+      this.save(this.config);
+    }
+
+    // One-time migration: the product pair's retired ids -> clay / rust.
+    if (parsed && renameRetiredThemeIds(this.config as unknown as Record<string, unknown>)) {
       this.save(this.config);
     }
 
@@ -240,7 +285,17 @@ export class ConfigManager {
     return this.config;
   }
 
-  save(partial: Partial<AppConfig>): void {
+  /**
+   * Merges `partial` into the in-memory config and persists it. Returns whether
+   * the write actually reached disk - `false` on a write failure (already
+   * reported through `write-failure-notice.ts`), which callers may check, but
+   * the in-memory config is updated regardless: a settings write failing must
+   * not roll back a value the user just changed for THIS session, only fail to
+   * carry it to the next one. DESKTOP-14/DESKTOP-13 were this method throwing
+   * out of a timer (uncaught exception) and out of the `config:set` IPC handler
+   * (unhandled rejection, never caught) when the data directory went unwritable.
+   */
+  save(partial: Partial<AppConfig>): boolean {
     const current = this.load();
     // Use merge semantics so partial updates to typed structs (e.g. contextBar)
     // preserve unmentioned keys. Dictionary paths (Record<string, ...>) still
@@ -249,13 +304,12 @@ export class ConfigManager {
       replaceFlatMaps: false,
       dictionaryPaths: CONFIG_DICTIONARY_PATHS,
     });
-    ensureDirs();
-    fs.writeFileSync(PATHS.configFile, JSON.stringify(this.config, null, 2));
+    return safeWriteJson(PATHS.configFile, this.config, 'config');
   }
 
   loadProjectOverrides(projectPath: string): Partial<AppConfig> | null {
     const configPath = path.join(projectPath, '.kangentic', 'config.json');
-    let overrides: Record<string, unknown> | null = null;
+    let overrides: Record<string, unknown> | null;
     try {
       const raw = fs.readFileSync(configPath, 'utf-8');
       overrides = JSON.parse(raw);
@@ -294,14 +348,19 @@ export class ConfigManager {
       }
     }
 
+    // One-time migration: the product pair's retired ids -> clay / rust.
+    if (renameRetiredThemeIds(overrides)) {
+      this.saveProjectOverrides(projectPath, overrides as Partial<AppConfig>);
+    }
+
     return overrides as Partial<AppConfig>;
   }
 
-  saveProjectOverrides(projectPath: string, overrides: Partial<AppConfig>): void {
-    const dir = path.join(projectPath, '.kangentic');
-    fs.mkdirSync(dir, { recursive: true });
-    const configPath = path.join(dir, 'config.json');
-    fs.writeFileSync(configPath, JSON.stringify(overrides, null, 2));
+  /** Same non-throwing contract as `save()`, for the per-project `.kangentic/config.json`.
+   *  Returns whether the write reached disk. */
+  saveProjectOverrides(projectPath: string, overrides: Partial<AppConfig>): boolean {
+    const configPath = path.join(projectPath, '.kangentic', 'config.json');
+    return safeWriteJson(configPath, overrides, 'config_project_override');
   }
 
   /** Extract the project-overridable subset of the current global config.

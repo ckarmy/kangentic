@@ -20,7 +20,7 @@ export async function resumeAnsweredTask(context: IpcContext, projectId: string,
   const { signal } = controller;
   try {
     await withTaskLock(taskId, async () => {
-      const { tasks, swimlanes, actions, attachments } = getProjectRepos(context, projectId);
+      const { tasks, swimlanes, automations, automationRuns, attachments } = getProjectRepos(context, projectId);
       const original = tasks.getById(taskId);
       if (!original || original.revision !== expectedRevision) throw new Error('La tarjeta cambió. Actualiza y revisa antes de reanudar.');
       const block = humanResponseResumeBlock({ labels: original.labels, description: original.description,
@@ -52,7 +52,7 @@ export async function resumeAnsweredTask(context: IpcContext, projectId: string,
         throw new Error('La tarjeta cambió durante la preparación. Sigue pausada; revisa antes de reintentar.');
       }
       const lane = applyProfileToLane(swimlanes.getById(current.swimlane_id), loadTaskProfile(context, current, project.path));
-      const engine = createTransitionEngine(context, actions, tasks, new SessionRepository(getProjectDb(projectId)), attachments, projectId, project.path);
+      const engine = createTransitionEngine(context, automations, automationRuns, tasks, new SessionRepository(getProjectDb(projectId)), attachments, projectId, project.path);
       const prompt = 'El humano respondió la última pregunta en la descripción actual. Continúa únicamente el alcance previamente aprobado usando esa respuesta. '
         + 'No repitas trabajo completado. Esta reanudación no autoriza producción, secretos, despliegues ni operaciones destructivas. '
         + 'Si la respuesta es insuficiente, solicita el dato concreto que falta.';

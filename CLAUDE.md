@@ -27,6 +27,10 @@ src/
       shared/     # Shared utilities (interpolateTemplate, resolveBridgeScript, execVersion)
       adapters/   # Per-agent subfolders (claude/, codex/, gemini/, qwen-code/, opencode/, aider/)
       commands/   # MCP command handlers
+    automations/  # Column automation adapter system (mirrors agent/, boards/, pr/)
+      shared/     # AutomationAdapter contract, context, errors, describe helpers
+      adapters/   # Per-type subfolders (send-message/, run-script/, webhook/, notify/, legacy/)
+      automation-registry.ts  # Central AutomationRegistry + automationRegistry singleton
     boards/       # Board integration adapter system (mirrors agent/)
       shared/     # BoardAdapter interface + auth, mapping, download, rate-limit helpers
       adapters/   # Per-provider subfolders (github-issues/, azure-devops/, jira/, etc.)
@@ -399,16 +403,19 @@ session; rules with one load when you touch matching files. Each rule names its 
 **Path-scoped rules (load with their subsystem):**
 - `task-lifecycle-lock.md` - wrap per-task async mutation in `withTaskLock` (`src/main/ipc/`).
 - `hmr-patterns.md` - dev-mode HMR parity patterns A through D (`src/renderer/`).
-- `ui-conventions.md` - shared UI primitives, selectors, font floor, no hover-only controls, `select-none` on clickable controls, brief accurate copy (`src/renderer/`).
+- `ui-conventions.md` - shared UI primitives, selectors, font floor, no hover-only controls, `select-none` on clickable controls, chrome rows that survive the 900x600 floor, brief accurate copy (`src/renderer/`).
 - `popover-escapes-clipping.md` - a menu popover portals to `document.body` with `strategy: 'fixed'`; `z-index` never escapes an ancestor's overflow clip (`src/renderer/`).
 - `light-dismiss-denylist.md` - clicking outside a task window closes it unless excluded; overlays mount outside the `data-dismiss-layer` shell subtree, action cursors need `data-no-dismiss`, and hover must not promise what the click will not do (`src/renderer/`).
 - `synchronous-shutdown.md` - the `before-quit` path must be synchronous; the only sanctioned
   `preventDefault` is the bounded PTY exit-callback drain (`src/main/` shutdown).
 - `utc-timestamps.md` - DB writes use `new Date().toISOString()` (`src/main/db/`).
+- `guarded-sync-writes.md` - a synchronous write in config/boards/browser/mobile-bridge/db-repositories/agent-adapters is either routed through `safeWriteJson` or marked `// sync-write-ok:` with a reason.
 - `ipc-7-layer-parity.md` - wire an IPC endpoint through all 7 layers.
 - `project-scoped-ipc.md` - renderer-driven task/session mutations forward an explicit interaction-time `projectId` (`src/preload/`, `src/main/ipc/`, `src/renderer/stores/`).
 - `esbuild-cjs-imports.md` - ES `import`, not bare `require()`, in bundled main/preload code.
+- `dependency-block-parity.md` - `dependencies` is the esbuild externals (minus `electron`) plus what `electron-builder.yml`'s `files:` names; everything bundled goes in `devDependencies` (`package.json`).
 - `agent-adapters-boundary.md` - no agent-name branching outside `src/main/agent/adapters/`.
+- `automation-adapters.md` - an automation type is declared once in `AUTOMATION_MANIFEST` and implemented under `src/main/automations/adapters/`; the runner owns escaping, timeouts and retry (`src/main/automations/`).
 - `cli-features-over-custom-layers.md` - do not shadow an agent CLI's native controls (`src/main/agent/`).
 - `dev-tooling-build-exclusion.md` - dev tooling build-excluded via `__KANGENTIC_DEV__` (`src/devtools/`).
 - `docs-stay-in-sync.md` - update docs when changing anchor source files (types, IPC, migrations, adapters, settings).
@@ -419,12 +426,14 @@ session; rules with one load when you touch matching files. Each rule names its 
 - `activity-state-classification.md` - bucket `ActivityState` idle-vs-active only via `src/shared/activity-state.ts` (`src/renderer/`).
 - `board-completing-task-chokepoint.md` - hide in-flight Done-completing tasks only at KanbanBoard's `tasksPerLane`, never per-lane (`src/renderer/components/board/`).
 - `keybindings-registry.md` - renderer shortcuts declared in `KEYBINDINGS` and bound via `useKeybinding`, not ad-hoc `addEventListener('keydown')` (`src/renderer/`).
+- `keyboard-drag-intent.md` - `IntentKeyboardSensor` is the only dnd-kit keyboard sensor: it arms only on Tab-placed focus, cancels on a pointer press or a focus move, and owns the in-gesture Escape, so a mouse-focused card never lifts on Space/Enter and no ghost outlives a click into a terminal; a sortable that spreads `attributes` registers it, on the same element as `listeners`; the board overlay's measured node carries no transform (`src/renderer/hooks/`, `components/board/`, `board-manager/`, `PrioritiesPopover`, `ShortcutsTab`, `DataTable`).
 - `restore-no-animation-replay.md` - a project switch / restore paints flat: restored windows skip the entrance animation (`skipEnterAnimation`) and `useValuePulse` rebaselines on a `resetKey` instead of pulsing (`src/renderer/`).
 - `cross-platform-parity.md` - code and tests must behave identically on Windows/macOS/Linux/CI; no OS-specific paths, no cross-test state leakage or pixel-exact assertions (`tests/`, `src/main/` pty/agent/git).
 - `browser-automation-driver.md` - the shipped CDP driver is singular and ships; every `kangentic_browser_*` tool routes through `withGuest`; no `src/devtools/` import from shipped code (`src/main/browser/`).
 - `mcp-tool-list-parity.md` - every MCP tool registered under `src/main/agent/mcp-http/*-tools.ts` stays in sync with `MCP_TOOL_MANIFEST` (the settings panel's source) and `docs/mcp-server.md` (`src/main/agent/mcp-http/`, `src/shared/mcp-tool-manifest.ts`).
 - `mcp-column-field-parity.md` - every `Swimlane` field is a parameter of both MCP column tools or classified as unexposed with a reason; enum fields validate in the handler, not only in zod (`src/main/agent/mcp-http/task-tools.ts`, `src/main/agent/commands/column-commands.ts`, `src/shared/types.ts`).
 - `central-embedding-engine.md` - only `embed-engine.ts` embeds; lifecycle/IPC call sites index and `markDirty()`, never embed inline (`src/main/retrieval/**`, `src/main/ipc/handlers/**`).
+- `dictation-out-of-process.md` - `sherpa-onnx-node` is imported only by the three sherpa engine files, which run exclusively inside the `kangentic-dictation` utilityProcess worker; `DictationClient` is constructed only in `dictation-client.ts` (`src/main/transcription/**`).
 - `pop-out-surface-registry.md` - every OS `BrowserWindow` is created only in `createWindow` or the pop-out window manager; every detachable surface goes through the shared + renderer registries (`src/main/pop-out/**`, `src/shared/pop-out.ts`, `src/renderer/pop-out/**`).
 - `spawn-entry-point-parity.md` - every agent-spawn entry point routes through `spawnAgent` / `prepareAgentSpawn` and the shared `runSpawnPreamble` (first-spawn override lock + agent resolution); no direct engine spawn calls in handlers (`src/main/ipc/**`, `src/main/transition-engine/**`).
 - `linux-package-dependencies.md` - rpm dependencies are soname capabilities, never package names, since RPM package names differ per distro (`electron-builder.yml`).
@@ -439,6 +448,7 @@ session; rules with one load when you touch matching files. Each rule names its 
 - `cookie-jar-sharing.md` - browser jar cookies are copied only through `cookie-seed.ts`, `isLocalCookieDomain` is the single localhost exclusion, and partitions stay task-keyed (`persist:kng-<projectId>-<taskId>`), so a project's IdP login shares across tasks while each task's localhost session stays isolated (`src/main/browser/**`, `src/shared/browser-partition.ts`, `src/devtools/main/cookie-jar-routes.ts`).
 - `pty-teardown-grace.md` - a young agent's PTY is never force-killed without its exit sequence and the 1500 ms grace (`SessionManager.kill()` parks it on `DeferredKillRegistry`, outside the registry row); a caller that touches the cwd after a kill captures `awaitExit` before `remove()`; the quit path defers only where the drain follows; a probe PTY runs Claude on the classic renderer; every `~/.claude.json` write takes Claude's own lock (`src/main/pty/**`, `src/main/ipc/**`, `src/main/transition-engine/**`, `src/main/agent/**`).
 - `web-demo-parity.md` - the web build (`demo/`) is the real renderer over the mock bridge: every `ElectronAPI` method has a mock implementation, demo behaviour lives in `demo/boot.js` and the scene registry rather than `src/renderer`, scenes are data, and the `demo` tier stays green (`src/shared/types.ts`, `src/preload/**`, `tests/ui/mock-electron-api.js`, `demo/**`, `tests/captures/**`, `tests/demo/**`).
+- `session-replica-contract.md` - the renderer session store is a replica of main's registry: a row leaving the registry emits `session-removed` (never a forced status), a status push only upserts and a removal push only removes, dropping a session scrubs every map keyed on it through `withoutSessions`, a sync neither resurrects a row removed in its gap nor drops one that arrived in it, a todo-role task is sessionless, and every `kill()` is followed by the push that says what happened (`remove`, `suspend`, or `announceSessionEnded`) (`src/renderer/stores/session-store.ts`, `src/renderer/stores/session-store/**`, `src/renderer/App.tsx`, `src/main/pty/session-manager.ts`, `src/main/pty/session-registry.ts`, `src/main/ipc/handlers/sessions.ts`).
 
 **Local overrides:** there is no per-rule local file. Put machine-specific instruction
 overrides in a gitignored `CLAUDE.local.md` at the project root.

@@ -5,7 +5,7 @@ import { SessionRepository } from '../../db/repositories/session-repository';
 import { UsageHistoryRepository } from '../../db/repositories/usage-history-repository';
 import { TaskRepository } from '../../db/repositories/task-repository';
 import { getProjectDb } from '../../db/database';
-import { getProjectRepos, ensureTaskWorktree, createTransitionEngine, resolveSpawnOverrides } from '../helpers';
+import { getProjectRepos, ensureTaskWorktree, createTransitionEngine, resolveSpawnOverrides, notifySpawnBlocked } from '../helpers';
 import { linkPR, autoLinkPRForTask, recordPushedBranchForSession } from '../../pr/pr-linking';
 import { resolveProjectContext } from '../helpers/project-repos';
 import { applyProfileToLane } from '../../transition-engine/column-strategy';
@@ -113,18 +113,21 @@ export function registerSessionHandlers(context: IpcContext): void {
       const resolvedProjectId = projectId ?? context.currentProjectId;
       if (!resolvedProjectId) throw new Error('No project is currently open');
 
-      const { tasks } = getProjectRepos(context, resolvedProjectId);
-      const task = tasks.getById(taskId);
-      if (!task) throw new Error(`Task ${taskId} not found`);
-      if (!task.session_id) return; // nothing to suspend
+      // Reconciled against the registry, as SESSION_RESUME and the task move
+      // are: a pointer at an exited row is cleared and there is nothing to
+      // suspend, and a live PTY the pointer lost is re-linked and suspended.
+      // On the raw pointer, a pause on a task whose CLI had ended by itself
+      // marked its exited record `suspended` and suspended a row that was not
+      // live.
+      const { liveSession } = reconcileTaskSessionRef(context, resolvedProjectId, taskId);
+      if (!liveSession) return; // nothing to suspend
 
-      const sessionId = task.session_id;
       // DB writes first (capture metrics, mark record suspended, clear
       // task.session_id) then async PTY shutdown. Capturing metrics before
       // shutdown is required - caches are still populated; afterwards is
       // also fine, but doing it first matches task-move's order.
       applySuspendDbWrites(context, resolvedProjectId, taskId, 'user');
-      await context.sessionManager.suspend(sessionId);
+      await context.sessionManager.suspend(liveSession.id);
     });
   });
 
@@ -143,7 +146,7 @@ export function registerSessionHandlers(context: IpcContext): void {
       const { projectId: resolvedProjectId, projectPath: resolvedProjectPath } = resolveProjectContext(context, projectId);
       if (!resolvedProjectId) throw new Error('No project is currently open');
 
-      const { tasks, actions, swimlanes, attachments: attachmentRepo } = getProjectRepos(context, resolvedProjectId);
+      const { tasks, automations, automationRuns, swimlanes, attachments: attachmentRepo } = getProjectRepos(context, resolvedProjectId);
 
       try {
         // Phase 1 (locked, short): validate task + lane, build plan.
@@ -192,7 +195,7 @@ export function registerSessionHandlers(context: IpcContext): void {
         } catch (worktreeError) {
           if (isAbortError(worktreeError)) throw worktreeError;
           const message = worktreeError instanceof Error ? worktreeError.message : String(worktreeError);
-          throw new Error(`Worktree setup failed: ${message}`);
+          throw new Error(`Worktree setup failed: ${message}`, { cause: worktreeError });
         }
 
         // Phase 3 (locked, short): CAS-check invariants, then spawn the PTY
@@ -227,7 +230,7 @@ export function registerSessionHandlers(context: IpcContext): void {
           const db = getProjectDb(resolvedProjectId);
           const sessionRepo = new SessionRepository(db);
           const engine = createTransitionEngine(
-            context, actions, tasks, sessionRepo, attachmentRepo,
+            context, automations, automationRuns, tasks, sessionRepo, attachmentRepo,
             resolvedProjectId, resolvedProjectPath,
           );
 
@@ -612,6 +615,29 @@ export function registerSessionHandlers(context: IpcContext): void {
     }
   });
 
+  // A session left the registry for good (SessionManager.remove()). Its own
+  // channel, never SESSION_STATUS: the renderer's status handler can only
+  // upsert, so a removal announced there re-seeded the row it was reporting
+  // gone (#661). The renderer drops the row and its per-session maps by id.
+  context.sessionManager.on('session-removed', (sessionId: string, session: Session) => {
+    // Drop anything this session left in the background buffers above. A
+    // non-focused session's usage and events are held here for up to
+    // BACKGROUND_FLUSH_MS, so without this the timer fires AFTER the removal
+    // and broadcasts a usage tick for a session the renderer has already
+    // dropped, writing `sessionUsage[id]` back under a row that no longer
+    // exists. That is the stale context bar of #661 arriving two seconds late,
+    // and no amount of renderer-side scrubbing can prevent it: the push is
+    // legitimate as far as the renderer can tell. Purging at the source also
+    // covers every other consumer of the channel, not just the board store.
+    bufferedUsage.delete(sessionId);
+    for (let eventIndex = bufferedEvents.length - 1; eventIndex >= 0; eventIndex--) {
+      if (bufferedEvents[eventIndex].sessionId === sessionId) bufferedEvents.splice(eventIndex, 1);
+    }
+    if (!context.mainWindow.isDestroyed()) {
+      broadcast(context.mainWindow, IPC.SESSION_REMOVED, sessionId, session, session.projectId);
+    }
+  });
+
   context.sessionManager.on('idle-timeout', (sessionId: string, taskId: string, timeoutMinutes: number) => {
     const projectId = context.sessionManager.getSessionProjectId(sessionId);
     if (!context.mainWindow.isDestroyed()) {
@@ -645,6 +671,43 @@ export function registerSessionHandlers(context: IpcContext): void {
     } catch {
       // DB may be closed
     }
+  });
+
+  /**
+   * A CLI that ended on its own and SAID why did not start; say so. The
+   * adapter reads its own CLI's last words (Claude's "No conversation found
+   * with session ID" on a `--resume` whose transcript is gone) and the failure
+   * rides the same "Agent did not start" notice a failed worktree or checkout
+   * raises. Without it the card simply went quiet: a dead session row was the
+   * only trace. Two routes reach this, and both must: the agent-absence sweep
+   * (the CLI runs under a shell that outlives it, so the PTY never exits on
+   * its own and the sweep's kill arrives INTENTIONAL) and the rare direct PTY
+   * exit. Never for a Command Terminal, which has no task to notify about.
+   */
+  const notifyStartupFailureIfNamed = (exitedSession: Session, exitCode: number, projectId: string): void => {
+    if (exitedSession.transient) return;
+    const exitAgentName = context.sessionManager.getSessionAgentName(exitedSession.id);
+    const adapter = exitAgentName ? agentRegistry.get(exitAgentName) : undefined;
+    if (!adapter?.describeStartupFailure) return;
+    const startupFailure = adapter.describeStartupFailure(context.sessionManager.getRawScrollback(exitedSession.id), exitCode);
+    if (!startupFailure) return;
+    try {
+      const failedTask = new TaskRepository(getProjectDb(projectId)).getById(exitedSession.taskId);
+      if (failedTask) notifySpawnBlocked(context, failedTask, 'agent', new Error(startupFailure), projectId);
+    } catch {
+      // DB may be closed during shutdown; the notice is best-effort.
+    }
+  };
+
+  // The agent-absence sweep found a running session whose CLI is gone and is
+  // about to retire it through kill(). That kill is intentional by design, so
+  // this is the only moment the CLI's own account of its end can be read.
+  context.sessionManager.on('agent-absent', (sessionId: string, session: Session) => {
+    const resolvedProjectId = context.sessionManager.getSessionProjectId(sessionId);
+    if (!resolvedProjectId) return;
+    // The sweep forces the reported exit code to 0 (a normal end); the
+    // recognizers read the wording, not the code.
+    notifyStartupFailureIfNamed(session, 0, resolvedProjectId);
   });
 
   context.sessionManager.on('exit', (sessionId: string, exitCode: number, intentional?: boolean) => {
@@ -684,6 +747,17 @@ export function registerSessionHandlers(context: IpcContext): void {
 
     if (!context.mainWindow.isDestroyed()) {
       broadcast(context.mainWindow, IPC.SESSION_EXIT, sessionId, exitCode, resolvedProjectId, intentional);
+    }
+
+    // The direct route to the startup-failure notice: the CLI was the PTY's
+    // root (or its shell ended with it) and the PTY itself exited. Never for a
+    // kill or a suspend, which are intentional and carry no failure. The usual
+    // route is the agent-absence sweep's `agent-absent` below, because the CLI
+    // normally runs under a shell that outlives it. Read BEFORE the DB writes
+    // so the raw ring is still the CLI's output and a DB throw cannot skip it.
+    if (intentional !== true && resolvedProjectId) {
+      const exitedSession = context.sessionManager.getSession(sessionId);
+      if (exitedSession) notifyStartupFailureIfNamed(exitedSession, exitCode, resolvedProjectId);
     }
 
     // Persist exit status to session DB -- use the session's own projectId

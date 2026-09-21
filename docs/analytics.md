@@ -7,7 +7,7 @@ the same kill switch (below).
 
 ## What We Collect (Aptabase)
 
-Seventeen event types are tracked, all on critical-path actions only:
+Eighteen event types are tracked, all on critical-path actions only:
 
 | Event | When | Properties |
 |-------|------|------------|
@@ -26,8 +26,10 @@ Seventeen event types are tracked, all on critical-path actions only:
 | `board_snapshot` | Once per project per app run, the first time the user views it (the boot auto-open or a sidebar switch); background activation of other projects does not count, and neither does the open that creates a project, whose board is still the default | columns, customColumns, taskBucket (`0` / `1-9` / `10-49` / `50-199` / `200+`), profiles |
 | `update_outcome` | Next launch after the app version changed | result (`applied` / `rolled_back`), fromVersion, toVersion |
 | `spawn_failed` | An agent spawn failed (born-into-column create, MCP auto-spawn, any board-driven resume including a drag move, startup recovery) | agent, reason (`create_spawn`, `auto_spawn`, `resume`, `unknown_agent`, `cli_not_found`) |
-| `utility_worker_crashed` | A Kangentic utility process exited unexpectedly (not an idle recycle or quit): at most twice per service per app run, on the first crash and when the restart cap latches | service (`kangentic-embeddings`, `kangentic-line-count`), exitCode (see below), phase (`first` / `latched`) |
+| `utility_worker_crashed` | A Kangentic utility process exited unexpectedly (not an idle recycle or quit): at most twice per service per app run, on the first crash and when the restart cap latches | service (`kangentic-embeddings`, `kangentic-line-count`, `kangentic-dictation`), exitCode (see below), phase (`first` / `latched`) |
 | `foreign_minidump_dropped` | A native crash dump reached us from a process that is not ours, and was filtered out before upload (see "Error Reporting" below) | module (the crashing executable's file name, never a path) |
+| `gpu_process_gone` | The GPU process exited abnormally (not a clean exit on quit): at most twice per app run, on the first death and when the escalation threshold latches | reason (Electron's `child-process-gone` reason), exitCode, phase (`first` / `latched`) |
+| `mobile_bridge_forced_redial` | The mobile bridge abandoned a relay socket that still read connected but carried nothing (a socket the relay reaped while the network was away; see `docs/mobile-bridge.md`): at most once per reason per app run | reason (`paired-silent` / `parked-stale`) |
 
 There is no close event. Every quit path exits before a network send can complete, so
 `app_close` fired on every quit and landed on none of them; the run's duration is instead
@@ -51,6 +53,21 @@ moment the Sentry issue is filed). The event used to tick on every crash, which 
 per five-minute decay window read as "71 crashes a day" when it was a handful of installs looping,
 and could not tell those apart. The per-run cap is held per service across policy instances, since
 the embed client rebuilds its policy on every model change and project switch.
+
+`gpu_process_gone` follows the same shape for the GPU process (`src/main/diagnostics/gpu-health.ts`),
+mirroring Chromium's own judgment of GPU health: three deaths inside five minutes is also the point
+at which Chromium falls back to software compositing on its own
+(`GpuProcessHost::RecordProcessCrash`). `first` fires on the first death, `latched` on the third;
+neither fires again for the rest of the RUN, even across a later decay reset and a fresh escalation -
+the phase gate is per-run, not per-window, which is what keeps this at exactly two Aptabase events no
+matter how many separate incidents one launch has. `exitCode`'s `-1` sentinel does NOT carry the same
+meaning it does for `utility_worker_crashed` above: there it means the fork never started, but here it
+means Electron's `child-process-gone` event reported no exit code, a routine and more common case.
+Reaching the latch also writes a durable escalation record for the NEXT launch to report to Sentry
+(see "Error Reporting" below) - live reporting is not possible here, because the GPU process
+exhausting every fallback mode can end in Chromium killing the browser process outright
+(`LOG(FATAL)`, DESKTOP-W), which happens before an async Sentry POST queued at that moment could
+ever transmit.
 
 The curated `feature` vocabulary is `ANALYTICS_FEATURES` in `src/main/analytics/usage.ts`:
 `command_terminal`, `worktree_session`, `board_profile`, `popout_window`, `browser_pane`,
@@ -192,8 +209,12 @@ in one Sentry org, one triage surface.
 - **Filtering is a different concern and does live in code,** in `ignoreErrors`, plus a `beforeSend`
   for the one class `ignoreErrors` cannot see (native crashes, below). Scrubbing removes data from an
   event we keep; filtering decides a whole class of event is un-actionable and should never become an
-  issue. Four classes are filtered:
-  - The Windows `npm start` TTY write artifacts (`write EAGAIN`, `write EPIPE`).
+  issue. Five classes are filtered:
+  - Benign Windows stdio write artifacts, in two message shapes. Node's `errnoException` reads
+    `write EAGAIN` / `write EPIPE` (the dev `npm start` TTY case) and is matched by those two
+    string literals; libuv's `uvException` reads `EPIPE: broken pipe, write` (a packaged GUI
+    build, which has no console) and is matched by the two regexes beside them. Neither literal
+    matches the other shape, so both forms are listed.
   - Utility-process exits reported by the SDK's own `childProcessIntegration`
     (`'Utility' process exited with '<reason>'`). That event is tagged only with the process
     TYPE - `serviceName` / `name` / `exitCode` go into a breadcrumb added AFTER the capture, so it
@@ -203,6 +224,14 @@ in one Sentry org, one triage surface.
     code are known. Scoped to `'Utility'` deliberately: renderer crashes come through the same
     integration as `'renderer' process exited with ...` and must keep reporting. The breadcrumb
     survives the filter, so an internal utility crash still shows as context on later events.
+  - The same SDK integration's GPU variant, but scoped narrower than the Utility filter:
+    `'GPU' process exited with 'abnormal-exit'` only, not every reason. A lone GPU death Chromium
+    recovers from on its own (DESKTOP-15) is the same un-attributable noise as a utility exit, and
+    Kangentic's own GPU health tracker now reports a repeated one (see "A GPU health escalation is
+    reported once" below). `'launch-failed'` is deliberately left unfiltered as a backstop: Chromium
+    can walk several GPU launch failures before giving up
+    (`GpuDataManagerImplPrivate::FallBackToNextGpuMode`), and the self-report cannot be verified to
+    fire when the LAST one ends in `LOG(FATAL)` killing the process first (DESKTOP-W) - see below.
   - `BENIGN_RENDERER_ERRORS` (`src/shared/benign-renderer-errors.ts`) is spread in, so the one
     registry drives the monaco error funnel, the UI-test collector, and Sentry. Patterns there
     must stay unanchored: monaco re-throws as `message + '\n\n' + stack`.
@@ -231,14 +260,27 @@ in one Sentry org, one triage surface.
 - **Handled errors are forwarded too** (`reportHandledError`): the deliberate catch sites that
   otherwise emit only a sanitized count - updater structural failures (`source: updater`), PTY
   spawn failures (`source: pty_spawn`), the silent agent-spawn catches (`source: spawn`, with a
-  `reason` tag), and a Kangentic utility worker that has crashed past its restart cap
-  (`source: utility_process`, with `service`, `exitCode`, and `crashCount`) - send the real error
-  to Sentry so hidden issues are diagnosable, not just counted. The utility-worker report also
+  `reason` tag), a Kangentic utility worker that has crashed past its restart cap
+  (`source: utility_process`, with `service`, `exitCode`, and `crashCount`), and a GPU health
+  escalation reported on the next launch (`source: gpu_process`, with `reason`, `exitCode`, and
+  `crashCount` - see the GPU health bullet below) - send the real error to Sentry so hidden issues
+  are diagnosable, not just counted. The utility-worker report also
   carries a `utility_process` context block with the last 8 KiB of the worker's stderr (home
   directory redacted). Both workers are forked with stderr piped for this; with Electron's
   `inherit` default, a packaged GUI build sent the worker's uncaught-exception dump nowhere, so
   every DESKTOP-H event could only say "exit code 1". Content lives in the context, never in a
   tag or the message, so grouping is unchanged.
+- **Host memory pressure carries a `host_memory` context on every event** (`setHostMemoryContext`,
+  `src/main/diagnostics/host-memory.ts`; DESKTOP-16 was a renderer OOM where the crashing process
+  held 179 MB while the host had 2.15 MB of Windows commit remaining out of an 89.8 GB limit - a
+  minimal reading like that took a multi-hour investigation to establish because the diagnosis
+  lived only in the minidump's `chromium_stability_report`, not on the event proper). The main
+  process samples `process.getSystemMemoryInfo()` every 60s and calls `Sentry.setContext` on the
+  ambient scope (not `beforeSend`, which is already `filterNativeCrashEvent` below and has no
+  transaction for `setMeasurement` to hang on), so whatever event fires next - including a native
+  crash - carries the freshest sample. `correctNativeCrashEvent` prunes `host_memory` under the
+  same stale-dump condition as `app_memory`/`free_memory`, since a startup-found dump can otherwise
+  present the uploading launch's memory as the crash's.
 - **User-configuration errors are the one deliberate exclusion.** `reportHandledError`
   early-returns on a `UserConfigurationError` (`src/shared/user-configuration-error.ts`). A
   missing agent CLI (`AgentCliNotFoundError`) is the user's environment, not a defect we can ship
@@ -255,6 +297,34 @@ in one Sentry org, one triage surface.
   `<project>/.kangentic/logs/<date>.log`, so the text is on disk locally whether or not error
   reporting is on. The Memory settings tab shows the same reason (exit code plus the first error
   line) while semantic search is off because of it.
+- **A GPU health escalation is reported once, and on the NEXT launch, not live.**
+  `src/main/diagnostics/gpu-health.ts` counts GPU `child-process-gone` deaths the same way
+  `UtilityRestartPolicy` counts a worker's, but cannot report live: the failure sequence this exists
+  for can end in Chromium calling `LOG(FATAL)` (`IntentionallyCrashBrowserForUnusableGpuProcess`),
+  which kills the whole process before an async Sentry POST queued at that moment would ever
+  transmit - the reason a 90-day search never turned up a single `'GPU' process exited with
+  'launch-failed'` event despite the SDK capturing that reason by default. Reaching the threshold
+  (three deaths in five minutes, matching Chromium's own `kForgiveGpuCrashMinutes` judgment) writes a
+  durable record to `<configDir>/gpu-health.json`, carrying `app.getGPUFeatureStatus()` AT THAT
+  MOMENT; further deaths in the same run keep updating count, lastAt, and that status rather than
+  freezing the record at the threshold, so a chronic looper's report does not read identically to a
+  run that latched once and ended. `src/main/index.ts` reads the record once `app.whenReady()`
+  resolves on the FOLLOWING launch, **clears it BEFORE reporting** (so a launch with error reporting
+  off - the kill switch, or `KANGENTIC_ERROR_REPORTING=0` - still consumes it silently rather than
+  carrying it forward to a later launch that might have reporting on; the local crash JSONs and the
+  `gpu_process_gone` Aptabase count exist either way), then calls `reportHandledError` with tags
+  `source: gpu_process`, `reason`, `exitCode`, `crashCount`, and a `gpu_process` context carrying
+  `reason`, `exitCode`, `count`, `firstAt`, `lastAt`, `escalatedInVersion` (the app version that
+  produced the escalation, not the one reporting it - the same build-attribution concern the native
+  crash correction below exists for), `featureStatusAtEscalation`, `featureStatusOnReport`, and
+  `previousRunExit`. The last three are deliberately three separate facts, not one:
+  `featureStatusAtEscalation` is what Chromium's GPU mode was AT THE DEATH that produced the record
+  (the one fact neither DESKTOP-W nor DESKTOP-15 could say); `featureStatusOnReport` is what it is on
+  THIS boot, read live, which may already differ (a machine can recover on its own between launches);
+  and `previousRunExit` is the previous run's `run-uptime.ts` exit kind (`abrupt` means that run ended
+  in a process kill, the DESKTOP-W shape; `clean` or `failsafe` means Chromium recovered on its own,
+  the DESKTOP-15 shape; `unknown` on a first launch or a wiped config dir), so the two failure shapes
+  are distinguishable on arrival.
 - **A transient updater feed failure is counted, not reported.** `hasTransientNetworkCause`
   (`src/main/updater.ts`) gates the `reportHandledError` call in the `autoUpdater.on('error')`
   handler, and sits deliberately AFTER `trackEvent('app_error')` so the "how often do update

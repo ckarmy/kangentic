@@ -374,6 +374,8 @@ export async function resumeSuspendedSessions(
         attachmentPaths: [],
         devPort: null,
         projectPath,
+        projectName: null,
+        move: null,
       });
       const taskPrompt = interpolateTaskTemplate(DEFAULT_SPAWN_PROMPT_TEMPLATE, templateVars);
       const columnPrompt = resolvedPromptLane?.auto_command

@@ -7,6 +7,8 @@ import fs from 'node:fs';
 import { registerAllIpc, getSessionManager, getTerminalSubmitScheduler, getBoardConfigManager, getCurrentProjectId, getOptionalIpcContext, openProjectByPath, deleteProjectFromIndex, pruneStaleWorktreeProjects, activateAllProjects, getLastOpenedProject } from './ipc/register-all';
 import { installDiagnostics } from './diagnostics/install';
 import { startEventLoopLagMonitor } from './diagnostics/event-loop-lag';
+import { startHostMemorySampler, getLastHostMemorySample } from './diagnostics/host-memory';
+import { createRendererReloadGate, isRecoverableRendererDeath, formatHostMemoryDetailLine, RENDERER_RELOAD_MAX, RENDERER_RELOAD_WINDOW_MS } from './diagnostics/renderer-recovery';
 // Dev-only (dropped from prod via __KANGENTIC_DEV__ dead-code elimination).
 import { createPreviewClone, fillPreviewClone, registerEphemeralProjectDevIpc } from '../devtools/main/ephemeral-projects';
 import { resolvePreviewTaskLabel } from '../devtools/main/preview-task-title';
@@ -28,9 +30,10 @@ import { decideSecondInstanceAction, isStartupComplete, markStartupComplete, sho
 import { isBenignStreamWriteError } from './diagnostics/benign-stream-error';
 const windowConfigManager = new ConfigManager();
 import { initAnalytics, trackEvent, sanitizeErrorMessage, shouldEmitHeartbeat, setAnalyticsClientId, HEARTBEAT_INTERVAL_MS } from './analytics/analytics';
-import { initErrorReporting, isErrorReportingActive, reportHandledError, setErrorReportingUser } from './analytics/error-reporting';
+import { initErrorReporting, isErrorReportingActive, reportHandledError, setErrorReportingUser, setHostMemoryContext } from './analytics/error-reporting';
 import { initUsageAnalytics, trackUpdateOutcome } from './analytics/usage';
 import { initRunUptimeTracking, checkpointRunUptime, recordRunExit, previousRunLaunchProps, RUN_UPTIME_CHECKPOINT_INTERVAL_MS } from './analytics/run-uptime';
+import { readPendingGpuEscalation, clearGpuEscalation } from './diagnostics/gpu-health';
 import { trackSettingsSnapshot } from './analytics/settings-snapshot';
 import { resolveClientId } from './analytics/client-id';
 import { PATHS } from './config/paths';
@@ -71,6 +74,8 @@ import { lineCountClient } from './git/line-count/line-count-client';
 import { setProjectDbInitializer } from './db/database';
 import { softly, setGlobalDbFailureNotifier } from './db/soft-db';
 import { ensureGlobalDbReadable, notifyGlobalDbUnavailable } from './db/global-db-dialog';
+import { setSyncWriteFailureNotifier } from './config/write-failure-notice';
+import { sendToRenderer } from './ipc/send-to-renderer';
 import { setWorktreeRemovedListener, setWorktreeRemovingListener } from './git/worktree-manager';
 import { notifyAdaptersWorktreeRemoved } from './ipc/helpers/task-cleanup';
 import { loadVecExtension } from './retrieval/vec-extension';
@@ -97,6 +102,12 @@ mark('process_start');
 // production via __KANGENTIC_DEV__.
 if (__KANGENTIC_DEV__) startEventLoopLagMonitor();
 
+// The GPU health escalation record. One constant, because the crash-capture
+// path below WRITES it and the whenReady block far below READS and clears it:
+// two independent path.join calls would diverge silently, with no compile or
+// test failure to catch it.
+const GPU_HEALTH_FILE_PATH = path.join(PATHS.configDir, 'gpu-health.json');
+
 // Install product diagnostics (log mirror, crash capture, IPC recorder,
 // debug-dump path resolver) BEFORE any IPC handler registers. The recorder
 // patches `ipcMain.handle` once and every subsequent registration flows
@@ -113,6 +124,7 @@ installDiagnostics({
     safeReadDeveloperFlag('persistConsoleLogs'),
   getRecordIpcTraffic: () =>
     safeReadDeveloperFlag('recordIpcTraffic'),
+  gpuHealthFilePath: GPU_HEALTH_FILE_PATH,
 });
 
 function safeReadDeveloperFlag(key: DeveloperFlagKey): boolean {
@@ -302,7 +314,7 @@ app.on('web-contents-created', (_event, contents) => {
     webPreferences.sandbox = true;
     webPreferences.webSecurity = true;
 
-    let allowed = false;
+    let allowed: boolean;
     try {
       const parsed = new URL(params.src);
       allowed = parsed.protocol === 'http:' || parsed.protocol === 'https:';
@@ -691,6 +703,11 @@ let mcpServerHandle: McpHttpServerHandle | null = null;
 let mcpServerSettled = false;
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 let runUptimeCheckpointInterval: ReturnType<typeof setInterval> | null = null;
+let stopHostMemorySampler: (() => void) | null = null;
+// DESKTOP-16 bounded-reload guard for the main window's render-process-gone
+// handler below. See renderer-recovery.ts for why the decision logic lives
+// in its own testable module rather than inline here.
+const rendererReloadGate = createRendererReloadGate();
 
 // Parse --cwd=<path> from command line args
 function getCwdArg(): string | null {
@@ -1115,6 +1132,50 @@ const createWindow = () => {
       reason: details.reason,
       exitCode: details.exitCode,
     });
+
+    // DESKTOP-16: an OOM/crashed renderer is usually the HOST running out of
+    // memory around us, not a bug on the page (see host-memory.ts's header).
+    // Agents live in main - a PTY survives a renderer death untouched - so
+    // recovering costs the user a repaint, never their work. Reload instead
+    // of leaving a dead, blank window with no explanation.
+    if (!isRecoverableRendererDeath(details.reason)) return;
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+
+    if (rendererReloadGate.tryReload()) {
+      if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
+        mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
+      } else {
+        mainWindow.loadFile(resolveRendererIndexPath(MAIN_WINDOW_VITE_NAME));
+      }
+      return;
+    }
+
+    // Past the bound: a fresh renderer died too, so reloading again would
+    // just spin. Say so, with the last known headroom, rather than leaving a
+    // blank window with nothing to explain it. Suppressed under E2E, where a
+    // modal has nobody to click it.
+    if (isE2ETest) return;
+    const sample = getLastHostMemorySample();
+    const detail = [
+      `The window crashed (${details.reason}) and could not recover after `
+        + `${RENDERER_RELOAD_MAX} attempts in ${RENDERER_RELOAD_WINDOW_MS / 60_000} minutes.`,
+      formatHostMemoryDetailLine(sample),
+      'Your agents are still running in the background. Restart Kangentic to reconnect to them.',
+    ].filter((line): line is string => line !== null).join('\n\n');
+    const parent = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const options: Electron.MessageBoxOptions = {
+      type: 'error',
+      title: 'Kangentic',
+      message: "Kangentic's window stopped responding",
+      detail,
+      buttons: ['OK'],
+    };
+    void (parent ? dialog.showMessageBox(parent, options) : dialog.showMessageBox(options)).catch(
+      (dialogError) => {
+        // A dialog that cannot open must not become the crash it was reporting.
+        console.error('[APP] Failed to show the renderer-recovery-failed dialog:', dialogError);
+      }
+    );
   });
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
@@ -1422,6 +1483,20 @@ app.whenReady().then(async () => {
     // time a read can degrade.
     notifyGlobalDbUnavailable(error, operation, mainWindow);
   });
+
+  // A sync write to config or one of the other small per-machine/per-project
+  // state files failed (DESKTOP-14/DESKTOP-13: the data directory itself went
+  // unwritable, e.g. a relocated userData on a removable volume). The Sentry
+  // report is unconditional (write-failure-notice.ts latches it once per
+  // source); the toast is suppressed on the way out, matching notifySpawnBlocked
+  // and notifySpawnWarning - a quit that closes the window mid-flush must not
+  // try to push to a renderer that is tearing down. mainWindow is read at CALL
+  // time, same reason as the DB notifier above: this runs before createWindow.
+  setSyncWriteFailureNotifier((message) => {
+    if (isShuttingDown()) return;
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    sendToRenderer(mainWindow, IPC.CONFIG_WRITE_FAILED, message);
+  });
   phase('ensureGlobalDbReadable');
   const globalDbReady = await ensureGlobalDbReadable();
   endPhase('ensureGlobalDbReadable');
@@ -1560,6 +1635,32 @@ app.whenReady().then(async () => {
   runUptimeCheckpointInterval = setInterval(() => checkpointRunUptime(), RUN_UPTIME_CHECKPOINT_INTERVAL_MS);
   runUptimeCheckpointInterval.unref();
 
+  // Host memory pressure sampling (Sentry DESKTOP-16): armed here, before
+  // createWindow()/registerAllIpc() below, but its first real tick is 60s
+  // away - by then mainWindow and the session manager both exist, the same
+  // ordering the heartbeat and run-uptime timers already rely on. The
+  // sampler itself is synchronous and side-effect-free
+  // (`process.getSystemMemoryInfo()`), so arming it this early is harmless
+  // even though nothing reads a sample until the first tick.
+  stopHostMemorySampler = startHostMemorySampler({
+    // getSessionManager() throws if registerAllIpc() has not run yet; that
+    // should never be true by the time a tick fires 60s+ after this is
+    // armed, but the fallback keeps a degenerate early-startup failure from
+    // becoming a recurring uncaught-exception report every tick.
+    getActiveAgentCount: () => {
+      try {
+        return getSessionManager().getSessionCounts().active;
+      } catch {
+        return 0;
+      }
+    },
+    onSample: (sample) => setHostMemoryContext(sample),
+    onPressure: (sample, activeAgentCount) => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      mainWindow.webContents.send(IPC.HOST_MEMORY_PRESSURE, { sample, activeAgentCount });
+    },
+  });
+
   // This span MUST stay one unbroken synchronous block. createWindow() calls
   // mainWindow.loadURL() internally, so the renderer starts loading before
   // initUpdater/initAnnouncements have registered their channels; only the
@@ -1608,6 +1709,27 @@ app.whenReady().then(async () => {
     checkpointRunUptime();
   });
 
+  // The mobile bridge's relay sockets do not survive a sleep: the relay's
+  // keepalive reaps a peer that misses one pong, and a socket the relay
+  // reaped while the machine was away still reads ESTABLISHED to this
+  // process afterwards, with nothing to tell the bridge (measured on
+  // 2026-09-18 after a router restart: four such sockets, 31 minutes). On
+  // resume each roster session redials or probes on its own evidence (a
+  // session with no phone attached redials at once; one whose phone was
+  // present is probed, since 'resume' also fires after a standby short
+  // enough that the socket survived); an unlock is only a hint, so it sends
+  // one presence probe and lets the session's own budget decide. Both are
+  // no-ops with the bridge disabled (no sessions), and neither touches an
+  // in-flight pairing. Electron emits 'unlock-screen' on Windows and macOS
+  // only; Linux recovers a zombie socket through 'resume', the rekey tick,
+  // and the spent-budget redial alone.
+  powerMonitor.on('resume', () => {
+    getOptionalIpcContext()?.mobileBridgeService.resumeAllSessions('system resumed from sleep');
+  });
+  powerMonitor.on('unlock-screen', () => {
+    getOptionalIpcContext()?.mobileBridgeService.probeAllPresence('screen unlocked');
+  });
+
   // OS-initiated shutdown/reboot bypasses before-quit entirely on Linux/macOS
   // (Windows's equivalent is the BrowserWindow 'session-end' handler above).
   // Route it through the same flush so an OS shutdown still suspends the
@@ -1649,6 +1771,70 @@ app.whenReady().then(async () => {
   // installs count (no-op unless error reporting initialized).
   setErrorReportingUser(clientId);
 
+  const previousRunProps = previousRunLaunchProps();
+
+  // A GPU health escalation (repeated GPU process deaths within one launch,
+  // possibly ending in the browser process being killed - gpu-health.ts)
+  // latches to disk rather than reporting live, because LOG(FATAL) can kill
+  // the process before an async Sentry POST queued at that moment would ever
+  // complete. Report it now instead, on the launch that follows. Must run
+  // AFTER setErrorReportingUser above (the install id is what correlates
+  // this with a minidump of the same crash) and after initRunUptimeTracking
+  // (previousRunProps reads that module's state); app.getGPUFeatureStatus()
+  // needs the app ready, which this whole block already is. Wrapped
+  // defensively so a telemetry-only failure here can never disrupt startup.
+  //
+  // Reported once per escalation: cleared before the report, so a run with
+  // error reporting OFF (the kill switch, or KANGENTIC_ERROR_REPORTING=0)
+  // still consumes it silently rather than queuing it for a later launch
+  // that might have reporting on. That loses only the Sentry issue - the
+  // local crash JSONs under .kangentic/logs/crashes/ and the Aptabase
+  // gpu_process_gone count exist independent of this report.
+  try {
+    const pendingGpuEscalation = readPendingGpuEscalation(GPU_HEALTH_FILE_PATH);
+    if (pendingGpuEscalation) {
+      clearGpuEscalation(GPU_HEALTH_FILE_PATH);
+      reportHandledError(
+        new Error(
+          `GPU process exited repeatedly (reason ${pendingGpuEscalation.reason}, exit code ${pendingGpuEscalation.exitCode ?? 'unknown'})`
+        ),
+        {
+          source: 'gpu_process',
+          reason: pendingGpuEscalation.reason,
+          exitCode: String(pendingGpuEscalation.exitCode ?? 'unknown'),
+          crashCount: String(pendingGpuEscalation.count),
+        },
+        // Content goes in a context, never a tag, matching restart-policy.ts.
+        // previousRunExit separates the two shapes seen so far: 'abrupt'
+        // means the escalating run ended in a browser-process kill
+        // (DESKTOP-W's shape); 'clean' or 'failsafe' means Chromium
+        // recovered on its own (DESKTOP-15's). TWO feature-status reads,
+        // deliberately not one: featureStatusAtEscalation is what Chromium's
+        // GPU mode was AT THE DEATH that produced this record (captured back
+        // when it was written); featureStatusOnReport is what it is on THIS
+        // boot, which may already differ (a machine that recovers on its own,
+        // or one still stuck) - reporting only the live read would silently
+        // claim to describe the failure while actually describing whatever
+        // came up afterwards.
+        {
+          gpu_process: {
+            reason: pendingGpuEscalation.reason,
+            exitCode: pendingGpuEscalation.exitCode,
+            count: pendingGpuEscalation.count,
+            firstAt: pendingGpuEscalation.firstAt,
+            lastAt: pendingGpuEscalation.lastAt,
+            escalatedInVersion: pendingGpuEscalation.appVersion,
+            featureStatusAtEscalation: pendingGpuEscalation.featureStatus,
+            featureStatusOnReport: app.getGPUFeatureStatus(),
+            previousRunExit: previousRunProps.lastRunExit ?? 'unknown',
+          },
+        },
+      );
+    }
+  } catch (error) {
+    console.error('[GPU-HEALTH] Failed to report a pending escalation:', error);
+  }
+
   // Fire app_launch event (analytics initialized before app.whenReady above).
   // trackEvent is a no-op if analytics is disabled, so no guard needed here.
   // clientId is attached explicitly here (the one authoritative per-launch
@@ -1660,7 +1846,7 @@ app.whenReady().then(async () => {
     platform: process.platform,
     arch: process.arch,
     clientId,
-    ...previousRunLaunchProps(),
+    ...previousRunProps,
   });
   // Once per run: which global settings differ from their defaults. Reads the
   // global config only, never a project's overrides, since there may be no
@@ -1840,6 +2026,12 @@ function getShutdownDependencies() {
         clearInterval(runUptimeCheckpointInterval);
         runUptimeCheckpointInterval = null;
       }
+      // Synchronous (clearInterval), so this needs no drain - see
+      // .claude/rules/synchronous-shutdown.md.
+      if (stopHostMemorySampler) {
+        stopHostMemorySampler();
+        stopHostMemorySampler = null;
+      }
       // Stop the background PR-refresh and remote-fetch timers (both
       // .unref()'d, but clear them explicitly so no tick fires mid-shutdown).
       prRefreshScheduler.stop();
@@ -1850,6 +2042,13 @@ function getShutdownDependencies() {
       // Synchronously kill the line-count worker (if spawned); in-flight
       // counts abandon and their callers fall back to inline counting.
       lineCountClient.dispose();
+      // Synchronously kill the dictation worker (if spawned): cancels every
+      // in-flight session bookkeeping-side and kills the kangentic-dictation
+      // utilityProcess. This is the DESKTOP-X quit-path gap - the method
+      // existed and was already synchronous-shutdown safe, but nothing
+      // called it, so the worker (and any native async work it still held)
+      // rode the app's own teardown instead of being torn down first.
+      getOptionalIpcContext()?.transcriptionService.dispose();
       // Stop accepting new MCP requests synchronously. The server's close()
       // is non-blocking; in-flight requests are abandoned, which is fine
       // because they're idempotent (the agent will retry on reconnect or

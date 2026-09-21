@@ -1,4 +1,4 @@
-import { chromium, type Browser, type Locator, type Page } from '@playwright/test';
+import { chromium, expect, type Browser, type Locator, type Page } from '@playwright/test';
 import path from 'node:path';
 
 const MOCK_SCRIPT = path.join(__dirname, 'mock-electron-api.js');
@@ -47,6 +47,46 @@ export async function waitForViteReady(url: string = VITE_URL, timeoutMs = 30000
 }
 
 /**
+ * Chromium flags for a spec that asserts on terminal CONTENT as text. Under
+ * WebGL, xterm draws rows to a canvas and `.xterm` innerText is empty; with
+ * WebGL disabled xterm falls back to its DOM renderer and the rows are real
+ * text nodes. Pass as `chromium.launch({ args: TERMINAL_TEXT_LAUNCH_ARGS })`.
+ * Costs a "WebGL unavailable" console warning per terminal, nothing else.
+ */
+export const TERMINAL_TEXT_LAUNCH_ARGS = ['--disable-webgl', '--disable-webgl2'];
+
+/**
+ * Put a mounted xterm into bracketed-paste mode the way an agent TUI does, and
+ * return once it is provably there. The mock never sends `\x1b[?2004h` and its
+ * scrollback is empty, so every UI-tier terminal starts with the mode OFF; a
+ * spec asserting a `\x1b[200~ ... \x1b[201~` packet must enable it first.
+ *
+ * Fires the DECSET as live PTY bytes with a sentinel in the same chunk and
+ * waits for the sentinel to render (xterm parses in order, so a visible
+ * sentinel means the mode landed, with no fixed wait). Fired INSIDE the poll: a
+ * chunk that lands while the mount replay is still in flight is held and then
+ * superseded by the replay's frame, so it is simply re-fired until one lands
+ * live; the DECSET is idempotent. Needs `TERMINAL_TEXT_LAUNCH_ARGS`, since the
+ * sentinel is read from `.xterm` innerText. `scope` is the container the
+ * terminal lives in (a task-detail dialog, the command-terminal window).
+ */
+export async function enableBracketedPaste(page: Page, scope: Locator, sessionId: string): Promise<void> {
+  const sentinel = 'MODE2004READY';
+  await expect
+    .poll(async () => {
+      await page.evaluate(
+        ({ targetSessionId, text }) => {
+          (window as unknown as { __mockFireSessionData: (id: string, data: string) => void })
+            .__mockFireSessionData(targetSessionId, `\x1b[?2004h${text}\r\n`);
+        },
+        { targetSessionId: sessionId, text: sentinel },
+      );
+      return scope.locator('.xterm').first().innerText();
+    }, { timeout: 10000, intervals: [250] })
+    .toContain(sentinel);
+}
+
+/**
  * Press one of the Changes panel's resize handles (`data-testid` selector) and
  * return its box once the drag is genuinely in flight, meaning the handle
  * publishes `data-resizing="true"`. Dispatch the moves only after this
@@ -83,6 +123,41 @@ export async function pressResizeHandle(
     await page.mouse.up();
   }
   throw new Error(`${selector} did not enter its drag after ${PRESS_ATTEMPTS} presses`);
+}
+
+/**
+ * Expand the task-detail Changes panel's History section and return only once
+ * it is provably open: the section's resize handle
+ * (`changes-history-resize`) renders ONLY while the section is open, so its
+ * presence is the signal, and a click that has not produced it within a short
+ * window is re-issued from a fresh `aria-expanded` read, bounded.
+ *
+ * Do not read the open state off `commit-graph-panel` being visible. The graph
+ * stays mounted while collapsed, clipped inside a `height: 0; overflow: hidden`
+ * body, and Playwright's visibility check reads the element's OWN box (which is
+ * not empty) rather than its ancestors' clipping, so that wait passes on a
+ * collapsed section too. That is how the History resize test in
+ * commit-graph-panel.spec.ts lost its expand click on UI shard 4 (the same
+ * starved-input shape `pressResizeHandle` re-presses for), sailed past the
+ * panel wait, and then spent the rest of its budget hovering a handle that was
+ * never going to render. The hard cap keeps a section that never opens a
+ * failure rather than a hang.
+ */
+export async function expandHistorySection(page: Page): Promise<void> {
+  const historyToggle = page.locator('[data-testid="changes-history-toggle"]');
+  const resizeHandle = page.locator('[data-testid="changes-history-resize"]');
+  await historyToggle.waitFor({ state: 'visible', timeout: 10000 });
+  const EXPAND_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= EXPAND_ATTEMPTS; attempt += 1) {
+    if ((await historyToggle.getAttribute('aria-expanded')) !== 'true') {
+      await historyToggle.click();
+    }
+    const opened = await resizeHandle.waitFor({ state: 'attached', timeout: 2000 })
+      .then(() => true)
+      .catch(() => false);
+    if (opened) return;
+  }
+  throw new Error(`changes-history-toggle did not expand the History section after ${EXPAND_ATTEMPTS} clicks`);
 }
 
 /**
@@ -151,6 +226,25 @@ export async function clickPastDragSwallow(
     if (settled) return;
     if (isLastAttempt && clickError) throw clickError;
   }
+}
+
+/**
+ * Wait until a dnd-kit keyboard drag that has just started can take its next key.
+ *
+ * dnd-kit registers the keyboard sensor's own `keydown` listener on a 0ms timer
+ * after pickup (`KeyboardSensor.attach`), so the activating key cannot end the
+ * drag it started. Blink runs an input task ahead of a due timer task, so a key
+ * pressed within a frame of the lifted item appearing can arrive before that
+ * listener exists and do nothing (seen as "the second Space did not drop, the
+ * third did"). A person cannot press two keys inside one frame; an automation
+ * can. A timer queued here lands BEHIND dnd-kit's in the same queue, so once it
+ * fires the listener is attached. This is a deterministic wait, not a fixed one.
+ *
+ * Call it after asserting the pickup happened (the overlay is visible, or the
+ * handle reads `aria-pressed="true"`) and before the next `keyboard.press`.
+ */
+export async function settleDndKitKeyboardSensor(page: Page): Promise<void> {
+  await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 0)));
 }
 
 /**

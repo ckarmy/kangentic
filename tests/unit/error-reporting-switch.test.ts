@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { createRequire } from 'node:module';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
 const mocks = vi.hoisted(() => {
   const setTagSpy = vi.fn();
@@ -33,6 +36,10 @@ const mocks = vi.hoisted(() => {
     sentryMock: {
       init: vi.fn(),
       setUser: vi.fn(),
+      // Top-level Sentry.setContext, distinct from the scope-level setContextSpy
+      // passed into withScope's callback below (used only by reportHandledError's
+      // per-error contexts). setHostMemoryContext calls the top-level one.
+      setContext: vi.fn(),
       captureException: vi.fn(),
       withScope: vi.fn(
         (
@@ -118,6 +125,7 @@ describe('error reporting runtime behavior (module-state gated)', () => {
   beforeEach(() => {
     mocks.sentryMock.init.mockClear();
     mocks.sentryMock.setUser.mockClear();
+    mocks.sentryMock.setContext.mockClear();
     mocks.sentryMock.captureException.mockClear();
     mocks.sentryMock.withScope.mockClear();
     mocks.setTagSpy.mockClear();
@@ -290,6 +298,44 @@ describe('error reporting runtime behavior (module-state gated)', () => {
     });
   });
 
+  describe('setHostMemoryContext (Sentry DESKTOP-16)', () => {
+    const sample = {
+      ts: '2026-09-16T14:24:24.000Z',
+      platform: 'win32' as const,
+      commitLimitBytes: 96_432_717_824,
+      commitRemainingBytes: 2_256_896,
+      physicalTotalBytes: 34_060_931_072,
+      physicalFreeBytes: 5_005_045_760,
+    };
+
+    it('forwards the sample to Sentry.setContext("host_memory", ...) only when active', async () => {
+      const errorReporting = await importFreshErrorReporting();
+      errorReporting.initErrorReporting();
+
+      errorReporting.setHostMemoryContext(sample);
+
+      expect(mocks.sentryMock.setContext).toHaveBeenCalledTimes(1);
+      expect(mocks.sentryMock.setContext).toHaveBeenCalledWith('host_memory', sample);
+    });
+
+    it('makes no call when the module was never initialized', async () => {
+      const errorReporting = await importFreshErrorReporting();
+      errorReporting.setHostMemoryContext(sample);
+
+      expect(mocks.sentryMock.setContext).not.toHaveBeenCalled();
+    });
+
+    it('swallows a throw from Sentry.setContext instead of propagating - this runs on a 60s timer, so a propagating throw would recur for the life of the process', async () => {
+      const errorReporting = await importFreshErrorReporting();
+      errorReporting.initErrorReporting();
+      mocks.sentryMock.setContext.mockImplementationOnce(() => {
+        throw new Error('sentry transport exploded');
+      });
+
+      expect(() => errorReporting.setHostMemoryContext(sample)).not.toThrow();
+    });
+  });
+
   describe('initErrorReporting Sentry.init option shape', () => {
     it('passes sendDefaultPii: false, filters MainProcessSession out of integrations while keeping others, and ignores the known-benign write errors', async () => {
       const errorReporting = await importFreshErrorReporting();
@@ -311,6 +357,22 @@ describe('error reporting runtime behavior (module-state gated)', () => {
           typeof pattern === 'string' ? message.includes(pattern) : pattern.test(message),
         );
 
+      // Two shapes carry the same benign EPIPE/EAGAIN write artifact: Node's
+      // errnoException (asserted above via the string literals) and a
+      // packaged Windows GUI build's uvException, which reads
+      // "EPIPE: broken pipe, write" instead. Neither string literal matches
+      // that second shape, which is why the two RegExp entries exist.
+      expect(matches('EPIPE: broken pipe, write')).toBe(true);
+      expect(matches('EAGAIN: resource temporarily unavailable, write')).toBe(true);
+      // The errnoException shape must still match through the same helper,
+      // so the two shapes coexist rather than one displacing the other.
+      expect(matches('write EPIPE')).toBe(true);
+      expect(matches('write EAGAIN')).toBe(true);
+      // Narrowness guard: a message that merely mentions EPIPE outside the
+      // benign stdio-write shape must not match. A loosened pattern like
+      // /EPIPE/ would wrongly swallow a real connection error such as this.
+      expect(matches('connect EPIPE 127.0.0.1:5432')).toBe(false);
+
       // The SDK's childProcessIntegration reports every utility-process exit
       // with only the process TYPE, so the event can never say WHICH process
       // died (serviceName/exitCode land in a breadcrumb added after capture).
@@ -319,6 +381,22 @@ describe('error reporting runtime behavior (module-state gated)', () => {
       // Scoped to utility processes: renderer crashes come through the SAME
       // integration and array, and must keep reporting.
       expect(matches("'renderer' process exited with 'crashed'")).toBe(false);
+
+      // The same SDK integration's GPU variant (DESKTOP-15): a lone GPU
+      // crash Chromium recovers from on its own is un-attributable noise.
+      expect(matches("'GPU' process exited with 'abnormal-exit'")).toBe(true);
+      // Deliberately narrower than the Utility filter (unanchored, matches
+      // any reason): a GPU 'launch-failed' keeps reporting as a backstop,
+      // because gpu-health.ts's own next-boot report of the same class
+      // cannot be verified to fire when LOG(FATAL) kills the process first.
+      // A later broadening to match every GPU reason is a deliberate act,
+      // not a silent side effect of some other change.
+      expect(matches("'GPU' process exited with 'launch-failed'")).toBe(false);
+      expect(matches("'GPU' process exited with 'crashed'")).toBe(false);
+      // Our own next-boot self-report must not collide with the filter it
+      // exists to replace: no quotes around GPU, so the pattern above cannot
+      // match it even loosely.
+      expect(matches("GPU process exited repeatedly (reason abnormal-exit, exit code 1)")).toBe(false);
 
       // The benign-renderer-error registry is spread in, so a pattern added
       // there is filtered here too. The monaco funnel normally swallows these
@@ -460,5 +538,48 @@ describe('error reporting runtime behavior (module-state gated)', () => {
         module: 'ffprobe',
       });
     });
+  });
+});
+
+/**
+ * The GPU and Utility `ignoreErrors` entries both match a third-party SDK's
+ * message template by hand, so either goes quietly blind if @sentry/electron
+ * reformats it or changes which reasons it captures by default. Every
+ * hand-written case above would stay green through either change. This reads
+ * the installed package and fails instead - the same trap
+ * updater-error-classifier.test.ts's "against the installed electron-updater
+ * source" block exists for.
+ */
+describe('against the installed @sentry/electron source', () => {
+  const requireFromTest = createRequire(import.meta.url);
+  // The package's `exports` map only publishes the `main` entry point itself
+  // (the subpath error-reporting.ts imports), not the integrations/ folder
+  // underneath it - so resolve relative to that entry's directory instead of
+  // requiring the internal file directly.
+  const mainEntryDir = path.dirname(requireFromTest.resolve('@sentry/electron/main'));
+  const childProcessSource = fs.readFileSync(
+    path.join(mainEntryDir, 'integrations', 'child-process.js'),
+    'utf-8',
+  );
+
+  it('still formats the message as `\'<process>\' process exited with \'<reason>\'`, the shape both filters match', () => {
+    expect(childProcessSource).toContain(
+      "const message = `'${process}' process exited with '${reason}'`;",
+    );
+  });
+
+  it('still captures exactly abnormal-exit, launch-failed, and integrity-failure by default', () => {
+    const eventsMatch = /events:\s*\[([^\]]*)\]/.exec(childProcessSource);
+    expect(eventsMatch).not.toBeNull();
+    const capturedReasons = (eventsMatch as RegExpExecArray)[1]
+      .split(',')
+      .map((entry) => entry.trim().replace(/^['"]|['"]$/g, ''))
+      .filter(Boolean);
+
+    // If this ever fails because a new reason was added, the ignoreErrors
+    // filter above needs a deliberate decision about that reason too, not a
+    // silent pass-through - see error-reporting.ts's comment on why the GPU
+    // filter is scoped to 'abnormal-exit' alone.
+    expect(capturedReasons.sort()).toEqual(['abnormal-exit', 'integrity-failure', 'launch-failed']);
   });
 });

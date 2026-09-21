@@ -4,6 +4,7 @@ import * as Sentry from '@sentry/electron/main';
 import type { ErrorEvent, EventHint } from '@sentry/electron/main';
 import { isUserConfigurationError } from '../../shared/user-configuration-error';
 import { BENIGN_RENDERER_ERRORS } from '../../shared/benign-renderer-errors';
+import type { HostMemorySample } from '../../shared/types';
 import { trackEvent } from './analytics';
 import {
   correctNativeCrashEvent,
@@ -112,6 +113,28 @@ export function reportHandledError(
     });
   } catch {
     // Error reporting must never cascade into the failing path itself
+  }
+}
+
+/**
+ * Attach the latest host memory sample (Sentry DESKTOP-16) to the persisted
+ * Sentry scope, so whatever event fires next - including a native crash,
+ * which has no other route into `contexts` - carries it. Deliberately not a
+ * `beforeSend` hook: `beforeSend` is already `filterNativeCrashEvent`
+ * (below), and tracing/replay are off (see `initErrorReporting`'s doc
+ * comment), so there is no transaction for `setMeasurement` to hang on.
+ * `setContext` on the ambient scope is the plain route. Composes with
+ * `correctNativeCrashEvent`'s stale-dump correction in
+ * `native-crash-event.ts`, which prunes this context the same way it prunes
+ * `app_memory`/`free_memory` when a startup-found dump's app context turns
+ * out to describe the uploading run rather than the crashed one.
+ */
+export function setHostMemoryContext(sample: HostMemorySample): void {
+  if (!active) return;
+  try {
+    Sentry.setContext('host_memory', { ...sample });
+  } catch {
+    // Never disrupt the sampler for telemetry
   }
 }
 
@@ -239,8 +262,19 @@ export function initErrorReporting(): void {
         // The known-benign Windows `npm start` TTY write artifacts that
         // index.ts's isSuppressibleUncaughtError filters for Aptabase. Sentry's
         // own global handlers would otherwise report them as crashes.
+        //
+        // Two different message shapes carry the same benign EPIPE/EAGAIN:
+        // Node's `errnoException` (an async socket, the dev TTY case above)
+        // reads `write EPIPE`, while `uvException` (a packaged Windows GUI
+        // build's synchronous stdio pipe, DESKTOP-10/11/12) reads
+        // `EPIPE: broken pipe, write`. Neither literal below matches the
+        // other shape, so both are listed. The log-mirror echo guard
+        // (log-mirror.ts) is the actual fix for the packaged case; this is
+        // defense-in-depth for any other main-process stdout write.
         'write EAGAIN',
         'write EPIPE',
+        /EPIPE: .*, write/,
+        /EAGAIN: .*, write/,
         // The SDK's own childProcessIntegration captures every utility-process
         // exit as `'Utility' process exited with '<reason>'`, tagged only with
         // the process TYPE - it attaches serviceName/name/exitCode to a
@@ -255,6 +289,20 @@ export function initErrorReporting(): void {
         // those must keep reporting. The breadcrumb survives this filter, so an
         // Electron-internal utility crash still shows as context on later events.
         /'Utility' process exited with/,
+        // The SDK's own childProcessIntegration also captures every GPU
+        // process exit, tagged only with the process type and reason, the
+        // same un-attributable shape as the Utility case above. Scoped to
+        // 'abnormal-exit' deliberately, narrower than the Utility filter:
+        // Chromium's own crash-limit fallback (RecordProcessCrash) can walk
+        // several GPU launch failures before it gives up, so a 'launch-failed'
+        // GPU death that Chromium survives still reaches Sentry as a real
+        // backstop - the one case gpu-health.ts's own next-boot report cannot
+        // be verified to cover (LOG(FATAL) kills the process before that
+        // report's async POST would complete, the same reason no
+        // 'launch-failed' GPU event has ever arrived here). 'abnormal-exit'
+        // alone is what DESKTOP-15 is: the reason Chromium's own recovery
+        // (a lone crash it relaunches past) fires this integration at all.
+        /'GPU' process exited with 'abnormal-exit'/,
         // Renderer errors that are known-benign and outside our control. Shared
         // with the monaco error funnel (monacoConfig.ts) and the UI-test
         // collector (tests/ui/helpers.ts) so one registry drives all three.

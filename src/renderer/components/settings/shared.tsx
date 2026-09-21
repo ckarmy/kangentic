@@ -181,6 +181,7 @@ export function SettingsPanelShell({ onClose, children, projectSwitcher, tabs, a
                       <div className={`${sectionHeaderClass} pt-3 pb-1`}>{TIER_LABELS[tab.tier as Exclude<SettingsTabTier, 'core'>]}</div>
                     )}
                     <button
+                      data-testid={`settings-tab-${tab.id}`}
                       onClick={() => { if (!hasNoMatches) onTabChange(tab.id); }}
                       title={tab.tooltip}
                       className={`w-full flex items-center gap-2.5 px-4 py-2 text-sm transition-colors ${
@@ -375,6 +376,10 @@ export function ToggleSwitch({
   checked,
   onChange,
   disabled,
+  ariaLabel,
+  testId,
+  title,
+  readOnly,
 }: {
   checked: boolean;
   onChange: (value: boolean) => void;
@@ -385,11 +390,35 @@ export function ToggleSwitch({
    * matters but the user is not allowed to change the value.
    */
   disabled?: boolean;
+  /**
+   * Required wherever the switch stands ALONE, with no adjacent label a
+   * screen reader would read as its name. A row of identical unlabelled
+   * switches is unusable, and it is also unaddressable from a test.
+   */
+  ariaLabel?: string;
+  testId?: string;
+  /** Native tooltip, used to explain a disabled state. */
+  title?: string;
+  /**
+   * The value is real and worth reading, it just is not editable here. The All
+   * columns table renders the column page's own switches this way so a row
+   * reads like the card that set it.
+   *
+   * This is a LABEL, not a behavior: it stamps `aria-readonly` and nothing
+   * else, so it belongs ALONGSIDE `disabled` rather than instead of it. On its
+   * own the switch still takes a click and still sits in the tab order, which
+   * in a read-only view is an edit affordance that lies.
+   */
+  readOnly?: boolean;
 }) {
   return (
     <button
       role="switch"
       aria-checked={checked}
+      aria-label={ariaLabel}
+      aria-readonly={readOnly ? true : undefined}
+      data-testid={testId}
+      title={title}
       disabled={disabled}
       onClick={disabled ? undefined : () => onChange(!checked)}
       className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
@@ -435,6 +464,7 @@ export function SettingToggleRow({ label, description, searchId, checked, onChan
       onChange={onChange}
       icon={icon}
       disabled={disabled}
+      testId={searchId ? `setting-row-${searchId}` : undefined}
     />
   );
 }

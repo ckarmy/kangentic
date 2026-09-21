@@ -5,6 +5,9 @@ import { IPC } from '../../shared/ipc-channels';
 import type { CrashRecord } from '../../shared/types';
 import { resolveCrashRecord } from './source-map-resolver';
 import { isBenignStreamWriteError } from './benign-stream-error';
+import { recordGpuProcessGone } from './gpu-health';
+import { getLastHostMemorySample } from './host-memory';
+import { PATHS } from '../config/paths';
 
 /**
  * Captures fatal-error events from main, preload, and renderer and persists
@@ -32,6 +35,11 @@ import { isBenignStreamWriteError } from './benign-stream-error';
 
 interface CrashCaptureOptions {
   getProjectRoot: () => string | null;
+  /** `<configDir>/gpu-health.json`, computed once from PATHS by the caller
+   *  (this module stays decoupled from PATHS, matching run-uptime.ts). Where
+   *  a repeated GPU death's escalation record is written for the NEXT launch
+   *  to report - see gpu-health.ts for why not live. */
+  gpuHealthFilePath: string;
 }
 
 let installed = false;
@@ -77,6 +85,8 @@ export function startCrashCapture(options: CrashCaptureOptions): void {
   // webContents). We attach to all of them.
   app.on('web-contents-created', (_event, webContents) => {
     webContents.on('render-process-gone', (_evt, details) => {
+      // DESKTOP-16: read synchronously, never re-sample - crash time is not
+      // the moment to call an OS API that may itself need to allocate.
       writeRecord(options.getProjectRoot(), {
         ts: new Date().toISOString(),
         kind: 'render-process-gone',
@@ -84,7 +94,7 @@ export function startCrashCapture(options: CrashCaptureOptions): void {
         message: `Render process gone: ${details.reason}`,
         stack: null,
         origin: safeGetUrl(webContents),
-        context: { reason: details.reason, exitCode: details.exitCode },
+        context: { reason: details.reason, exitCode: details.exitCode, hostMemory: getLastHostMemorySample() },
         versions: getVersions(),
       });
     });
@@ -118,6 +128,16 @@ export function startCrashCapture(options: CrashCaptureOptions): void {
       context: { reason: details.reason, exitCode: details.exitCode },
       versions: getVersions(),
     });
+    // Counts repeated deaths across the whole run (not gated on a project
+    // being open, unlike the local record above) and writes a durable
+    // escalation once they cross the threshold - see gpu-health.ts.
+    // getFeatureStatus is only READ by that module once it is actually about
+    // to write, so this closure costs nothing on the deaths before a latch.
+    recordGpuProcessGone(options.gpuHealthFilePath, details.reason, details.exitCode, app.getVersion(), {
+      // gpu-health.ts stays Electron-free (matches run-uptime.ts), so it
+      // takes a plain record rather than Electron's GPUFeatureStatus type.
+      getFeatureStatus: () => ({ ...app.getGPUFeatureStatus() }),
+    });
   });
 
   // Renderer-side error capture forwards through the preload script.
@@ -127,12 +147,16 @@ export function startCrashCapture(options: CrashCaptureOptions): void {
 }
 
 function writeRecord(projectRoot: string | null, record: CrashRecord): void {
-  if (!projectRoot) return;
   // Resolve bundled-chunk URLs in the stack back to original source
   // file:line:col (V1 is a passthrough; replacing the resolver body adds
   // real source-map lookup with no caller changes).
   const resolved = resolveCrashRecord(record);
-  const directory = path.join(projectRoot, '.kangentic', 'logs', 'crashes');
+  // No project open (or none yet at startup): fall back to the app's own
+  // config dir rather than dropping the record. A crash is exactly the kind
+  // of event that must not silently go missing because nothing was open.
+  const directory = projectRoot
+    ? path.join(projectRoot, '.kangentic', 'logs', 'crashes')
+    : path.join(PATHS.configDir, 'logs', 'crashes');
   try {
     fs.mkdirSync(directory, { recursive: true });
   } catch {

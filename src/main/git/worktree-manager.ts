@@ -706,8 +706,8 @@ export class WorktreeManager {
     // initialises a repo for a folder that had none (see `ensureGitRepo`), and the user's very
     // next action is usually a task move. Running in the project directory is the honest answer;
     // worktrees start working on their own once there is a first commit. Living here (rather than
-    // at each `ensureWorktree` caller) means the `create_worktree` transition action gets the
-    // same guard as the normal task-move path.
+    // at each `ensureWorktree` caller) means every entry point gets the same guard as the
+    // normal task-move path.
     const resolution = await resolveWorktreeBase(
       this.projectPath,
       task.base_branch ?? null,
@@ -844,7 +844,7 @@ export class WorktreeManager {
       await fs.promises.mkdir(worktreesDir, { recursive: true });
     } catch (err) {
       console.error(`[WORKTREE] Failed to create worktrees directory: ${worktreesDir}`, err);
-      throw new Error(`Cannot create worktrees directory at ${worktreesDir}: ${(err as Error).message}`);
+      throw new Error(`Cannot create worktrees directory at ${worktreesDir}: ${(err as Error).message}`, { cause: err });
     }
 
     // Fetch the latest from origin so worktrees start from up-to-date code.
@@ -917,7 +917,7 @@ export class WorktreeManager {
             `[WorktreeManager] Could not inspect stale worktree dir: ${worktreePath} `
             + `(code=${errnoError.code ?? 'unknown'} errno=${errnoError.errno ?? '?'} syscall=${errnoError.syscall ?? '?'}): ${errnoError.message}`
           );
-          throw new Error(staleWorktreeError(worktreePath, 'unreadable', outcome.holders));
+          throw new Error(staleWorktreeError(worktreePath, 'unreadable', outcome.holders), { cause: error });
         }
         if (leftover.length > 0) {
           throw new Error(staleWorktreeError(worktreePath, 'not-empty', outcome.holders));

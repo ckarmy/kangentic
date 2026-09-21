@@ -25,6 +25,7 @@ import { removeHooks as removeClaudeHooks } from './hook-manager';
 import { runCliPrintSummarize, buildSummarizePrompt } from '../../shared/auto-name';
 import { discoverClaudeStaticCapabilities, rescanClaudeModels } from './capability-discovery';
 import { createSlashCommandVerifier } from './slash-command-verifier';
+import { describeClaudeStartupFailure } from './startup-failure';
 import { configuredModelFromClaudeCommand, buildModelDisplayNames } from './model-display-name';
 import { ClaudeSessionHistoryParser } from './session-history-parser';
 import type {
@@ -65,10 +66,18 @@ export class ClaudeAdapter implements AgentAdapter {
   // global snapshot - even a freshly spawned one that has not reported its own yet.
   readonly reportsRateLimits = true;
   // Claude's own clipboard image paste fails silently on Windows Snipping Tool
-  // images (claude-code #26679), and a bare typed path is never auto-recognized
-  // as an image (no @file support for images). Kangentic's own clipboard/drop
-  // capture is reliable, so inject an explicit Read instruction pointing at the
-  // saved temp PNG instead of a bare path.
+  // images (claude-code #26679), so Kangentic captures the image itself and
+  // hands Claude the saved file's path. Claude's prompt input scans a bracketed
+  // paste for tokens ending in these extensions (`/\.(png|jpe?g|gif|webp)$/i`,
+  // one surrounding quote pair stripped first), reads the file, and attaches it
+  // as an `[Image #N]` chip in the user turn: no `Read` tool call, no extra
+  // model round trip. A typed path never reaches that scan, which is why the
+  // renderer delivers it through xterm's paste() rather than a raw write.
+  readonly pastedImageNativeExtensions = ['png', 'jpg', 'jpeg', 'gif', 'webp'];
+  // bmp and svg are outside Claude's native set, so they keep the explicit
+  // Read instruction; the scan leaves the text alone and the agent reads it.
+  // That reaches an svg (Read returns the markup) but not a bmp: Read refuses
+  // a bmp as binary, on every delivery form. Verified against 2.1.276.
   readonly pastedImageReferenceTemplate = 'Read this image: {path} ';
   readonly permissions: AgentPermissionEntry[] = [
     { mode: 'plan', label: 'Plan (Read-Only)' },
@@ -341,9 +350,10 @@ export class ClaudeAdapter implements AgentAdapter {
         const filePath = locateClaudeTranscriptFile(context.agentSessionId, context.cwd);
         const verifier = createSlashCommandVerifier(filePath);
         if (!verifier) return false;
-        // sentAt comes from TerminalSubmit.submitKeystrokes's most-recent
-        // Enter timestamp, re-advanced on each retry attempt. Falling back to
-        // Date.now() preserves single-call use (e.g. ad-hoc verifier
+        // sentAt comes from TerminalSubmit.submitKeystrokes and is the FIRST
+        // Enter pressed for the command, held across its retries and the
+        // scheduler's late re-check (see `firstSentAt` on the result). Falling
+        // back to Date.now() preserves single-call use (e.g. ad-hoc verifier
         // invocation in tests) but the production path always supplies it.
         //
         // `mode` distinguishes an adapter-emitted settings command (must
@@ -355,6 +365,14 @@ export class ClaudeAdapter implements AgentAdapter {
       };
     }
     return null;
+  }
+
+  /**
+   * A `--resume` of a conversation the CLI can no longer find is the one
+   * startup failure Claude names in its output. See `startup-failure.ts`.
+   */
+  describeStartupFailure(finalOutput: string, exitCode: number): string | null {
+    return describeClaudeStartupFailure(finalOutput, exitCode);
   }
 
   /**

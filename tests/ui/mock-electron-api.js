@@ -11,6 +11,15 @@
   let swimlanes = [];
   let archivedTasks = [];
   let actions = [];
+  // Column automations. Nothing is seeded: a fresh board has none, which is
+  // what the app now does too (the seeded actions that used to become them were
+  // each a no-op or a duplicate of the fallback spawn).
+  let automations = [];
+  // Run records. Seedable through `__mockPreConfigure` so a spec can read run
+  // history (`runsForTask`) without executing anything; `runAgain` appends to it.
+  let automationRuns = [];
+  let automationFailureListeners = [];
+  let automationInterruptedListeners = [];
   let sessions = [];
   let attachments = [];
   let backlogTasks = [];
@@ -99,6 +108,27 @@
   // commit selection overrides scope), or per-worktree fixtures via
   // window.__mockGitDiffByWorktree = { '<worktree folder>': { working, staged, branch } },
   // matched on the request's worktreePath (the sample install seeds one per task).
+  // Resolve a per-worktree fixture map (keyed by worktree FOLDER name) for a request's
+  // worktreePath. A worktree path ends in its folder, so the path's last segment is tried
+  // first. The substring scan below it is unanchored: it matches any key that appears anywhere
+  // in the path, so two slugs where one is a prefix of the other would resolve by Object.keys
+  // order rather than by which folder the path is actually in. Today's slugs carry random
+  // suffixes and do not collide, which is why the scan is kept as the fallback rather than
+  // replaced outright. Shared by diffFiles, branchSummary, commitGraph, fileHistory, and blame,
+  // which the sample install seeds per task (window.__mock*ByWorktree).
+  function resolveByWorktree(byWorktree, worktreePath) {
+    if (!byWorktree || !worktreePath) return null;
+    var segments = worktreePath.split(/[\\/]/);
+    var lastSegment = segments[segments.length - 1] || segments[segments.length - 2] || '';
+    if (byWorktree[lastSegment]) return byWorktree[lastSegment];
+    var folders = Object.keys(byWorktree);
+    for (var folderIndex = 0; folderIndex < folders.length; folderIndex++) {
+      var folder = folders[folderIndex];
+      if (worktreePath.indexOf(folder) !== -1 && byWorktree[folder]) return byWorktree[folder];
+    }
+    return null;
+  }
+
   function resolveGitDiffFixture(request) {
     var commitOid = request && request.commitOid;
     var byCommit = (typeof window !== 'undefined' && window.__mockGitDiffByCommit) || null;
@@ -107,30 +137,16 @@
     var byScope = (typeof window !== 'undefined' && window.__mockGitDiffByScope) || null;
     if (byScope && byScope[scope]) return byScope[scope];
     var byWorktree = (typeof window !== 'undefined' && window.__mockGitDiffByWorktree) || null;
-    var worktreePath = (request && request.worktreePath) || '';
-    if (byWorktree && worktreePath) {
-      // The keys are worktree FOLDER names and a worktree path ends in its folder, so try the
-      // path's last segment first. The substring scan below it is unanchored: it matches any key
-      // that appears anywhere in the path, so two slugs where one is a prefix of the other would
-      // resolve by Object.keys order rather than by which folder the path is actually in. Today's
-      // slugs carry random suffixes and do not collide, which is why the scan is kept as the
-      // fallback rather than replaced outright.
-      var segments = worktreePath.split(/[\\/]/);
-      var lastSegment = segments[segments.length - 1] || segments[segments.length - 2] || '';
-      if (byWorktree[lastSegment] && byWorktree[lastSegment][scope]) return byWorktree[lastSegment][scope];
-      var folders = Object.keys(byWorktree);
-      for (var folderIndex = 0; folderIndex < folders.length; folderIndex++) {
-        var folder = folders[folderIndex];
-        if (worktreePath.indexOf(folder) !== -1 && byWorktree[folder] && byWorktree[folder][scope]) {
-          return byWorktree[folder][scope];
-        }
-      }
-    }
+    var forWorktree = resolveByWorktree(byWorktree, (request && request.worktreePath) || '');
+    if (forWorktree && forWorktree[scope]) return forWorktree[scope];
     return (typeof window !== 'undefined' && window.__mockGitDiff) || null;
   }
 
   let config = Object.assign({
     theme: 'dark',
+    themeFollowsSystem: false,
+    themeLight: 'light',
+    themeDark: 'dark',
     sidebarVisible: true,
     boardLayout: 'horizontal',
     cardDensity: 'default',
@@ -356,6 +372,9 @@
     var git = source.git || {};
     var result = {};
     if (source.theme !== undefined) result.theme = source.theme;
+    if (source.themeFollowsSystem !== undefined) result.themeFollowsSystem = source.themeFollowsSystem;
+    if (source.themeLight !== undefined) result.themeLight = source.themeLight;
+    if (source.themeDark !== undefined) result.themeDark = source.themeDark;
     // terminal.* (shell, fontSize, fontFamily, cursorStyle,
     // backspaceSendsCtrlH) is global-only now - see the comment on
     // pickOverridableSubset() in src/main/config/config-manager.ts.
@@ -463,6 +482,15 @@
     listeners.forEach(function (fn) { fn(info); });
   };
 
+  // Host memory pressure test hooks (Sentry DESKTOP-16), same eager pattern
+  // as the update-downloaded hooks above: `__mockFireHostMemoryPressure`
+  // exists before any renderer subscriber has registered.
+  window.__mockHostMemoryPressureListeners = [];
+  window.__mockFireHostMemoryPressure = function (event) {
+    var listeners = window.__mockHostMemoryPressureListeners.slice();
+    listeners.forEach(function (fn) { fn(event); });
+  };
+
   // Announcements test hooks: installed eagerly for the same reason as the
   // update-downloaded hooks above. `__mockFireAnnouncementsChanged(active,
   // history)` also updates `__mockActiveAnnouncements` /
@@ -550,6 +578,8 @@
           swimlanes = [];
           archivedTasks = [];
           actions = [];
+          automations = [];
+          automationRuns = [];
           sessions = [];
           attachments = [];
         }
@@ -772,6 +802,26 @@
         }
         return function () {
           var listeners = window.__mockProjectPathMissingListeners || [];
+          var idx = listeners.indexOf(callback);
+          if (idx >= 0) listeners.splice(idx, 1);
+        };
+      },
+      onListChanged: function (callback) {
+        // Tests can fire the project-list-changed push via
+        // `window.__mockFireProjectListChanged()`. Carries no payload; the
+        // renderer is expected to refetch `list()` / `getCurrent()`.
+        if (!window.__mockProjectListChangedListeners) {
+          window.__mockProjectListChangedListeners = [];
+        }
+        window.__mockProjectListChangedListeners.push(callback);
+        if (!window.__mockFireProjectListChanged) {
+          window.__mockFireProjectListChanged = function () {
+            var listeners = (window.__mockProjectListChangedListeners || []).slice();
+            listeners.forEach(function (fn) { fn(); });
+          };
+        }
+        return function () {
+          var listeners = window.__mockProjectListChangedListeners || [];
           var idx = listeners.indexOf(callback);
           if (idx >= 0) listeners.splice(idx, 1);
         };
@@ -1142,6 +1192,34 @@
           archivedTasks.push(archived);
           tasks.splice(idx, 1);
         }
+
+        // Mirror main-process behavior: a cross-column move into a todo-role
+        // lane tears the task's session down (cleanupTaskResources ->
+        // SessionManager.remove()), and main announces each removal on
+        // session:removed AFTER the renderer's own optimistic eviction has
+        // run. Splice in place: `sessions` is the closure array
+        // __mockPreConfigure hands out, so tests that hold a reference keep
+        // seeing the same array. The push is guarded on the helper being
+        // installed (it is, once App.tsx has subscribed).
+        if (targetLane && targetLane.role === 'todo' && oldSwimlaneId !== newSwimlaneId) {
+          var removedSessions = [];
+          for (var sessionIndex = sessions.length - 1; sessionIndex >= 0; sessionIndex--) {
+            if (sessions[sessionIndex].taskId === input.taskId) {
+              removedSessions.unshift(sessions[sessionIndex]);
+              sessions.splice(sessionIndex, 1);
+            }
+          }
+          tasks[idx] = Object.assign({}, tasks[idx], { session_id: null });
+          if (typeof window !== 'undefined' && window.__mockFireRemoved) {
+            removedSessions.forEach(function (removedSession) {
+              window.__mockFireRemoved(
+                removedSession.id,
+                Object.assign({}, removedSession),
+                removedSession.projectId,
+              );
+            });
+          }
+        }
       },
       cancelSpawn: async function (taskId) {
         // Record cancellations so UI tests can assert the stall toast's Cancel
@@ -1349,6 +1427,15 @@
         };
       },
       unarchive: async function (input) {
+        // Test hook: record every call (task id), mirroring tasks.move's
+        // __mockMoveProjectIds counter, so a test can assert this path was
+        // never reached (e.g. a gate that should keep a hotkey off an
+        // archived task's window).
+        if (typeof window !== 'undefined') {
+          if (!window.__mockUnarchiveCallIds) window.__mockUnarchiveCallIds = [];
+          window.__mockUnarchiveCallIds.push(input.id);
+        }
+
         // Test hook: simulate a main-process failure (e.g. worktree conflict).
         // Real main process leaves archivedTasks unchanged before throwing, so
         // the mock also leaves them unchanged and throws. The renderer's catch
@@ -1671,39 +1758,98 @@
       },
     },
 
-    actions: {
+    automations: {
       list: async function () {
-        return actions;
+        // A sorted COPY: the store holds what this returns, and handing out the
+        // live array would let a renderer mutation reach the mock's state.
+        return automations
+          .slice()
+          .sort(function (left, right) {
+            if (left.swimlane_id !== right.swimlane_id) return left.swimlane_id < right.swimlane_id ? -1 : 1;
+            if (left.trigger !== right.trigger) return left.trigger === 'enter' ? -1 : 1;
+            return left.position - right.position;
+          })
+          .map(function (row) {
+            return Object.assign({}, row, { config: Object.assign({}, row.config) });
+          });
       },
-      create: async function (input) {
-        var action = Object.assign({ id: uuid(), created_at: now() }, input);
-        actions.push(action);
-        return action;
-      },
-      update: async function (input) {
-        var idx = actions.findIndex(function (a) {
-          return a.id === input.id;
+      replaceForColumn: async function (swimlaneId, rows) {
+        // Mirrors the repository: whole-column delete-and-insert, with position
+        // assigned PER TRIGGER so the two groups never interleave.
+        automations = automations.filter(function (row) {
+          return row.swimlane_id !== swimlaneId;
         });
-        if (idx >= 0) {
-          actions[idx] = Object.assign({}, actions[idx], input);
-          return actions[idx];
+        var nextPosition = { enter: 0, exit: 0 };
+        (rows || []).forEach(function (row) {
+          var trigger = row.trigger === 'exit' ? 'exit' : 'enter';
+          automations.push({
+            id: row.id || uuid(),
+            swimlane_id: swimlaneId,
+            name: row.name,
+            type: row.type,
+            trigger: trigger,
+            position: nextPosition[trigger],
+            enabled: row.enabled !== false,
+            config: Object.assign({}, row.config),
+            created_at: now(),
+            updated_at: now(),
+          });
+          nextPosition[trigger] += 1;
+        });
+        return automations.filter(function (row) {
+          return row.swimlane_id === swimlaneId;
+        });
+      },
+      runsForTask: async function (taskId) {
+        return automationRuns
+          .filter(function (run) { return run.task_id === taskId; })
+          .slice()
+          .sort(function (left, right) { return left.started_at < right.started_at ? 1 : -1; })
+          .map(function (run) { return Object.assign({}, run); });
+      },
+      runAgain: async function (automationId, taskId) {
+        var automation = automations.find(function (row) { return row.id === automationId; });
+        if (!automation) {
+          return { ok: false, error: 'That automation no longer exists. It was probably deleted or renamed in the Column Manager.' };
         }
-        throw new Error('Action not found: ' + input.id);
+        var lane = swimlanes.find(function (row) { return row.id === automation.swimlane_id; });
+        // A fresh run row, which is the half the spec asserts: a re-run must be
+        // visible in the log rather than only in the toast.
+        var run = {
+          id: uuid(),
+          automation_id: automation.id,
+          automation_name: automation.name,
+          type: automation.type,
+          task_id: taskId,
+          swimlane_id: automation.swimlane_id,
+          trigger: automation.trigger,
+          status: 'succeeded',
+          detail: 'Ran again.',
+          attempts: 1,
+          started_at: now(),
+          finished_at: now(),
+        };
+        automationRuns.push(run);
+        return {
+          ok: true,
+          runId: run.id,
+          automationName: automation.name,
+          columnName: lane ? lane.name : '',
+          status: 'succeeded',
+          detail: run.detail,
+        };
       },
-      delete: async function (id) {
-        actions = actions.filter(function (a) {
-          return a.id !== id;
-        });
+      onRunFailed: function (callback) {
+        automationFailureListeners.push(callback);
+        return function () {
+          automationFailureListeners = automationFailureListeners.filter(function (entry) { return entry !== callback; });
+        };
       },
-    },
-
-    transitions: {
-      list: async function () {
-        return [];
-      },
-      set: async function () {},
-      getForTransition: async function () {
-        return [];
+      onRunsInterrupted: function (callback) {
+        automationInterruptedListeners.push(callback);
+        return function () {
+          automationInterruptedListeners = automationInterruptedListeners.filter(function (entry) { return entry !== callback; });
+        };
       },
     },
 
@@ -1896,6 +2042,25 @@
         }
         return function () {
           var listeners = window.__mockStatusListeners || [];
+          var idx = listeners.indexOf(callback);
+          if (idx >= 0) listeners.splice(idx, 1);
+        };
+      },
+      onRemoved: function (callback) {
+        // Tests can fire this via window.__mockFireRemoved(sessionId, session, projectId).
+        // The mock's own tasks.move fires it for a move into a todo-role
+        // column, mirroring SessionManager.remove() on the main side. The third
+        // argument matches the real preload, which forwards session.projectId.
+        if (!window.__mockRemovedListeners) window.__mockRemovedListeners = [];
+        window.__mockRemovedListeners.push(callback);
+        if (!window.__mockFireRemoved) {
+          window.__mockFireRemoved = function (sessionId, session, projectId) {
+            var listeners = (window.__mockRemovedListeners || []).slice();
+            for (var i = 0; i < listeners.length; i++) { listeners[i](sessionId, session, projectId); }
+          };
+        }
+        return function () {
+          var listeners = window.__mockRemovedListeners || [];
           var idx = listeners.indexOf(callback);
           if (idx >= 0) listeners.splice(idx, 1);
         };
@@ -2237,6 +2402,13 @@
       __stopCalls: [],
       stop: async function (dictationSessionId, expectedFrames) {
         window.electronAPI.dictation.__stopCalls.push({ dictationSessionId, expectedFrames });
+        // Test hook: window.__mockDictationStopError, a string, makes stop()
+        // reject with an Error carrying that message - so a spec can exercise
+        // useDictation's finalizeOnRelease() catch branch (a real engine fault
+        // decoding the utterance) without a real crash.
+        if (typeof window !== 'undefined' && window.__mockDictationStopError) {
+          throw new Error(window.__mockDictationStopError);
+        }
         return 'This is a test of dictation.';
       },
       __cancelCalls: [],
@@ -2274,7 +2446,12 @@
         return true;
       },
       getInfo: async function () {
-        return {
+        // Test hook: window.__mockDictationInfoOverrides merges over the
+        // defaults (e.g. { workerUnavailable: true, workerError: '...' } to
+        // exercise DictationTab's worker-crashed banner), matching the
+        // probePath() override idiom above.
+        var overrides = (typeof window !== 'undefined' && window.__mockDictationInfoOverrides) || {};
+        var defaults = {
           hardware: { cpuModel: 'Mock CPU', cpuCores: 8, totalRamGb: 16, hasAvx2: true, gpu: 'none', gpuDescription: 'Integrated', platform: 'linux', arch: 'x64' },
           tier: 'accurate-base',
           selectedEngineId: 'stub',
@@ -2287,7 +2464,9 @@
           finalModels: [],
           selectedLiveModelId: null,
           selectedFinalModelId: null,
+          workerUnavailable: false,
         };
+        return Object.assign({}, defaults, overrides);
       },
       // Push-event subscribers. Tests drive these via window.__emitDictationPartial
       // (dictationSessionId, text) and window.__emitDictationFinal(...).
@@ -2446,6 +2625,23 @@
         return 0;
       },
       onChanged: function (/* callback() */) { return noop; },
+      onWriteFailed: function (callback) {
+        // Tests fire this via window.__mockFireConfigWriteFailed(message).
+        if (!window.__mockConfigWriteFailedListeners) window.__mockConfigWriteFailedListeners = [];
+        window.__mockConfigWriteFailedListeners.push(callback);
+        if (!window.__mockFireConfigWriteFailed) {
+          window.__mockFireConfigWriteFailed = function (message) {
+            var listeners = (window.__mockConfigWriteFailedListeners || []).slice();
+            listeners.forEach(function (listener) { listener(message); });
+          };
+        }
+        // A REAL unsubscribe, for the same reason onSpawnBlocked returns one.
+        return function () {
+          var listeners = window.__mockConfigWriteFailedListeners || [];
+          var index = listeners.indexOf(callback);
+          if (index !== -1) listeners.splice(index, 1);
+        };
+      },
     },
 
     keybindings: {
@@ -2508,8 +2704,12 @@
             // KEEP IN SYNC with ClaudeAdapter.reportsRateLimits: gates the ContextBar
             // rate-limit pill on the agent capability (account-wide snapshot).
             reportsRateLimits: true,
-            // KEEP IN SYNC with ClaudeAdapter.pastedImageReferenceTemplate: the text
-            // injected for a pasted/dropped image instead of a bare file path.
+            // KEEP IN SYNC with ClaudeAdapter.pastedImageNativeExtensions: the image
+            // extensions Claude attaches natively from a bracketed-paste path, so the
+            // renderer pastes the bare quoted path for these.
+            pastedImageNativeExtensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'],
+            // KEEP IN SYNC with ClaudeAdapter.pastedImageReferenceTemplate: the fallback
+            // text pasted for an image outside the native set (bmp, svg).
             pastedImageReferenceTemplate: 'Read this image: {path} ',
             // Capabilities mirror what discoverClaudeCapabilities() would return
             // for a real Claude install: parsed from `claude --help` plus the
@@ -3018,6 +3218,23 @@
         }
         return { hasPendingChanges: false, uncommittedFileCount: 0, unpushedCommitCount: 0, currentBranch: null };
       },
+      prefetchRemotes: async function (checkPath) {
+        // Test hook: record every prefetch so drag-prefetch-remotes.spec.ts can
+        // assert the board warms the fetch for a worktree-backed card at drag
+        // start and never for a card without a worktree.
+        if (typeof window !== 'undefined') {
+          window.__mockPrefetchRemotesCalls = window.__mockPrefetchRemotesCalls || [];
+          window.__mockPrefetchRemotesCalls.push(checkPath);
+          // Test hook: force this call to reject, so a test can pin that the
+          // fire-and-forget `.catch(() => {})` in handleDragStart is load-bearing
+          // and a rejecting prefetch cannot break the drag. Default off (falsy)
+          // so no existing spec's behavior changes. Set
+          // window.__mockPrefetchRemotesShouldReject = true before the drag.
+          if (window.__mockPrefetchRemotesShouldReject) {
+            throw new Error('mock prefetchRemotes rejection');
+          }
+        }
+      },
       branchSummary: async function (request) {
         // Test hook: record every branchSummary call (worktreePath, projectPath,
         // baseBranch, refreshRemote) so a test can assert how the mount-only
@@ -3038,6 +3255,12 @@
         if (typeof window !== 'undefined' && window.__mockBranchSummary) {
           return window.__mockBranchSummary;
         }
+        // Per-worktree summaries, as the sample install seeds them (one per task with a
+        // worktree), keyed by worktree folder name.
+        var summaryForWorktree = typeof window !== 'undefined'
+          ? resolveByWorktree(window.__mockBranchSummaryByWorktree, (request && request.worktreePath) || '')
+          : null;
+        if (summaryForWorktree) return summaryForWorktree;
         return { currentBranch: null, ahead: 0, behind: 0, lastCommit: null };
       },
       worktreeHead: async function () {
@@ -3050,29 +3273,48 @@
         }
         return { branch: null, sha: null };
       },
-      commitGraph: async function () {
+      commitGraph: async function (request) {
         // Test hook: seed the commit-graph pane via window.__mockCommitGraph =
         // { commits: [{ hash, shortHash, parents, authorName, authorTimestamp, subject }],
         //   tipHash, baseHash, mergeBaseHash, currentBranch, truncated }.
         if (typeof window !== 'undefined' && window.__mockCommitGraph) {
           return window.__mockCommitGraph;
         }
+        // Per-worktree graphs (window.__mockCommitGraphByWorktree, keyed by worktree folder), as
+        // the sample install seeds a scaffolded project's real history.
+        var graphForWorktree = typeof window !== 'undefined'
+          ? resolveByWorktree(window.__mockCommitGraphByWorktree, (request && request.worktreePath) || '')
+          : null;
+        if (graphForWorktree) return graphForWorktree;
         return { commits: [], tipHash: null, baseHash: null, mergeBaseHash: null, currentBranch: null, truncated: false };
       },
-      fileHistory: async function () {
+      fileHistory: async function (request) {
         // Test hook: seed the file-history popover via window.__mockFileHistory =
         // { commits: [{ hash, shortHash, authorName, authorTimestamp, subject }] }.
         if (typeof window !== 'undefined' && window.__mockFileHistory) {
           return window.__mockFileHistory;
         }
+        // Per-worktree, per-file (window.__mockFileHistoryByWorktree[folder][filePath]).
+        var historyForWorktree = typeof window !== 'undefined'
+          ? resolveByWorktree(window.__mockFileHistoryByWorktree, (request && request.worktreePath) || '')
+          : null;
+        var filePath = (request && request.filePath) || '';
+        if (historyForWorktree && historyForWorktree[filePath]) return historyForWorktree[filePath];
         return { commits: [] };
       },
-      blame: async function () {
+      blame: async function (request) {
         // Test hook: seed the blame gutter via window.__mockBlame =
         // { lines: [{ line, hash, shortHash, author, date }] }.
         if (typeof window !== 'undefined' && window.__mockBlame) {
           return window.__mockBlame;
         }
+        // Per-worktree, per-file (window.__mockBlameByWorktree[folder][filePath]), the blame of
+        // the working tree a recorded session left behind.
+        var blameForWorktree = typeof window !== 'undefined'
+          ? resolveByWorktree(window.__mockBlameByWorktree, (request && request.worktreePath) || '')
+          : null;
+        var blamePath = (request && request.filePath) || '';
+        if (blameForWorktree && blameForWorktree[blamePath]) return blameForWorktree[blamePath];
         return { lines: [] };
       },
     },
@@ -3480,7 +3722,7 @@
     //     desktop auto-enrolling on the phone's confirm frame. Production
     //     pairing is driven by a main-process PUSH (mobile:pairingConfirmed),
     //     not a renderer-initiated confirm call, so this seeds a device with
-    //     the full ten-verb grant and fires that push directly, exactly as
+    //     the full every-verb grant and fires that push directly, exactly as
     //     MobileBridgeService does on a successful ceremony.
     mobile: (function () {
       var state = {
@@ -3499,11 +3741,13 @@
       var mockDeviceCounter = 0;
 
       // Mirrors packages/protocol/src/capabilities/verbs.ts's CAPABILITY_VERBS -
-      // pairing grants all ten, not a read-only subset.
+      // pairing grants every verb, not a read-only subset. Hand-mirrored, so a
+      // new verb is appended here too; tests/unit/mobile-capability-verbs-parity.test.ts
+      // reads this literal as text and fails when it drifts from the protocol.
       var FULL_CAPABILITY_SET = [
         'read-stream', 'read-board', 'read-diff', 'send-user-message', 'move-task',
         'answer-permission-prompt', 'interactive-terminal', 'board-tool-read',
-        'board-tool-write', 'register-push',
+        'board-tool-write', 'register-push', 'start-session',
       ];
 
       if (typeof window !== 'undefined') {
@@ -3546,6 +3790,7 @@
             capabilities: FULL_CAPABILITY_SET.slice(),
             pairedAt: new Date().toISOString(),
             connectionState: 'connected',
+            connectionStateSince: new Date().toISOString(),
           };
           state.devices.push(device);
           state.pairingInProgress = false;
@@ -3699,6 +3944,17 @@
         window.__mockUpdateDownloadedListeners.push(callback);
         return function () {
           var listeners = window.__mockUpdateDownloadedListeners || [];
+          var idx = listeners.indexOf(callback);
+          if (idx >= 0) listeners.splice(idx, 1);
+        };
+      },
+    },
+
+    hostMemory: {
+      onPressure: function (callback) {
+        window.__mockHostMemoryPressureListeners.push(callback);
+        return function () {
+          var listeners = window.__mockHostMemoryPressureListeners || [];
           var idx = listeners.indexOf(callback);
           if (idx >= 0) listeners.splice(idx, 1);
         };
@@ -3929,6 +4185,15 @@
 
     clipboard: {
       readImage: function () { return Promise.resolve('/tmp/kangentic-clipboard/pasted-image-1234567890.png'); },
+      // Call log for test assertions (each entry is the PNG byte length the drop
+      // path handed over). Reset with window.electronAPI.clipboard.__saveImageCalls.length = 0.
+      // Answers with a fixed path, the way main answers a decodable image; a spec
+      // that needs the "not an image" null overrides this per page.
+      __saveImageCalls: [],
+      saveImage: function (pngBytes) {
+        window.electronAPI.clipboard.__saveImageCalls.push(pngBytes ? pngBytes.byteLength : 0);
+        return Promise.resolve('/tmp/kangentic-clipboard/pasted-image-normalized.png');
+      },
       // Call log for test assertions. Reset with window.electronAPI.clipboard.__writeTextCalls.length = 0.
       __writeTextCalls: [],
       writeText: function (text) {
@@ -4334,6 +4599,8 @@
       tasks: tasks,
       archivedTasks: archivedTasks,
       swimlanes: swimlanes,
+      automations: automations,
+      automationRuns: automationRuns,
       sessions: sessions,
       backlogTasks: backlogTasks,
       activityCache: activityCache,

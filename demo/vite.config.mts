@@ -8,9 +8,10 @@
  * false (no dev badge, no DevtoolsBootstrap), the Sentry sourcemap plugins are dropped by name,
  * and sourcemaps are off.
  *
- * One plugin injects four classic scripts ahead of the module bundle (demo/index.html documents
- * the order), emits them and the recordings under content-hashed names, and relocates the
- * emitted HTML from `demo/index.html` to the outDir root.
+ * One plugin injects five classic scripts ahead of the module bundle (demo/index.html documents
+ * the order), emits them, the recordings, and the guest pages under content-hashed names, plus
+ * the unhashed scenes.json, and relocates the emitted HTML from `demo/index.html` to the outDir
+ * root.
  *
  * `base` defaults to `/demo/`; the GitHub Pages deploy passes `--base=/kangentic/` on the CLI.
  */
@@ -19,8 +20,8 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { buildDemoPreConfig } from '../tests/captures/helpers/demo-dataset';
-import { loadDemoChanges, loadDemoEnds, loadDemoMessageTrails, loadDemoOpenFrames, loadDemoPeeks, loadDemoPeekTimelines, loadDemoRecordings, loadDemoScrollback, readLiveTailMs, type DemoRecordingEntry } from '../tests/captures/helpers/demo-scrollback';
+import { buildDemoPreConfig, DEMO_PROJECTS } from '../tests/captures/helpers/demo-dataset';
+import { buildCellWidthTable, loadDemoChanges, loadDemoEnds, loadDemoHistory, loadDemoMessageTrails, loadDemoOpenFrames, loadDemoPeeks, loadDemoPeekTimelines, loadDemoRecordings, loadDemoScrollback, loadDemoTiledFrames, loadDemoTranscripts, readLiveTailMs, type DemoRecordingEntry } from '../tests/captures/helpers/demo-scrollback';
 // The cap main keeps per session, so a replayed trail slices exactly as a pushed one does.
 import { MESSAGE_TRAIL_MAX_ENTRIES } from '../src/main/agent/message-trail-tracker';
 import { SCENES } from '../tests/captures/scenes';
@@ -47,6 +48,7 @@ const DEMO_BASE = '/demo/';
 const DEMO_HTML_INPUT = path.join(demoDir, 'index.html');
 const MOCK_SCRIPT_PATH = path.join(repoRoot, 'tests', 'ui', 'mock-electron-api.js');
 const BOOT_SCRIPT_PATH = path.join(demoDir, 'boot.js');
+const WEBVIEW_SHIM_PATH = path.join(demoDir, 'webview-shim.js');
 
 
 function readAppVersion(): string {
@@ -93,23 +95,58 @@ function hashedName(name: string, source: string): string {
 function planDemoAssets(version: string, base: string): { scripts: string[]; files: PlannedAsset[] } {
   const recordings = loadDemoRecordings();
   const files: PlannedAsset[] = [];
-  const nameOf = (entry: DemoRecordingEntry): string => {
+  // Each index entry carries the grid its recording was made at beside the file name, so the
+  // seed can decide at a terminal's first resize, before any fetch, whether to hold the terminal
+  // at that grid (demo-dataset.ts, the sessions.resize wrapper).
+  interface IndexEntry { file: string; cols: number; rows: number; tiled?: IndexEntry }
+  const emitRecording = (entry: DemoRecordingEntry): IndexEntry => {
     const source = JSON.stringify({ serialized: entry.serialized, stream: entry.stream, peek: entry.peek, cols: entry.cols, rows: entry.rows, stopReason: entry.stopReason, frameTimeline: entry.frameTimeline });
     const fileName = hashedName(`recordings/${entry.file}`, source);
     files.push({ fileName, source });
-    return fileName.slice('recordings/'.length);
+    return { file: fileName.slice('recordings/'.length), cols: entry.cols, rows: entry.rows };
   };
+  // A session's tiled sibling rides on its index entry, so the seed can pair the two layouts the
+  // way it pairs a Command Terminal's two boots (demo-dataset.ts, layoutFor).
+  const indexEntryOf = (entry: DemoRecordingEntry): IndexEntry => {
+    const indexed = emitRecording(entry);
+    return entry.tiled ? { ...indexed, tiled: emitRecording(entry.tiled) } : indexed;
+  };
+  // The agent transcripts the conversation viewer shows, one file per session the manifest
+  // marks, under their own directory: a still frame fetches no recording, and a transcript is
+  // fetched only when a viewer opens.
+  const transcripts: Record<string, { file: string }> = {};
+  for (const [sessionId, entries] of Object.entries(loadDemoTranscripts())) {
+    const source = JSON.stringify({ entries });
+    const fileName = hashedName(`transcripts/${sessionId}.json`, source);
+    files.push({ fileName, source });
+    transcripts[sessionId] = { file: fileName.slice('transcripts/'.length) };
+  }
   const index = {
     base: `${base}recordings/`,
-    sessions: Object.fromEntries(Object.entries(recordings.sessions).map(([id, entry]) => [id, nameOf(entry)])),
-    spawns: Object.fromEntries(Object.entries(recordings.spawns).map(([key, entry]) => [key, nameOf(entry)])),
-    terminals: Object.fromEntries(Object.entries(recordings.terminals).map(([id, entry]) => [id, nameOf(entry)])),
+    sessions: Object.fromEntries(Object.entries(recordings.sessions).map(([id, entry]) => [id, indexEntryOf(entry)])),
+    spawns: Object.fromEntries(Object.entries(recordings.spawns).map(([key, entry]) => [key, indexEntryOf(entry)])),
+    terminals: Object.fromEntries(Object.entries(recordings.terminals).map(([id, entry]) => [id, indexEntryOf(entry)])),
     geometry: recordings.geometry,
+    transcriptsBase: `${base}transcripts/`,
+    transcripts,
   };
-  console.log(`[demo] recordings emitted: ${Object.keys(index.sessions).length} sessions, ${Object.keys(index.spawns).length} spawn boots, ${Object.keys(index.terminals).length} terminal boots`);
+  const tiledCount = Object.values(index.sessions).filter((entry) => entry.tiled).length;
+  console.log(`[demo] recordings emitted: ${Object.keys(index.sessions).length} sessions (${tiledCount} with a tiled sibling), ${Object.keys(index.spawns).length} spawn boots, ${Object.keys(index.terminals).length} terminal boots, ${Object.keys(transcripts).length} transcripts`);
+  // The guest pages: what each project renders at its dev URL, for the Browser pane's iframe
+  // stand-in (demo/webview-shim.js). Keyed by the URL the pane shows, valued by the hashed file.
+  const guestPages: Record<string, string> = {};
+  for (const project of DEMO_PROJECTS) {
+    if (!project.dev_url || !project.guest_page) continue;
+    const source = readFileSync(path.join(demoDir, 'guest', project.guest_page), 'utf8');
+    const fileName = hashedName(`guest/${project.guest_page}`, source);
+    files.push({ fileName, source });
+    guestPages[project.dev_url] = `${base}${fileName}`;
+  }
+  console.log(`[demo] guest pages emitted: ${Object.keys(guestPages).length}`);
   const scripts = [
-    { name: 'demo-scenes.js', source: buildScenesScript(version, `window.__demoRecordings = ${JSON.stringify(index)};\n`) },
+    { name: 'demo-scenes.js', source: buildScenesScript(version, `window.__demoRecordings = ${JSON.stringify(index)};\nwindow.__demoGuestPages = ${JSON.stringify(guestPages)};\n`) },
     { name: 'demo-boot.js', source: readFileSync(BOOT_SCRIPT_PATH, 'utf8') },
+    { name: 'demo-webview.js', source: readFileSync(WEBVIEW_SHIM_PATH, 'utf8') },
     { name: 'mock-electron-api.js', source: readFileSync(MOCK_SCRIPT_PATH, 'utf8') },
     { name: 'demo-seed.js', source: buildSeedScript(version) },
   ].map((script) => ({ fileName: hashedName(script.name, script.source), source: script.source }));
@@ -121,25 +158,49 @@ function buildScenesScript(version: string, recordingsScript: string): string {
   return `window.__demoScenes = ${JSON.stringify(SCENES)};\nwindow.__demoVersion = ${JSON.stringify(version)};\n${recordingsScript}`;
 }
 
+/** The frame every scene is authored at: the site's 1600 by 1000 (demo/stage.html). */
+const SCENE_FRAME = { width: 1600, height: 1000 };
+
+/**
+ * The hand-off to the site: which scenes this deployment serves, what each shows (the alt text a
+ * docs figure carries), which a page may embed (`reach`, so a rig-only scene is refused by name
+ * rather than rendering the error card inside a captioned figure), and which app version they
+ * belong to. Emitted UNHASHED beside index.html so the site's build can fetch it by a stable URL;
+ * generated from the same SCENES the page boots, so the two cannot drift. No timestamp: the build
+ * stays reproducible, and the version is the only freshness that matters.
+ */
+function buildScenesManifest(version: string): string {
+  const scenes = Object.values(SCENES).map((scene) => ({
+    name: scene.name,
+    reach: scene.reach,
+    alt: scene.alt,
+    description: scene.description,
+  }));
+  return `${JSON.stringify({ version, frame: SCENE_FRAME, scenes }, null, 2)}\n`;
+}
+
 function buildSeedScript(version: string): string {
   const scrollback = loadDemoScrollback();
   const changes = loadDemoChanges();
   const peeks = loadDemoPeeks();
   const ends = loadDemoEnds();
   const openFrames = loadDemoOpenFrames();
+  const tiledFrames = loadDemoTiledFrames();
   const messageTrails = loadDemoMessageTrails();
-  console.log(`[demo] recorded terminal sessions embedded: ${Object.keys(scrollback).length}, with a working-tree diff: ${Object.keys(changes).length}, with an open frame: ${Object.keys(openFrames).length}, with an agent message trail: ${Object.keys(messageTrails).length}`);
+  console.log(`[demo] recorded terminal sessions embedded: ${Object.keys(scrollback).length}, with a working-tree diff: ${Object.keys(changes).length}, with an open frame: ${Object.keys(openFrames).length}, with tiled frames: ${Object.keys(tiledFrames).length}, with an agent message trail: ${Object.keys(messageTrails).length}`);
   return [
     '// Generated by demo/vite.config.mts from tests/captures/helpers/demo-dataset.ts and the',
     '// recordings in tests/captures/fixtures/demo/.',
     'window.__demoApplyFixture = function () {',
     buildDemoPreConfig({
-      scrollback, changes, peeks, ends, openFrames,
+      scrollback, changes, peeks, ends, openFrames, tiledFrames,
       peekTimelines: loadDemoPeekTimelines(),
       messageTrails,
       messageTrailMaxEntries: MESSAGE_TRAIL_MAX_ENTRIES,
       liveTailMs: readLiveTailMs(),
       appVersion: version,
+      cellWidths: buildCellWidthTable(),
+      history: loadDemoHistory(),
     }),
     '};',
     'window.__demoBoot.afterSeed();',
@@ -175,6 +236,9 @@ function demoStaticSitePlugin(version: string): Plugin {
         // The host the page hands over to when opened directly (demo/stage.html): the frame at
         // the site's 1600 by 1000, scaled to the window, so the recordings always fit.
         this.emitFile({ type: 'asset', fileName: 'stage.html', source: readFileSync(path.join(demoDir, 'stage.html'), 'utf8') });
+        // The scene list the site reads at build time; unhashed, like the two entry pages.
+        this.emitFile({ type: 'asset', fileName: 'scenes.json', source: buildScenesManifest(version) });
+        console.log(`[demo] scenes.json emitted: ${Object.keys(SCENES).length} scenes`);
 
         const html = bundle[emittedHtmlName];
         if (html === undefined || html.type !== 'asset') {

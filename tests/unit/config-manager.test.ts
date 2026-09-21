@@ -238,6 +238,78 @@ describe('Config Manager -- claude.* to agent.* namespace migration', () => {
     expect(config.agent.cliPaths).toEqual({ gemini: '/usr/bin/gemini' });
     expect(config.agent.maxConcurrentSessions).toBe(4);
   });
+
+  it('renames the product pair\'s retired theme ids across all three theme keys and persists it', async () => {
+    // kangentic-light / kangentic-dark existed on main for three days before the pair
+    // was named clay / rust; a retired id would otherwise paint as the classless dark.
+    fs.writeFileSync(configPath, JSON.stringify({
+      theme: 'kangentic-dark', themeFollowsSystem: true, themeLight: 'kangentic-light', themeDark: 'kangentic-dark',
+    }));
+
+    const cm = await createConfigManager();
+    const config = cm.load();
+
+    expect(config.theme).toBe('rust');
+    expect(config.themeLight).toBe('clay');
+    expect(config.themeDark).toBe('rust');
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect([raw.theme, raw.themeLight, raw.themeDark]).toEqual(['rust', 'clay', 'rust']);
+  });
+
+  it('does not rewrite the config file on a second construction once its theme ids are already migrated', async () => {
+    fs.writeFileSync(configPath, JSON.stringify({
+      theme: 'kangentic-dark', themeLight: 'kangentic-light', themeDark: 'kangentic-dark',
+    }));
+
+    const firstManager = await createConfigManager();
+    firstManager.load();
+    const rawAfterFirstConstruction = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect([rawAfterFirstConstruction.theme, rawAfterFirstConstruction.themeLight, rawAfterFirstConstruction.themeDark])
+      .toEqual(['rust', 'clay', 'rust']);
+
+    // Backdate so a spurious rewrite is unmissable: safeWriteJson's write-to-temp-then-rename
+    // always stamps a fresh mtime on the destination, so a rewrite at "now" cannot collide
+    // with a stamp a minute in the past the way two same-millisecond stat calls could.
+    const backdated = new Date(Date.now() - 60_000);
+    fs.utimesSync(configPath, backdated, backdated);
+    const before = fs.statSync(configPath).mtimeMs;
+
+    // A fresh instance, not the same one that just migrated: this is what a second app
+    // launch against the already-migrated file looks like.
+    vi.resetModules();
+    const { ConfigManager } = await import('../../src/main/config/config-manager');
+    const secondManager = new ConfigManager();
+    secondManager.load();
+
+    const after = fs.statSync(configPath).mtimeMs;
+    expect(after).toBe(before);
+
+    const rawAfterSecondConstruction = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    expect([rawAfterSecondConstruction.theme, rawAfterSecondConstruction.themeLight, rawAfterSecondConstruction.themeDark])
+      .toEqual(['rust', 'clay', 'rust']);
+  });
+
+  it('does not rewrite a global config whose theme ids are already current', async () => {
+    // hasMigratedWindowLightDismissDefault and hasPurgedSeededDiscoveredModels both default to
+    // false, and neither of those migrations is gated on `parsed` - both would otherwise fire
+    // unconditionally on this file's first load. Set both markers true so only the theme-id
+    // migration is under test.
+    fs.writeFileSync(configPath, JSON.stringify({
+      theme: 'rust', themeLight: 'clay', themeDark: 'rust', themeFollowsSystem: true,
+      hasMigratedWindowLightDismissDefault: true, hasPurgedSeededDiscoveredModels: true,
+    }));
+    // Backdate so a spurious write is unmissable rather than possibly landing in the same
+    // millisecond as the fixture write above.
+    const backdated = new Date(Date.now() - 60_000);
+    fs.utimesSync(configPath, backdated, backdated);
+    const before = fs.statSync(configPath).mtimeMs;
+
+    const cm = await createConfigManager();
+    cm.load();
+
+    const after = fs.statSync(configPath).mtimeMs;
+    expect(after).toBe(before);
+  });
 });
 
 describe('Config Manager -- terminal.* project-override migration', () => {
@@ -288,6 +360,57 @@ describe('Config Manager -- terminal.* project-override migration', () => {
 
     const raw = JSON.parse(fs.readFileSync(projectOverridesPath(projectDir), 'utf-8'));
     expect(raw).not.toHaveProperty('terminal');
+  });
+
+  it('renames a retired product-pair theme id in a project override and persists it', async () => {
+    const projectDir = path.join(tmpDir, 'proj-theme');
+    writeProjectOverrides(projectDir, { theme: 'kangentic-light', themeDark: 'kangentic-dark' });
+
+    const cm = await createConfigManager();
+    const overrides = cm.loadProjectOverrides(projectDir);
+
+    expect(overrides?.theme).toBe('clay');
+    expect(overrides?.themeDark).toBe('rust');
+    const raw = JSON.parse(fs.readFileSync(projectOverridesPath(projectDir), 'utf-8'));
+    expect([raw.theme, raw.themeDark]).toEqual(['clay', 'rust']);
+  });
+
+  it('rewrites a project override once and does not rewrite it again on a second loadProjectOverrides call', async () => {
+    const projectDir = path.join(tmpDir, 'proj-theme-idempotent');
+    writeProjectOverrides(projectDir, { theme: 'kangentic-light', themeDark: 'kangentic-dark' });
+
+    const cm = await createConfigManager();
+    const firstOverrides = cm.loadProjectOverrides(projectDir);
+    expect(firstOverrides?.theme).toBe('clay');
+    expect(firstOverrides?.themeDark).toBe('rust');
+
+    // Backdate so a spurious second write is unmissable: the two stat calls here bracket only
+    // a synchronous readFileSync + JSON.parse, not the async work the sibling "does not rewrite
+    // the file when there is nothing to migrate" test gets for free, so same-millisecond mtimes
+    // would otherwise pass whether or not the second call actually rewrote the file.
+    const backdated = new Date(Date.now() - 60_000);
+    fs.utimesSync(projectOverridesPath(projectDir), backdated, backdated);
+    const before = fs.statSync(projectOverridesPath(projectDir)).mtimeMs;
+    const secondOverrides = cm.loadProjectOverrides(projectDir);
+    const after = fs.statSync(projectOverridesPath(projectDir)).mtimeMs;
+
+    expect(after).toBe(before);
+    expect(secondOverrides?.theme).toBe('clay');
+    expect(secondOverrides?.themeDark).toBe('rust');
+  });
+
+  it('does not rewrite a project override whose theme ids are already current', async () => {
+    const projectDir = path.join(tmpDir, 'proj-theme-clean');
+    writeProjectOverrides(projectDir, { theme: 'rust', themeLight: 'clay', themeDark: 'rust' });
+    const backdated = new Date(Date.now() - 60_000);
+    fs.utimesSync(projectOverridesPath(projectDir), backdated, backdated);
+    const before = fs.statSync(projectOverridesPath(projectDir)).mtimeMs;
+
+    const cm = await createConfigManager();
+    cm.loadProjectOverrides(projectDir);
+
+    const after = fs.statSync(projectOverridesPath(projectDir)).mtimeMs;
+    expect(after).toBe(before);
   });
 
   it('does not rewrite the file when there is nothing to migrate', async () => {
@@ -748,6 +871,66 @@ describe('Config Manager -- load() parse-validity guard', () => {
       expect(() => cm.load()).not.toThrow();
     },
   );
+});
+
+describe('Config Manager -- unwritable data directory (DESKTOP-14/DESKTOP-13)', () => {
+  // A FILE sitting where a directory needs to be created makes mkdirSync fail
+  // with ENOTDIR/ENOENT reliably on every OS - the same "data directory
+  // unwritable" failure class as the Sentry install (a relocated userData on a
+  // removable volume), without depending on chmod/permission semantics that
+  // differ between POSIX and Windows.
+
+  it('save() does not throw, returns false, and keeps serving the in-memory value; a later successful write persists both changes', async () => {
+    const blockerPath = path.join(tmpDir, 'blocker');
+    fs.writeFileSync(blockerPath, '');
+    process.env.KANGENTIC_DATA_DIR = path.join(blockerPath, 'config-dir');
+    vi.resetModules();
+    const cm = await createConfigManager();
+
+    let persisted = true;
+    expect(() => { persisted = cm.save({ theme: 'dark' }); }).not.toThrow();
+    expect(persisted).toBe(false);
+    // The failed write must not roll back the value that was already
+    // accepted into memory - this is what lets the session keep working.
+    expect(cm.load().theme).toBe('dark');
+
+    // Remove the blocking file so the same directory can now be created, and
+    // confirm the next successful write carries BOTH the earlier-failed
+    // value and the new one - nothing set during the outage is lost.
+    fs.rmSync(blockerPath, { force: true });
+    expect(cm.save({ sidebarVisible: false })).toBe(true);
+
+    const onDisk = JSON.parse(
+      fs.readFileSync(path.join(blockerPath, 'config-dir', 'config.json'), 'utf-8'),
+    );
+    expect(onDisk.theme).toBe('dark');
+    expect(onDisk.sidebarVisible).toBe(false);
+  });
+
+  it('saveProjectOverrides() does not throw and returns false when the project directory cannot be created', async () => {
+    const cm = await createConfigManager();
+    const blockerPath = path.join(tmpDir, 'project-blocker');
+    fs.writeFileSync(blockerPath, '');
+
+    // saveProjectOverrides writes to <projectPath>/.kangentic/config.json, so
+    // passing a FILE as the project path makes that subdirectory uncreatable.
+    let persisted = true;
+    expect(() => { persisted = cm.saveProjectOverrides(blockerPath, { theme: 'dark' }); }).not.toThrow();
+    expect(persisted).toBe(false);
+  });
+
+  it('load() on an unwritable data directory does not throw and falls back to defaults', async () => {
+    const blockerPath = path.join(tmpDir, 'blocker2');
+    fs.writeFileSync(blockerPath, '');
+    process.env.KANGENTIC_DATA_DIR = path.join(blockerPath, 'config-dir');
+    vi.resetModules();
+    const { ConfigManager } = await import('../../src/main/config/config-manager');
+    const { DEFAULT_CONFIG } = await import('../../src/shared/types');
+    const cm = new ConfigManager();
+
+    expect(() => cm.load()).not.toThrow();
+    expect(cm.load().theme).toBe(DEFAULT_CONFIG.theme);
+  });
 });
 
 describe('Config Manager -- terminal.colors replace semantics', () => {

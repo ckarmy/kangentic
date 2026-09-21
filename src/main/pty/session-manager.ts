@@ -42,6 +42,7 @@ import type {
   SpawnSessionInput,
   PerToolStat,
   PtyResizeOrigin,
+  SessionResizeResult,
 } from '../../shared/types';
 import type { ActivityEngineOptions, ActivityStatsSnapshot } from '../activity-engine/engine';
 import type { CapturedSessionTree } from '../activity-engine/background-shell/process-tree';
@@ -1163,7 +1164,7 @@ export class SessionManager extends EventEmitter {
     // pty-resize emit, never passed through resize(). Deriving from the shared
     // type keeps the two unions linked when PtyResizeOrigin grows.
     origin: Exclude<PtyResizeOrigin, 'spawn'> = 'desktop',
-  ): { colsChanged: boolean; refused?: true } {
+  ): SessionResizeResult {
     const session = this.registry.get(sessionId);
 
     // Guard against NaN/Infinity from layout edge cases (e.g. getComputedStyle
@@ -1282,8 +1283,11 @@ export class SessionManager extends EventEmitter {
       });
       // `refused` tells the echo re-assert (the width-drift self-heal) that
       // main is deliberately holding this grid, so it stops immediately
-      // instead of burning its retry budget against the floor.
-      return { colsChanged: false, refused: true };
+      // instead of burning its retry budget against the floor. `held` names
+      // the grid kept, so the refused terminal can conform to it (resize its
+      // own grid to the PTY's and scale its font to fit) instead of showing
+      // the taller frame clipped.
+      return { colsChanged: false, refused: true, held: { cols: session.pty.cols, rows: session.pty.rows } };
     }
 
     const colsChanged = this.bufferManager.onResize(sessionId, clampedCols, clampedRows);
@@ -1404,23 +1408,31 @@ export class SessionManager extends EventEmitter {
     this.kill(sessionId);
     // Full cleanup including file deletion - the session is not coming back.
     this.sessionFiles.detachAndDelete(sessionId);
-    // Announce the removal as a STATUS change before the row disappears.
+    // Announce the removal as its OWN fact, before the row disappears, so the
+    // payload still carries taskId / projectId.
     //
     // kill() nulls session.pty synchronously but never touches status for a
     // PTY-backed session (a young session's real exit can still be up to
     // KILL_GRACE_MS away), and the renderer's SESSION_EXIT handler
     // deliberately ignores an intentional exit (App.tsx) so it never
-    // self-corrects. Without this push a caller that reaches remove() before
-    // the natural 'exit' - or a syncSessions() that lands mid-grace - leaves
-    // the renderer holding a 'running' row for a session that no longer
-    // exists anywhere in main: the board keeps painting a spinner and the
-    // bottom panel keeps a tab for an agent that is gone. Forcing 'exited'
-    // here (rather than trusting whatever the row already carries) covers
-    // both the awaited-exit case, where onExit already set it, and the
-    // direct-remove case (project deletion), where it has not.
+    // self-corrects. Without a push a caller that reaches remove() before the
+    // natural 'exit' - or a syncSessions() that lands mid-grace - leaves the
+    // renderer holding a 'running' row for a session that no longer exists
+    // anywhere in main: the board keeps painting a spinner and the bottom
+    // panel keeps a tab for an agent that is gone.
+    //
+    // This used to be a 'session-changed' emit carrying a forced 'exited'
+    // status. That channel's only renderer handler is an UPSERT, so for a task
+    // moved to To Do (whose rows the renderer evicts optimistically the moment
+    // the move starts) the removal announcement re-inserted an exited row for
+    // a PTY, worktree, and session directory that no longer existed, and its
+    // usage entry filled a context bar under a black terminal (#661). A
+    // removal and a status change cannot share one channel: the renderer
+    // drops this id, and every per-session map entry keyed on it, on
+    // 'session-removed' (SESSION_REMOVED). Covers the awaited-exit case and
+    // the direct-remove case (project deletion, SESSION_RESET) alike.
     if (session) {
-      session.status = 'exited';
-      this.emit('session-changed', sessionId, toSession(session));
+      this.emit('session-removed', sessionId, toSession(session));
     }
     this.registry.delete(sessionId);
     this.clearSessionCaches(sessionId);
@@ -1461,6 +1473,32 @@ export class SessionManager extends EventEmitter {
    */
   removeByTaskId(taskId: string): void {
     for (const session of this.registry.listByTaskId(taskId)) this.remove(session.id);
+  }
+
+  /**
+   * Announce a session a caller ended with `kill()` + `awaitExit()` and is
+   * KEEPING in the registry (no `remove()`, no `suspend()`): re-emit the row
+   * on 'session-changed' with its resolved status. The PTY's natural exit
+   * emits only 'exit', which the renderer ignores for an intentional end (it
+   * cannot tell a suspend from a hard end without racing the suspended status
+   * push), so without this the renderer's replica stays at 'running' for a
+   * session main knows is finished: the card keeps its spinner and the bottom
+   * panel its tab. `remove()` and `suspend()` announce themselves, and
+   * `retireAgentlessSession` does the same inline; the cleanup_worktree
+   * transition action is the caller here. Every kill site is classified by
+   * `tests/unit/session-kill-followup.test.ts`. See
+   * .claude/rules/session-replica-contract.md.
+   */
+  announceSessionEnded(sessionId: string): void {
+    const session = this.registry.get(sessionId);
+    if (!session) return;
+    if (session.status === 'running' || session.status === 'queued') {
+      // awaitExit resolved without onExit stamping the row (its safety
+      // timeout, or a PTY-less row): the session is ended either way.
+      session.status = 'exited';
+      if (session.exitCode === null) session.exitCode = -1;
+    }
+    this.emit('session-changed', sessionId, toSession(session));
   }
 
   /**
@@ -1537,7 +1575,10 @@ export class SessionManager extends EventEmitter {
    * (record marked exited, panel tab dropped, phantom count corrected, queue
    * slot freed, hooks stripped, transcript flushed) and its `intentionalExit`
    * flag suppresses the renderer's "Session crashed" toast - the agent's own
-   * exit was the event, and Kangentic is only noticing it late.
+   * exit was the event, and Kangentic is only noticing it late. Because that
+   * flag also silences the exit listener's startup-failure read, the
+   * retirement first emits `agent-absent` so the IPC layer can read the CLI's
+   * last words and raise a notice when they name a failure.
    *
    * The reported exit code is forced to 0 because this WAS a normal end. A
    * force-kill reports an abnormal code on every platform, and
@@ -1552,6 +1593,16 @@ export class SessionManager extends EventEmitter {
     if (!this.isAgentAbsenceCandidate(sessionId)) return;
     const session = this.registry.get(sessionId);
     if (!session) return;
+    // Say WHY the agent is gone while its last words are still readable. The
+    // kill below arrives at the exit listener as INTENTIONAL (the CLI's own
+    // end was the event; the sweep only noticed it late), and that listener
+    // rightly treats an intentional exit as carrying no failure, so an agent
+    // that ended at boot with its own account of why (a `--resume` whose
+    // conversation the CLI could not find) reached the user as a card that
+    // went quiet. The IPC layer asks the adapter to read the raw ring and
+    // raises the notice; the ring survives the kill, so ordering here is for
+    // clarity rather than correctness.
+    this.emit('agent-absent', sessionId, toSession(session));
     session.overrideExitCode = 0;
     // Immediate: the agent is already gone, so the exit-sequence grace would
     // only type `/exit` into a bare shell, and the `exited` stamp below would
@@ -1845,7 +1896,10 @@ export class SessionManager extends EventEmitter {
    * separates the two.
    *
    * No settle and no slicing: a diagnostic wants the bytes as they are, not a
-   * replay-shaped view of them.
+   * replay-shaped view of them. The exit listener reads it for the same reason
+   * when it asks an adapter whether the CLI's last words name a startup
+   * failure: at exit there is no process left to repaint, and what matters is
+   * what the CLI wrote.
    */
   getRawScrollback(sessionId: string): string {
     return this.bufferManager.getRawScrollback(sessionId);
@@ -2206,6 +2260,11 @@ export class SessionManager extends EventEmitter {
       disposeAdapterAttachment(exitedRow);
       this.sessionFiles.removeSession(exitedRow.id);
       this.clearSessionCaches(exitedRow.id);
+      // A row that leaves the registry announces it, here as in remove(): the
+      // placeholder's own status push below makes it the task's only row in the
+      // renderer, but only a removal push drops the evicted id's per-session
+      // map entries (usage, activity, events) with it.
+      this.emit('session-removed', exitedRow.id, toSession(exitedRow));
     }
     this.emit('session-changed', session.id, session);
     return session;

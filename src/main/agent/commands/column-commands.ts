@@ -1,4 +1,8 @@
+import type Database from 'better-sqlite3';
 import { SwimlaneRepository } from '../../db/repositories/swimlane-repository';
+import { AutomationRepository } from '../../db/repositories/automation-repository';
+import { setColumnMessage, setColumnMessageMode } from '../../automations/column-message';
+import { resolveColumnMessage } from '../../transition-engine/column-strategy';
 import { pruneDeletedColumnFromProfiles } from '../../config/board-config/prune-profile-references';
 import { snapSpawnStrategyToTarget } from '../../../shared/session-track';
 import { resolveColumn, listActiveSwimlanes } from './column-resolver';
@@ -11,6 +15,7 @@ import {
 } from './column-enums';
 import type { CommandContext, CommandHandler, CommandResponse } from './types';
 import type {
+  AutoCommandMode,
   SwimlaneCreateInput,
   SwimlaneUpdateInput,
   SessionTarget,
@@ -20,6 +25,15 @@ import type {
 /** The defaults a brand-new column starts at, matching the two NOT NULL column DEFAULTs. */
 const DEFAULT_SESSION_TARGET: SessionTarget = 'main';
 const DEFAULT_SESSION_SPAWN_STRATEGY: SessionSpawnStrategy = 'create_or_resume';
+
+/**
+ * The message this column actually sends, for the `autoCommand` field these
+ * tools echo back. Goes through the same resolver the engine uses, so what a
+ * caller reads is what the column will deliver.
+ */
+function readColumnMessage(db: Database.Database, swimlaneId: string): string | null {
+  return resolveColumnMessage(new AutomationRepository(db).listForColumn(swimlaneId))?.message ?? null;
+}
 
 export const handleUpdateColumn: CommandHandler = (
   params: Record<string, unknown>,
@@ -67,14 +81,27 @@ export const handleUpdateColumn: CommandHandler = (
     updates.auto_spawn = Boolean(params.autoSpawn);
     changedFields.push('autoSpawn');
   }
-  if (params.autoCommand !== undefined) {
-    updates.auto_command = params.autoCommand === null ? null : String(params.autoCommand).slice(0, 4000);
+  // `autoCommand` is NOT a lane field any more. It writes the column's first
+  // `send_message` enter automation, which is the row the engine delivers.
+  // Deferred until after the lane write below, so a call that also renames the
+  // column does not half-apply if the rename throws.
+  const messageWrite = params.autoCommand === undefined
+    ? null
+    : { text: params.autoCommand === null ? null : String(params.autoCommand).slice(0, 4000) };
+  if (messageWrite) {
     changedFields.push('autoCommand');
   }
+  let messageMode: AutoCommandMode | undefined;
   if (params.autoCommandMode !== undefined && params.autoCommandMode !== null) {
     const parsed = parseEnumParam(params.autoCommandMode, VALID_AUTO_COMMAND_MODES, 'autoCommandMode');
     if ('error' in parsed) return { success: false, error: parsed.error };
+    // The lane field is still written because the Column Manager round-trips
+    // it, but it is NOT what the engine honours. The delivered mode lives on
+    // the `send_message` row's config, so `messageMode` carries it down to the
+    // automation write below. Writing only this line reported success and
+    // changed nothing the delivery path reads.
     updates.auto_command_mode = parsed.value;
+    messageMode = parsed.value;
     changedFields.push('autoCommandMode');
   }
   if (params.agentOverride !== undefined) {
@@ -161,6 +188,21 @@ export const handleUpdateColumn: CommandHandler = (
   const swimlaneRepo = new SwimlaneRepository(db);
   const updated = swimlaneRepo.update(updates);
 
+  let messageNote = '';
+  if (messageWrite) {
+    const result = setColumnMessage(new AutomationRepository(db), updated.id, messageWrite.text, messageMode);
+    messageNote = result.action === 'unchanged'
+      ? ' This column had no message to clear.'
+      : ` The message is the "${result.name}" automation on this column's On enter group (${result.action}).`;
+  } else if (messageMode !== undefined) {
+    // Mode with no message of its own to attach to. Says so rather than
+    // reporting a success that moved nothing.
+    const result = setColumnMessageMode(new AutomationRepository(db), updated.id, messageMode);
+    messageNote = result.name === null
+      ? ' It has no message for that delivery mode to apply to, so nothing is scheduled yet.'
+      : ` The delivery mode is on the "${result.name}" automation on this column's On enter group.`;
+  }
+
   // `swimlane` is the pre-update row resolved above. Handing it over lets the
   // host propagate the change into live sessions the same way the UI's
   // SWIMLANE_UPDATE does; without a before-row it cannot tell what changed.
@@ -168,7 +210,7 @@ export const handleUpdateColumn: CommandHandler = (
 
   return {
     success: true,
-    message: `Updated ${changedFields.join(', ')} for column "${updated.name}".`,
+    message: `Updated ${changedFields.join(', ')} for column "${updated.name}".${messageNote}`,
     data: {
       id: updated.id,
       name: updated.name,
@@ -177,8 +219,10 @@ export const handleUpdateColumn: CommandHandler = (
       icon: updated.icon,
       role: updated.role,
       autoSpawn: updated.auto_spawn,
-      autoCommand: updated.auto_command,
-      autoCommandMode: updated.auto_command_mode,
+      // The column's live message, read back off the automation. Echoing
+      // `updated.auto_command` reported the retired field, which is null on
+      // every board the migration has touched.
+      autoCommand: readColumnMessage(db, updated.id),
       agentOverride: updated.agent_override,
       modelOverride: updated.model_override,
       effortOverride: updated.effort_override,
@@ -228,13 +272,21 @@ export const handleCreateColumn: CommandHandler = (
   if (params.autoSpawn !== undefined && params.autoSpawn !== null) {
     input.auto_spawn = Boolean(params.autoSpawn);
   }
-  if (params.autoCommand !== undefined && params.autoCommand !== null) {
-    input.auto_command = String(params.autoCommand).slice(0, 4000);
-  }
+  // Not a lane field. Written as the new column's message automation once the
+  // row exists, since an automation needs its column's id.
+  const initialMessage = params.autoCommand === undefined || params.autoCommand === null
+    ? null
+    : String(params.autoCommand).slice(0, 4000);
+  // Validated here, the same way `handleUpdateColumn` validates it, rather than
+  // coerced at the write below. Coercing turned every unrecognized value into
+  // 'immediate' and still reported success, so a typo silently changed the
+  // delivery mode instead of being refused. The MCP tool's zod schema catches
+  // this for the released tool only; a direct handler call had nothing.
+  let initialMessageMode: AutoCommandMode | undefined;
   if (params.autoCommandMode !== undefined && params.autoCommandMode !== null) {
     const parsed = parseEnumParam(params.autoCommandMode, VALID_AUTO_COMMAND_MODES, 'autoCommandMode');
     if ('error' in parsed) return { success: false, error: parsed.error };
-    input.auto_command_mode = parsed.value;
+    initialMessageMode = parsed.value;
   }
   if (params.agentOverride !== undefined && params.agentOverride !== null) {
     input.agent_override = String(params.agentOverride);
@@ -332,11 +384,17 @@ export const handleCreateColumn: CommandHandler = (
     return swimlaneRepo.create(input);
   })();
 
+  let messageNote = '';
+  if (initialMessage) {
+    const result = setColumnMessage(new AutomationRepository(db), created.id, initialMessage, initialMessageMode);
+    messageNote = ` Its message is the "${result.name}" automation on its On enter group.`;
+  }
+
   context.onSwimlaneUpdated(created);
 
   return {
     success: true,
-    message: `Created column "${created.name}" at position ${created.position}.`,
+    message: `Created column "${created.name}" at position ${created.position}.${messageNote}`,
     data: {
       id: created.id,
       name: created.name,
@@ -346,8 +404,7 @@ export const handleCreateColumn: CommandHandler = (
       role: created.role,
       position: created.position,
       autoSpawn: created.auto_spawn,
-      autoCommand: created.auto_command,
-      autoCommandMode: created.auto_command_mode,
+      autoCommand: readColumnMessage(db, created.id),
       agentOverride: created.agent_override,
       modelOverride: created.model_override,
       effortOverride: created.effort_override,
@@ -401,6 +458,13 @@ export const handleDeleteColumn: CommandHandler = (
   const transitionCount = (db
     .prepare('SELECT COUNT(*) as count FROM swimlane_transitions WHERE from_swimlane_id = ? OR to_swimlane_id = ?')
     .get(swimlane.id, swimlane.id) as { count: number } | undefined)?.count ?? 0;
+  // The column's automations go with it (`deleteSwimlaneRowWithReferences`
+  // drops them, and the foreign key cascades anyway). Counted and reported
+  // because this is the part a caller actually loses: the transition count
+  // above is zero on every board the automations migration has touched, so
+  // reporting only that told an agent nothing had been cleaned up while its
+  // column's whole enter and exit groups went with the delete.
+  const automationCount = new AutomationRepository(db).listForColumn(swimlane.id).length;
   const planExitCount = (db
     .prepare('SELECT COUNT(*) as count FROM swimlanes WHERE plan_exit_target_id = ?')
     .get(swimlane.id) as { count: number } | undefined)?.count ?? 0;
@@ -421,6 +485,7 @@ export const handleDeleteColumn: CommandHandler = (
   context.onSwimlaneDeleted(swimlane);
 
   const alsoCleaned: string[] = [];
+  if (automationCount > 0) alsoCleaned.push(`${automationCount} automation(s)`);
   if (transitionCount > 0) alsoCleaned.push(`${transitionCount} transition(s)`);
   if (planExitCount > 0) alsoCleaned.push(`${planExitCount} plan-exit reference(s)`);
   if (removedEntries > 0) alsoCleaned.push(`${removedEntries} board-profile entr${removedEntries === 1 ? 'y' : 'ies'}`);
@@ -434,6 +499,7 @@ export const handleDeleteColumn: CommandHandler = (
     data: {
       id: swimlane.id,
       name: swimlane.name,
+      automationsRemoved: automationCount,
       transitionsRemoved: transitionCount,
       planExitReferencesCleared: planExitCount,
       profileEntriesRemoved: removedEntries,

@@ -19,6 +19,7 @@ export const IPC = {
   PROJECT_RELOCATE: 'project:relocate',
   PROJECT_MOVE_PROGRESS: 'project:moveProgress',
   PROJECT_PATH_MISSING: 'project:pathMissing',
+  PROJECT_LIST_CHANGED: 'project:listChanged',
 
   // Dev-only (preview): build-excluded from production via __KANGENTIC_DEV__.
   DEV_CREATE_EPHEMERAL_PROJECT: 'dev:createEphemeralProject',
@@ -83,16 +84,24 @@ export const IPC = {
   SWIMLANE_REORDER: 'swimlane:reorder',
   SWIMLANE_UPDATED_BY_AGENT: 'swimlane:updatedByAgent',
 
-  // Actions
-  ACTION_LIST: 'action:list',
-  ACTION_CREATE: 'action:create',
-  ACTION_UPDATE: 'action:update',
-  ACTION_DELETE: 'action:delete',
-
-  // Transitions
-  TRANSITION_LIST: 'transition:list',
-  TRANSITION_SET: 'transition:set',
-  TRANSITION_GET_FOR: 'transition:getFor',
+  // Column automations. Replaced the ACTION_* and TRANSITION_* channels, which
+  // had no renderer callers: named actions and `from -> to` transitions were
+  // never editable in the app.
+  AUTOMATION_LIST: 'automation:list',
+  AUTOMATION_REPLACE_FOR_COLUMN: 'automation:replaceForColumn',
+  AUTOMATION_RUNS_FOR_TASK: 'automation:runsForTask',
+  /**
+   * Re-run ONE automation against the task's CURRENT state, writing a fresh run
+   * row. Reached from the failure toast's Run again action and from MCP.
+   */
+  AUTOMATION_RUN_AGAIN: 'automation:runAgain',
+  /** Main -> renderer: one automation failed or was interrupted. */
+  AUTOMATION_RUN_FAILED: 'automation:runFailed',
+  /**
+   * Main -> renderer: runs left `running` by a quit were marked interrupted on
+   * project open. One summary per open, never one per row.
+   */
+  AUTOMATION_RUNS_INTERRUPTED: 'automation:runsInterrupted',
 
   // Sessions
   SESSION_SPAWN: 'session:spawn',
@@ -120,6 +129,7 @@ export const IPC = {
   SESSION_MESSAGE_TRAIL: 'session:messageTrail',
   SESSION_GET_MESSAGE_TRAILS: 'session:getMessageTrails',
   SESSION_STATUS: 'session:status',
+  SESSION_REMOVED: 'session:removed',
   SESSION_SUSPEND: 'session:suspend',
   SESSION_RESUME: 'session:resume',
   SESSION_RECONCILE: 'session:reconcile',
@@ -154,6 +164,16 @@ export const IPC = {
   // (main + pop-outs) so live theme/settings changes sync across windows. Carries
   // no payload; subscribers re-fetch via config:get.
   CONFIG_CHANGED: 'config:changed',
+  // Push: a sync write to the data directory (config or one of the other small
+  // per-machine/per-project state files) failed - DESKTOP-14/DESKTOP-13. Carries
+  // the user-facing message to toast. Latched once per failing source in
+  // src/main/config/write-failure-notice.ts, so this fires at most once until a
+  // later write to that same source succeeds.
+  // Main window only (sendToRenderer, not broadcast), unlike CONFIG_CHANGED
+  // above: ToastContainer is mounted in AppLayout alone, so a pop-out window has
+  // no toast host to deliver this to. Register it in POP_OUT_SURFACES only if a
+  // pop-out ever gets one.
+  CONFIG_WRITE_FAILED: 'config:writeFailed',
 
   // Keybindings
   KEYBINDINGS_PROBE_GLOBAL: 'keybindings:probeGlobal',
@@ -191,6 +211,7 @@ export const IPC = {
   GIT_DIFF_UNSUBSCRIBE: 'git:diffUnsubscribe',
   GIT_DIFF_CHANGED: 'git:diffChanged',
   GIT_CHECK_PENDING_CHANGES: 'git:checkPendingChanges',
+  GIT_PREFETCH_REMOTES: 'git:prefetchRemotes',
   GIT_BRANCH_SUMMARY: 'git:branchSummary',
   GIT_WORKTREE_HEAD: 'git:worktreeHead',
   GIT_COMMIT_GRAPH: 'git:commitGraph',
@@ -366,8 +387,9 @@ export const IPC = {
   BACKLOG_ATTACHMENT_GET_DATA_URL: 'backlogAttachment:getDataUrl',
   BACKLOG_ATTACHMENT_OPEN: 'backlogAttachment:open',
 
-  // Clipboard
+  // Clipboard (and the pasted-image temp directory it shares with the drop path)
   CLIPBOARD_READ_IMAGE: 'clipboard:readImage',
+  CLIPBOARD_SAVE_IMAGE: 'clipboard:saveImage',
   CLIPBOARD_WRITE_TEXT: 'clipboard:writeText',
 
   // Browser pane: embedded webview capture-and-send
@@ -447,6 +469,9 @@ export const IPC = {
   UPDATE_INSTALL: 'updater:install',
   UPDATE_DOWNLOADED: 'updater:downloaded',
 
+  // Host memory pressure (Sentry DESKTOP-16; see src/main/diagnostics/host-memory.ts)
+  HOST_MEMORY_PRESSURE: 'hostMemory:pressure',
+
   // Announcements (remote feed poll; see src/main/announcements.ts)
   ANNOUNCEMENTS_GET: 'announcements:get',
   ANNOUNCEMENTS_GET_HISTORY: 'announcements:getHistory',
@@ -497,3 +522,13 @@ export const IPC = {
  * offers the "Locate Folder..." relocation flow instead of a generic error.
  */
 export const PROJECT_PATH_MISSING_PREFIX = 'PROJECT_PATH_MISSING:';
+
+/**
+ * Sentinel prefix for "no project with this id in the global index DB".
+ * Electron wraps handler errors in its own Error, so the renderer detects
+ * this case via `error.message.includes(PROJECT_NOT_FOUND_PREFIX)` and
+ * refetches the project list instead of surfacing a raw IPC error. See
+ * Sentry DESKTOP-V: a renderer holding a stale list clicked a row main
+ * could no longer resolve, and the failure had nowhere to go.
+ */
+export const PROJECT_NOT_FOUND_PREFIX = 'PROJECT_NOT_FOUND:';

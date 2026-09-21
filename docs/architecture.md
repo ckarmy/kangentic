@@ -10,6 +10,17 @@ Electron app with two processes:
 
 Context isolation is enabled -- the renderer has no direct access to Node.js APIs.
 
+### Renderer crash recovery
+
+A recoverable renderer death (`render-process-gone` with reason `oom` or `crashed`, never
+`clean-exit` or `killed`) reloads the main window automatically instead of leaving it dead and
+blank. PTY sessions live in main and are untouched by a renderer-only crash, so a reload costs the
+user a repaint, not their work. Reloads are bounded (`RENDERER_RELOAD_MAX` per
+`RENDERER_RELOAD_WINDOW_MS`, `src/main/diagnostics/renderer-recovery.ts`): a machine still starved
+of memory would kill a freshly reloaded renderer too, so past the bound a native dialog explains
+what happened instead of retrying forever. See `src/main/diagnostics/host-memory.ts` (Sentry
+DESKTOP-16) for the host memory pressure sampler this pairs with.
+
 ## Data Flow
 
 ```
@@ -17,8 +28,10 @@ User drags task between columns
   → BoardStore.moveTask() -- optimistic UI update
   → IPC task:move
   → Main: update DB positions
+  → Main: TransitionEngine runs the SOURCE column's On exit automations
   → Main: check priority rules (To Do? Done? Active session? No session?)
-  → Main: TransitionEngine executes action chain (create_worktree → spawn_agent)
+  → Main: TransitionEngine runs the TARGET column's On enter automations
+  → Main: the agent starts before the first automation that needs it
   → SessionManager spawns PTY (or queues it)
   → PTY streams output → 16ms batched flush → IPC session:data → xterm render
   → Bridge scripts write status/activity/events files → fs.watch → IPC → Zustand stores
@@ -28,7 +41,7 @@ User drags task between columns
 
 All channels defined in `src/shared/ipc-channels.ts`. The preload bridge in `src/preload/preload.ts` mirrors them as `window.electronAPI.*`.
 
-### Projects (19 channels)
+### Projects (20 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `project:list` | invoke | Fetch all projects (ordered by position) |
@@ -50,6 +63,7 @@ All channels defined in `src/shared/ipc-channels.ts`. The preload bridge in `src
 | `project:moveProgress` | on | Event: progress during a one-step project move (`phase`: `moving`/`copying`, `copiedEntries`, `totalEntries`) |
 | `project:autoOpened` | on | Event: project auto-opened on launch |
 | `project:pathMissing` | on | Event: a registered project path no longer exists on disk |
+| `project:listChanged` | on | Event: the project list changed server-side (a stale project pruned, or a recovered global DB); tells the renderer to refetch `project:list` and `project:getCurrent` |
 
 ### Dev-only (preview)
 Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimination); present only in `npm start` and `/preview` builds, never in shipped installers. Registered from `src/devtools/`, so it is not counted in the production channel totals above.
@@ -168,22 +182,20 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `swimlane:reorder` | invoke | Reorder swimlanes by ID array |
 | `swimlane:updatedByAgent` | on | Push event when an MCP agent changes a project's columns: a column create, update, or delete, or (reusing the same deliberately kind-agnostic signal) a same-column task reorder via `kangentic_reorder_tasks` / `kangentic_move_task`'s `position`, where no swimlane field itself changed |
 
-### Actions (4 channels)
+### Automations (6 channels)
+
+Replaced the `action:*` and `transition:*` channels, which had no renderer callers.
+
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
-| `action:list` | invoke | Fetch all actions |
-| `action:create` | invoke | Create action with type and config |
-| `action:update` | invoke | Update action |
-| `action:delete` | invoke | Delete action |
+| `automation:list` | invoke | Fetch every column's automations |
+| `automation:replaceForColumn` | invoke | Replace one column's whole list (the Column Manager's Save) |
+| `automation:runsForTask` | invoke | Run history for a task, newest first |
+| `automation:runAgain` | invoke | Re-run ONE automation against the task's current state, writing a fresh run row |
+| `automation:runFailed` | on | Push event when a run failed or was interrupted, rationed per automation |
+| `automation:runsInterrupted` | on | Push event after the project-open sweep, one summary per open |
 
-### Transitions (3 channels)
-| Channel | Pattern | Purpose |
-|---------|---------|---------|
-| `transition:list` | invoke | Fetch all transitions |
-| `transition:set` | invoke | Set action chain for lane A→B |
-| `transition:getFor` | invoke | Get transitions for lane pair (exact match, then wildcard) |
-
-### Sessions (41 channels)
+### Sessions (42 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `session:spawn` | invoke | Spawn PTY session (may queue) |
@@ -215,6 +227,7 @@ Build-excluded from production via `__KANGENTIC_DEV__` (esbuild dead-code elimin
 | `session:firstOutput` | on | The adapter's readiness escape matched (Claude: cursor-hide `\x1b[?25l`), lifting the shimmer overlay. A heuristic, not proof the agent is up - a shell preamble can carry the same escape (includes `projectId`) |
 | `session:exit` | on | Session exited (includes `projectId`) |
 | `session:status` | on | Session changed - pushes full `Session` object (includes `projectId`) |
+| `session:removed` | on | Session left main's registry for good (`SessionManager.remove()`: a To Do reset, a task or project delete, a session reset, an aborted spawn). Carries the row's last `Session` snapshot and `projectId`. Its own channel because the status handler can only upsert; the renderer drops the row and every per-session map entry keyed on the id. The main-side handler also purges that session from the background usage and event buffers, so a tick held for `BACKGROUND_FLUSH_MS` cannot flush after the removal and write its numbers back under a row the renderer has dropped |
 | `session:usage` | on | Usage data updated (includes `projectId`) |
 | `session:activity` | on | Activity state or reason changed (includes `projectId`, `taskId`). Two main-side emitters feed this one channel: `activity` on a real state transition, and `activity-reason` when the state holds but the reason's kind moves (a fan-out starting mid-turn, say). Only the first reaches the desktop notifier, the mobile push notifier, turn-completion auto-move, and the activity-interval recorder, which all read an `activity` emit as a transition. |
 | `session:event` | on | Structured event (includes `projectId`) |
@@ -263,7 +276,7 @@ from a host's complete mounted set, never accumulated from claim/release - see
 | `detail:syncOwned` | send | A host reports the COMPLETE set of details it currently owns, derived from its window store. Replaces a claim/release pair: a lost or out-of-order message cannot strand a claim, which used to make a task permanently unopenable. Owns, not merely mounts: a window RETAINED for a backgrounded project stays mounted but is excluded, since it is holding a Browser pane's guest alive rather than presenting that task's detail, and leaving it in would block the Agent Monitor from hosting the same task. Main reconciles per `(webContentsId, host)`. |
 | `detail:remoteOwners` | on | Main publishing which details are held by a DIFFERENT renderer, filtered per recipient. Terminal ownership ("one xterm per PTY") was renderer-local, so a detail hosted in the detached monitor left the main window free to mount a second xterm on the same live PTY. Only main sees both sides. |
 
-### Config (10 channels)
+### Config (11 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `config:get` | invoke | Fetch effective AppConfig (global merged with project overrides) |
@@ -275,7 +288,8 @@ from a host's complete mounted set, never accumulated from claim/release - see
 | `config:getProjectByPath` | invoke | Fetch project overrides by filesystem path |
 | `config:setProjectByPath` | invoke | Update project overrides by filesystem path |
 | `config:syncDefaultToProjects` | invoke | Sync default config values to all project configs |
-| `config:changed` | on | Bare-signal event fanned to every window (main + open pop-outs) after any `config:set` persists; subscribers re-fetch via `config:get` so theme/settings sync live across windows |
+| `config:changed` | on | Bare-signal event fanned to every window (main + open pop-outs) after any `config:set` is applied; subscribers re-fetch via `config:get` so theme/settings sync live across windows |
+| `config:writeFailed` | on | Push to the main window only, not broadcast to pop-outs (`ToastContainer` mounts in `AppLayout` alone, so a pop-out has no toast host): a synchronous write to the data directory failed, so the change applies to this session but will not persist. Carries the user-facing message. Latched per failing source in `src/main/config/write-failure-notice.ts`, so it fires at most once until a later write to that source succeeds (Sentry DESKTOP-14/DESKTOP-13) |
 
 ### Keybindings (1 channel)
 | Channel | Pattern | Purpose |
@@ -304,7 +318,7 @@ Machine-global (like Config), not project-scoped - backs the Mobile Devices sett
 | `mobile:getStatus` | invoke | Report bridge status: enabled, secure-storage availability, identity fingerprint, relay URL, relay transport state, paired device count, pairing-in-progress |
 | `mobile:startPairing` | invoke | Mint a pairing token, connect the pairing relay slot, and return the QR payload URI. Supersedes a stale in-progress ceremony rather than throwing |
 | `mobile:cancelPairing` | invoke | Cancel an in-progress pairing ceremony |
-| `mobile:listDevices` | invoke | List paired devices (id, display name, capabilities, paired-at, live connection state) |
+| `mobile:listDevices` | invoke | List paired devices (id, display name, capabilities, paired-at, live connection state and the time it last changed) |
 | `mobile:revokeDevice` | invoke | Revoke a paired device: drop it from the signed roster and tear down its session |
 | `mobile:renameDevice` | invoke | Rename a paired device (re-signs the roster entry, preserves paired-at) |
 | `mobile:setDeviceCapabilities` | invoke | Update a paired device's granted capability verbs (re-signs the roster entry); no longer surfaced as settings-tab UI, kept as the enforcement/future-preset seam |
@@ -331,7 +345,7 @@ Machine-global (like Config), not project-scoped - backs the Mobile Devices sett
 ### Agents (2 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
-| `agent:list` | invoke | List all detected agent CLIs as `AgentDetectionInfo` (name, displayName, found, path, version, authenticated, permissions, defaultPermission, liveTelemetryUnsupported, reportsRateLimits, pastedImageReferenceTemplate, supportsSummarize, remoteExecution) |
+| `agent:list` | invoke | List all detected agent CLIs as `AgentDetectionInfo` (name, displayName, found, path, version, authenticated, permissions, defaultPermission, liveTelemetryUnsupported, reportsRateLimits, pastedImageNativeExtensions, pastedImageReferenceTemplate, supportsSummarize, capabilities, remoteExecution, launchOptions) |
 | `agent:probeExecutionServer` | invoke | Reachability probe for an agent's configured remote execution server ("Test connection" in the Agent settings tab, shown when the selected agent declares remote-execution support). Returns `RemoteServerStatus`. |
 
 ### Handoffs (1 channel)
@@ -354,7 +368,7 @@ Machine-global (like Config), not project-scoped - backs the Mobile Devices sett
 |---------|---------|---------|
 | `font:getAvailable` | invoke | List detected system fonts (monospace-filtered when detectable) for the Terminal tab's Font Family picker |
 
-### Git (13 channels)
+### Git (14 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `git:detect` | invoke | Detect git installation (path, version, minimum version check) |
@@ -365,6 +379,7 @@ Machine-global (like Config), not project-scoped - backs the Mobile Devices sett
 | `git:diffUnsubscribe` | send | Release THIS window's subscription for a worktree; the watcher and merge-base cache are torn down only when the path's last subscriber leaves (a destroyed window releases its subscriptions automatically) |
 | `git:diffChanged` | on | Debounced event fired when watched worktree files or git metadata change on disk |
 | `git:checkPendingChanges` | invoke | Check whether a path has uncommitted or unpushed changes |
+| `git:prefetchRemotes` | invoke | Warm the throttled all-remotes fetch for a worktree (fire-and-forget, non-interactive) so a following `checkPendingChanges` skips or joins it rather than starting its own; the board calls it when a worktree-backed card drag begins, and main skips it when `git.autoFetchIntervalMinutes` is off |
 | `git:branchSummary` | invoke | Lightweight branch summary for the Changes panel header: current branch, ahead/behind commit counts vs the base branch, and the HEAD tip commit (hash, subject, timestamp). Cheap enough to run on every panel open and watcher fire. An optional `refreshRemote` flag makes the handler run the throttled all-remotes fetch first so `behind` reflects the actual remote; the panel passes it once per mount, never on watcher fires |
 | `git:worktreeHead` | invoke | A checkout's live HEAD (`branch`, `sha`): two rev-parse calls, no fetch. `branch` is null on a detached HEAD or a git error and `sha` is null only on a git error, so the pair tells the two apart. The Command Terminal layer re-derives every window's branch pill from it on reattach and on every `git:diffChanged`. Unqueued, like `git:branchSummary` |
 | `git:commitGraph` | invoke | Topo-ordered commit history (commits with parent links plus resolved tip / base / merge-base anchors) for the Changes panel's commit-history browser. Local-only and fail-safe, like `git:branchSummary` |
@@ -407,10 +422,11 @@ Detach a registered UI surface (usage stats, git changes, a single changed file'
 |---------|---------|---------|
 | `app:getVersion` | invoke | Get Electron app version string |
 
-### Clipboard (2 channels)
+### Clipboard (3 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
 | `clipboard:readImage` | invoke | Read the native clipboard image, cap its long edge at `IMAGE_LONG_EDGE_CAP`, prune stale `pasted-image-*` files from the temp directory (24h age limit, 40-file cap), save it to a temp file, returns file path or null |
+| `clipboard:saveImage` | invoke | Save PNG bytes the renderer decoded from a dropped image (a format the agent CLI cannot attach from a path, such as bmp) into the same temp directory under the same cap and prune; returns the file path, or null when the bytes are not a decodable image or the write failed |
 | `clipboard:writeText` | invoke | Write text to the native clipboard (focus-independent; used by terminal copy and the OSC 52 handler) |
 
 ### Browser pane (17 channels)
@@ -440,6 +456,11 @@ Detach a registered UI surface (usage stats, git changes, a single changed file'
 | `updater:check` | invoke | Check for application updates |
 | `updater:install` | invoke | Install downloaded update (quit and install) |
 | `updater:downloaded` | on | Event: update has been downloaded and is ready to install |
+
+### Host memory pressure (1 channel)
+| Channel | Pattern | Purpose |
+|---------|---------|---------|
+| `hostMemory:pressure` | on | Event: host commit headroom crossed below the warning threshold (edge-triggered, not a per-tick heartbeat). Carries `{ sample, activeAgentCount }`. See `src/main/diagnostics/host-memory.ts` (Sentry DESKTOP-16) |
 
 ### Announcements (4 channels)
 | Channel | Pattern | Purpose |
@@ -471,8 +492,8 @@ Conversation-memory semantic layer (Smart-mode search). See the Memory settings 
 ### Diagnostics (2 channels)
 | Channel | Pattern | Purpose |
 |---------|---------|---------|
-| `diagnostics:logAppend` | invoke | Renderer / preload forwards a `LogEntry` to the main process. The main-side log mirror persists `error` and `warn` levels unconditionally and `info` / `debug` / `log` when `developer.persistConsoleLogs` is on. NDJSON written to `<projectRoot>/.kangentic/logs/<YYYY-MM-DD>.log`. |
-| `diagnostics:crashReport` | invoke | Renderer forwards a `CrashRecord` (window.onerror, unhandledrejection) to the main process. Crash capture writes one JSON file per record to `<projectRoot>/.kangentic/logs/crashes/<ts>.json`. Always-on - no toggle. |
+| `diagnostics:logAppend` | invoke | Renderer / preload forwards a `LogEntry` to the main process. The main-side log mirror persists `error` and `warn` levels unconditionally and `info` / `debug` / `log` when `developer.persistConsoleLogs` is on. NDJSON written to `<projectRoot>/.kangentic/logs/<YYYY-MM-DD>.log`, falling back to `<configDir>/logs/` while no project is open (the same fallback crash capture uses). |
+| `diagnostics:crashReport` | invoke | Renderer forwards a `CrashRecord` (window.onerror, unhandledrejection) to the main process. Crash capture writes one JSON file per record to `<projectRoot>/.kangentic/logs/crashes/<ts>.json`, falling back to the app's own config directory when no project is open (a crash must never be silently dropped for that reason). Always-on - no toggle. |
 
 ### Dictation (14 channels)
 By-session-id, not task-scoped (no `projectId`), in the same category as `session:write`.
@@ -516,10 +537,11 @@ Stores the project list. Tables:
 
 Created on project open. Stored in the global config directory (not inside the project). Tables:
 
-- **swimlanes** -- Kanban columns. Fields: id, name, role (`todo`/`done`/null, set only at create, narrowed on read via `normalizeSwimlaneRole` and normalized when applied from `kangentic.json`, with an unconditional migration repairing any stray value already on disk. See [database.md](database.md)), position, color, icon, is_archived, permission_mode, auto_spawn, auto_command, auto_command_mode, agent_override, model_override, effort_override, handoff_context, plan_exit_target_id, session_target, session_spawn_strategy, is_ghost, created_at
+- **swimlanes** -- Kanban columns. Fields: id, name, role (`todo`/`done`/null, set only at create, narrowed on read via `normalizeSwimlaneRole` and normalized when applied from `kangentic.json`, with an unconditional migration repairing any stray value already on disk. See [database.md](database.md)), position, color, icon, is_archived, permission_mode, auto_spawn, agent_override, model_override, effort_override, handoff_context, plan_exit_target_id, session_target, session_spawn_strategy, is_ghost, created_at (plus the retired `auto_command` / `auto_command_mode`, which the column's message automation replaced)
 - **tasks** -- Kanban cards. Fields: id, display_id, title, description, swimlane_id, position, agent, agent_override, model_override, effort_override, permission_mode, auto_command, auto_command_state, auto_command_text, auto_command_error, auto_command_at, profile_id, run_mode, session_id, worktree_path, worktree_folder, worktree_skip_reason, branch_name, pushed_branch, pr_number, pr_url, pr_state, pr_merge_readiness, head_sha, base_branch, resolved_base_branch, use_worktree, labels, priority, external_id, external_source, external_url, detail_view_state, archived_at, created_at, updated_at (the canonical column table lives in [database.md](database.md); this list is a pointer, not a second source of truth)
-- **actions** -- Executable steps. Types: `spawn_agent`, `send_command`, `run_script`, `kill_session`, `create_worktree`, `cleanup_worktree`, `create_pr`, `webhook`. Config stored as JSON.
-- **swimlane_transitions** -- Maps lane pairs to action chains. Fields: from_swimlane_id (`*` = any), to_swimlane_id, action_id, execution_order
+- **column_automations** -- What runs when a task enters or leaves a column. Fields: id, swimlane_id, name, type (`send_message`, `run_script`, `webhook`, `notify`, plus the legacy `spawn_agent`), trigger (`enter`/`exit`), position, enabled, config_json, created_at, updated_at. One list per column, numbered per trigger, with names unique per column
+- **automation_runs** -- One row per execution, so an outcome survives a restart and a rename. Fields: id, automation_id, automation_name, type, task_id, swimlane_id, trigger, status (`running`/`succeeded`/`failed`/`skipped`/`interrupted`), detail, attempts, started_at, finished_at. Swept on project open: stale `running` rows become `interrupted`, then the newest 200 are kept
+- **actions**, **swimlane_transitions** -- Retired by the migration that created `column_automations`. Left on disk only so an older build can still read the file; nothing reads them after the migration. See [database.md](database.md)
 - **sessions** -- Session persistence for recovery/resume. Fields: id, task_id, session_type, agent_session_id, command, cwd, permission_mode, prompt, status (`running`/`queued`/`suspended`/`exited`/`orphaned`), exit_code, timestamps
 - **task_attachments** -- File attachments (images, etc.) stored on disk, metadata in DB
 - **backlog_tasks** -- Staging area tasks (Backlog View). Pre-board tasks with priority, labels, and optional external source tracking.
@@ -578,25 +600,37 @@ When a task moves between swimlanes, the IPC handler checks priorities in order:
 1. **Target is To Do** → Kill session, preserve worktree
 2. **Target is Done** → Suspend session (resumable), archive task
 3. **Target has auto_spawn=false** → Suspend session
-4. **Task has active session** → A permission-mode delta (destination's effective mode differs from the session record's spawn-time mode) suspends and respawns so the new `--permission-mode` / `--model` / `--effort` land as CLI flags. Otherwise live-inject model/effort/auto_command when the adapter supports it, respawn on a concrete model/effort delta without live-swap, or keep the session alive. See [Transition Engine](transition-engine.md) Priority 3 for the full sub-case order.
-5. **Task has no session** → Create worktree (if enabled), execute transition action chain. For resumed sessions, `auto_command` is preloaded as the resume prompt. For fresh spawns, it is injected via `TerminalSubmitScheduler.scheduleKeystrokes`. Note that escalation to a restart-with-prompt is wired ONLY on the warm-session column move (`task-move.ts`); neither fresh-spawn call site passes an `escalate` handler, so an unconfirmed fresh-spawn `auto_command` stops at `failed`. See [Command Injection](command-injection.md) for the delivery ladder.
+4. **Task has active session** → A permission-mode delta (destination's effective mode differs from the session record's spawn-time mode) suspends and respawns so the new `--permission-mode` / `--model` / `--effort` land as CLI flags. Otherwise live-inject model/effort/the column's message when the adapter supports it, respawn on a concrete model/effort delta without live-swap, or keep the session alive. Either keep-alive return then runs the destination's On enter group, with the already-delivered message named to the runner so it is not sent twice. See [Transition Engine](transition-engine.md) Priority 3 for the full sub-case order.
+5. **Task has no session** → Create worktree (if enabled), run the destination's On enter group with the fallback spawn handed in, so the agent starts right before the first automation that needs it. For resumed sessions, the column's message is preloaded as the resume prompt. For fresh spawns, it is injected via `TerminalSubmitScheduler.scheduleKeystrokes`. Note that escalation to a restart-with-prompt is wired ONLY on the warm-session column move (`task-move.ts`); neither fresh-spawn call site passes an `escalate` handler, so an unconfirmed fresh-spawn message stops at `failed`. See [Command Injection](command-injection.md) for the delivery ladder.
 
-Transitions only fire for case 5. The action chain runs in `execution_order`: typically `create_worktree` → `spawn_agent`.
+The SOURCE column's On exit group runs ahead of all five, in Phase 1 inside the short lock, after
+the DB write and before the priority branches: Priority 1 kills the session, so an exit automation
+that needs the agent has to find it still attached. An exit row never aborts the move, and the
+group is capped at 60 seconds in aggregate whatever the adapters declare, because holding the
+short lock is what wedges that task's next move. Every row is isolated: a failure records its
+outcome in `automation_runs` and the next row still runs.
 
-### Action Types
+### Automation adapters
 
-| Type | What it does |
-|------|-------------|
-| `spawn_agent` | Build Claude CLI command, spawn PTY. Resumes if suspended session exists. |
-| `send_command` | Write interpolated text to running PTY stdin |
-| `run_script` | Spawn one-off shell command (no persistence) |
-| `kill_session` | Suspend session, clear task.session_id |
-| `create_worktree` | Create git worktree with sparse-checkout |
-| `cleanup_worktree` | Remove worktree directory and optionally branch |
-| `create_pr` | Reserved. Not yet implemented. |
-| `webhook` | POST to URL with interpolated body |
+Each type is an adapter under `src/main/automations/adapters/`, registered in
+`automation-registry.ts` and declared once in `AUTOMATION_MANIFEST`
+(`src/shared/automation-manifest.ts`), which the renderer reads for the picker, the dialog's
+fields, and the row sentence. The engine dispatches through the registry, so a new type is one
+folder and one manifest entry. See `.claude/rules/automation-adapters.md` for the contract.
 
-Template variables available: `{{title}}`, `{{description}}`, `{{task_xml}}`, `{{taskId}}`, `{{projectPath}}`, `{{worktreePath}}`, `{{branchName}}`, `{{baseBranch}}`, `{{prUrl}}`, `{{prNumber}}`, `{{attachments}}`, `{{port}}`. One declaration (`src/shared/task-template-vars.ts`) drives the `auto_command` field, the `spawn_agent` promptTemplate, and the Automation section's "Template variable" picker, which lists each variable with its description - see [Transition Engine](transition-engine.md#template-variables).
+| Type | Label | Needs | Timeout | What it does |
+|------|-------|-------|---------|-------------|
+| `send_message` | Send message to agent | the agent | the scheduler's own 120s | Deliver an interpolated message to the task's agent, through the three delivery rungs |
+| `run_script` | Run script | none | 10 minutes by default, per automation | Run a script as a child process in the task's worktree, awaiting the exit and recording the code |
+| `webhook` | Call webhook | none | 30s | Send a request with an interpolated body, retried on a transport error, 429 or 5xx with an idempotency key |
+| `notify` | Notify me | none | none | Raise one desktop notification through the same path `DesktopNotifier` uses |
+| `spawn_agent` | Start agent | none | none | Legacy. Kept so a row carrying a custom `promptTemplate` still runs; never offered for a new automation |
+
+The retired `send_command`, `kill_session`, `create_worktree`, `cleanup_worktree` and `create_pr`
+types are gone, rows and all: each was a no-op or a duplicate of the move path. A hand-written
+`kangentic.json` naming one is warned and skipped rather than rejected.
+
+Template variables available: `{{title}}`, `{{description}}`, `{{task_xml}}`, `{{taskId}}`, `{{taskNumber}}`, `{{projectPath}}`, `{{projectName}}`, `{{worktreePath}}`, `{{branchName}}`, `{{baseBranch}}`, `{{prUrl}}`, `{{prNumber}}`, `{{prState}}`, `{{issueKey}}`, `{{issueUrl}}`, `{{labels}}`, `{{attachments}}`, `{{port}}`, plus `{{column}}`, `{{fromColumn}}`, `{{toColumn}}` and `{{trigger}}` in a column automation, where there is a move to read them from. One declaration (`src/shared/task-template-vars.ts`) drives the `auto_command` field, the `spawn_agent` promptTemplate, and the Automation section's "Template variable" picker, which lists each variable with its description - see [Transition Engine](transition-engine.md#template-variables).
 
 ## PTY Session Manager
 
@@ -693,7 +727,7 @@ All stores in `src/renderer/stores/`. They call `window.electronAPI.*` for IPC a
 
 ### BoardStore (`board-store.ts`)
 
-State: `tasks`, `swimlanes`, `archivedTasks`, `loading`, `completingTask`, `completingTaskIds`, `completionGates`, `recentlyArchivedId`, `lanePins`, `pendingMoveConfirms` (with `pendingMoveConfirm` as its head)
+State: `tasks`, `swimlanes`, `automations`, `automationsLoaded`, `archivedTasks`, `loading`, `completingTask`, `completingTaskIds`, `completionGates`, `recentlyArchivedId`, `lanePins`, `pendingMoveConfirms` (with `pendingMoveConfirm` as its head)
 
 - **Optimistic updates** -- all mutations update UI immediately, then sync via IPC. Errors revert via full `loadBoard()`.
 - **Stale move protection** - per-task `moveGenerations` counters prevent older async reloads from clobbering newer moves of the same task.
@@ -701,6 +735,7 @@ State: `tasks`, `swimlanes`, `archivedTasks`, `loading`, `completingTask`, `comp
 - **Move confirmations queue** - `pendingMoveConfirms` is FIFO. As a single slot, a second confirmation overwrote the first, and that move had already returned `ok` without calling the IPC, leaving an optimistic placement no write backed.
 - **Session cascade** -- after task move, reloads sessions to detect spawns/kills from transition engine. Auto-activates new sessions with toast notification.
 - **Completion animation** -- `setCompletingTask()` mounts the FlyingCard with the captured drop rect; a per-task completion gate joins the fly finishing (`markCompletionAnimationDone`) and the move being approved (`approveCompletion`, after a clean worktree probe or a confirmed dialog), and `persistCompletion` runs the actual move once both signals land.
+- **Automations** (`board-store/automations-slice.ts`) -- `loadAutomations()` fetches every column's list, `replaceAutomationsForColumn()` writes one column's whole list and re-reads, and `runAutomationAgain()` re-runs one row for the failure toast's Run again and returns the result. `selectAutomationCounts(swimlaneId)` derives the runnable enter/exit counts the rail, the board glyph and the overview all read, so the same number cannot mean three things.
 
 ### SessionStore (`session-store.ts`)
 
@@ -717,7 +752,7 @@ State: `sessions`, `activeSessionId`, `detailTaskId`, `dialogSessionIds`, `sessi
 
 State: `config` (AppConfig), `globalConfig`, `appVersion`, `agentList`, `gitInfo`, `settingsOpen`, `projectOverrides`
 
-- **Theme subscription** -- watches theme changes, updates `<html>` class for CSS variables.
+- **Theme subscription** -- resolves the shown theme (the Theme tab's hover preview if one is resting, else `resolveTheme(config, systemPrefersDark)`: the hand-picked `theme`, or with `themeFollowsSystem` on, the pair member for the OS side read off `prefers-color-scheme`), swaps the `theme-*` class on `<html>` (no class for `dark`), and mirrors the RESOLVED committed theme, never a preview, to `localStorage` to seed the next launch's FOUC guard. A media-query listener keeps `systemPrefersDark` live, so a follow-system install repaints when the OS flips with no restart or config write.
 - **App version** -- `loadAppVersion()` fetches the Electron app version via IPC.
 - **Agent inventory** - `loadAgentList()` probes every registered agent adapter and returns per-agent found/path/version/displayName (`AgentDetectionInfo[]`); consumers look up their own agent's entry rather than reading a single Claude-only detection result.
 - **Git detection** -- `detectGit()` checks for git installation, version, and minimum version requirement.
@@ -801,13 +836,43 @@ On project open (`src/main/transition-engine/session-startup/`):
 
 - **WebGL xterm with an attachment budget** - attempts the WebGL renderer first and recovers from context loss on a retry schedule of 2s, 10s, 30s, 30s, 60s and then every 120s, with no permanent fallback. The tail is sized to outlast Chromium's 3D-API block: after a second GPU-process crash within two minutes Chromium refuses WebGL for the page's domain until the older crash entry ages out, up to 120s later, so the old two-retry ladder always failed in exactly the case it ran in (Sentry DESKTOP-T). A terminal on the DOM renderer that is not budget-suspended always has a retry armed (`retryArmed` and `failedAttempts` in the renderer report). Live WebGL attachments are capped at `WEBGL_ATTACH_BUDGET` (8) page-wide, below Chromium's ~16-context limit: a coordinator (`useFocusedSessionsSync`) keeps the most-recently-focused terminal windows on WebGL and temporarily suspends the rest to the DOM renderer (`suspendedByBudget` in the renderer report - not a context loss, does not advance the retry schedule), re-attaching on focus (`src/renderer/utils/terminal-webgl.ts`, `terminal-visibility.ts`). The coordinator applies that plan BEFORE it publishes the parked set: swapping the renderer changes the cell metric a fit divides by, and a revealed terminal fits itself synchronously, so a fit taken on a renderer the terminal is about to stop using sizes the grid wrong (see the fit-on-the-renderer-you-keep bullet in [session-lifecycle.md](session-lifecycle.md))
 - **Parked-window write gating** - a terminal window that is off-view (board layer parked on the Backlog view, or occluded by a maximized same-layer window) leaves the focused-session set, so main stops emitting its PTY data at the source; any stragglers are acked-and-dropped by the renderer queue (never parsed, never wedging backpressure). On reveal the terminal repaints from the scrollback ring via `reloadScrollback` (`src/renderer/utils/parked-terminals.ts`, `focused-sessions.ts`). Reveal is the narrow edge: a session can leave the focused set without being parked at all (a detail window a detached monitor owns, a hidden panel, a closed command bar over a transient), so `src/renderer/utils/focused-terminals.ts` repaints on the wider unfocused-to-focused edge too. See the focus-edge catch-up bullet in [session-lifecycle.md](session-lifecycle.md) for the mechanism
-- **Serialized terminal construction** - building an xterm (construct + `open` + WebGL context + fit) costs ~75ms, peaking at 130ms, of which the WebGL context alone is 13-29ms on a COLD first context and 7.4-9.6ms once the GPU process is warm (a real session opens warm far more often than cold, so the unqualified range overstated the steady state). A later phase-split pass over that same measurement - the dev-only `init-timing` renderer trace emitted from `initTerminal` (`src/renderer/hooks/useTerminal.ts`) - puts construct plus WebGL context together at 82-87% of the synchronous beat (median 84%), leaving the fit as the small remainder; that split is the ceiling on what reusing a terminal across an ownership handoff could ever save, since the fit is per-host and has to run either way. Each host defers its own init by a frame, but that is the SAME frame for every host mounting in one commit, so a burst (dragging a batch of tasks into a spawning column, restoring a workspace) compounded into a single multi-hundred-ms block with no paint and no input. `src/renderer/utils/terminal-init-queue.ts` runs at most one construction per animation frame, FIFO. It does not reduce the work, it caps the longest single block at one terminal's cost so input keeps being processed between them; a lone terminal still inits on the very next frame. Measured with `kangentic_devtools_event_loop_lag`'s long-frame ring, which is where the ~75ms figure comes from
+- **Serialized terminal construction** - building an xterm (construct + `open` + WebGL context + fit) costs ~75ms, peaking at 130ms, of which the WebGL context alone is 13-29ms on a COLD first context and 7.4-9.6ms once the GPU process is warm (a real session opens warm far more often than cold, so the unqualified range overstated the steady state). A later phase-split pass over that same measurement - the dev-only `init-timing` renderer trace emitted from `initTerminal` (`src/renderer/hooks/useTerminal.ts`) - puts construct plus WebGL context together at 82-87% of the synchronous beat (median 84%), leaving the fit as the small remainder; that split is the ceiling on what reusing a terminal across an ownership handoff could ever save, since the fit is per-host and has to run either way. Each host defers its own init by a frame, but that is the SAME frame for every host mounting in one commit, so a burst (dragging a batch of tasks into a spawning column, restoring a workspace) compounded into a single multi-hundred-ms block with no paint and no input. `src/renderer/utils/terminal-init-queue.ts` runs at most one construction per animation frame, FIFO. It does not reduce the work, it caps the longest single block at one terminal's cost so input keeps being processed between them; a lone terminal still inits on the very next frame. Measured with `kangentic_devtools_event_loop_lag`'s long-frame ring, which is where the ~75ms figure comes from. The queue also holds every construction for the length of a board card drag (the coalescer's `isBoardDragActive`, resumed via `onBoardDragEnd` one frame after the drop frame): the 2026-09-16 drag audit measured a construction at 21 to 42ms on the production build, which is 3 to 6 refresh periods at 144Hz, and the pane a drop spawns mounts while the user is already dragging the next card of a batch. Only construction is held; the xterm write queue streams through a drag on purpose (see [board-drag-perf-audit.md](board-drag-perf-audit.md))
 - **Resize debouncing** -- PTY resize calls debounced at 200ms, suppressed during panel drag
 - **Repaint-settled scrollback** - after a geometry-changing resize (cols or rows), `getScrollback` waits for the agent TUI's async repaint to land before sampling, so a restored terminal never replays a frame drawn for a stale geometry; while the agent is actively streaming (never quiesces) the wait settles early on the post-resize repaint marker instead of burning the max-wait ceiling, and a marker-less repaint (Claude's idle default renderer redraws without a full-screen erase) settles on its quiesce once the marker-arrival window has passed rather than riding the whole ceiling (see [session-lifecycle](session-lifecycle.md))
 - **Activity log** -- plain DOM list instead of xterm. Events flow through JSONL files, not terminal output.
 - **Terminal ownership handoff** -- one xterm instance per session at a time prevents duplicate resize calls that corrupt TUI output. Enforced ACROSS renderers, not just within one: main pushes `detail:remoteOwners` (per-recipient, own claims filtered out) so the bottom panel yields its terminal to a detail hosted in the detached Agent Monitor. Without it the panel and the pop-out each mounted an xterm on the same PTY and fitted it to two different widths.
 - **Output batching** -- 16ms flush interval prevents per-character IPC overhead
 - **Scrollback cap** -- 512KB prevents unbounded memory growth
+
+## Automation Adapters
+
+`src/main/automations/`
+
+One folder per automation type, mirroring `src/main/boards/` and `src/main/pr/`. The registry
+dispatches by type, so the transition engine, the IPC handlers and the renderer contain no
+per-type branching.
+
+```
+src/main/automations/
+  shared/
+    automation-adapter.ts   # AutomationAdapter contract + AutomationContext
+    automation-errors.ts    # the typed failures a run records
+  adapters/
+    send-message/           # deliver the column's message to the agent
+    run-script/             # child process in the task's worktree, awaits the exit
+    webhook/                # request with retry, idempotency key, response.ok check
+    notify/                 # one desktop notification
+    legacy/spawn-agent.ts   # status 'legacy', never offered for a new automation
+  automation-registry.ts    # AutomationRegistry + automationRegistry singleton
+  automation-runner.ts      # per-row isolation, timeouts, and the automation_runs record
+  automation-run-outcome.ts # rationed failure push to the renderer
+  interpolate-config.ts     # per-field escaping from the manifest's `escape`
+  column-message.ts         # which row is the column's message, for the profile overlay
+```
+
+The manifest (`src/shared/automation-manifest.ts`) is renderer-safe and holds each type's label,
+description, icon name, `needs`, fields, timeout and retry policy.
+`tests/unit/automation-adapter-parity.test.ts` fails if the registry and the manifest disagree.
 
 ## Board Adapters
 
@@ -882,7 +947,7 @@ Phase 1 (shipped) covers identity/roster/pairing/transport and the deny-by-defau
 - [Agent Integration](agent-integration.md) -- Adapter interface, per-agent CLI details, permission modes, hooks, trust
 - [Board Integration](board-integration.md) -- BoardAdapter interface, registry, how to add a new provider
 - [Mobile Bridge](mobile-bridge.md) - Pairing ceremony, signed device roster, capability verbs, relay transport
-- [Transition Engine](transition-engine.md) -- Action types, templates, priority rules
+- [Transition Engine](transition-engine.md) -- Automation adapters, triggers, template variables, priority rules
 - [Database](database.md) -- Full schema reference, migrations, repository pattern
 - [Configuration](configuration.md) -- Config cascade, all settings keys
 - [Cross-Platform](cross-platform.md) -- Shell resolution, path handling, packaging

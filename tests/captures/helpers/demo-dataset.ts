@@ -43,6 +43,39 @@ export interface DemoChangesMap {
   [sessionId: string]: DemoDiff;
 }
 
+/** One commit of a scaffolded project's history, in git:commitGraph's shape. */
+export interface DemoHistoryCommit {
+  hash: string;
+  shortHash: string;
+  parents: string[];
+  authorName: string;
+  authorTimestamp: string;
+  subject: string;
+}
+
+export interface DemoBlameLine {
+  line: number;
+  hash: string;
+  shortHash: string;
+  author: string;
+  date: string;
+}
+
+/**
+ * The git history behind a scaffolded project, as scripts/capture-demo-history.mjs reads it out
+ * of the repo the capture matrix records against: commits newest first, the diff each commit
+ * introduces, and the blame of every file a recorded session modified (its recorded working
+ * tree applied uncommitted, so the agent's own lines blame as uncommitted).
+ */
+export interface DemoHistory {
+  project: string;
+  branch: string;
+  tipHash: string;
+  commits: DemoHistoryCommit[];
+  diffs: Record<string, DemoDiff>;
+  blame: Record<string, Record<string, { lines: DemoBlameLine[] }>>;
+}
+
 interface DemoProjectGroup {
   id: string;
   name: string;
@@ -60,6 +93,11 @@ interface DemoProject {
   position: number;
   lastOpenedMinutesAgo: number;
   createdDaysAgo: number;
+  /** The project's Browser default URL (Settings, Browser): where a task's Browser pane opens. */
+  dev_url?: string;
+  /** A page under demo/guest/ that is what the project renders at `dev_url`, for the web build's
+   *  iframe stand-in of the desktop's webview (demo/webview-shim.js). */
+  guest_page?: string;
 }
 
 interface DemoLane {
@@ -147,6 +185,11 @@ export const GROUP_CONTOSO = 'group-contoso';
 export const GROUP_OSS = 'group-open-source';
 
 export const TASK_MIDDLEWARE = 'task-cw-middleware';
+// The other tasks a scene names: the second working session (tiled beside the middleware
+// window), the Planning card a drag scene lifts, and the To Do card a context-menu scene opens on.
+export const TASK_API_CLIENT = 'task-cw-api-client';
+export const TASK_WEBSOCKET = 'task-cw-websocket';
+export const TASK_AUTH = 'task-cw-auth';
 export const SESSION_WEBSOCKET = 'sess-cw-websocket';
 export const SESSION_MIDDLEWARE = 'sess-cw-middleware';
 export const SESSION_API_CLIENT = 'sess-cw-api-client';
@@ -179,7 +222,9 @@ export const DEMO_GROUPS: DemoProjectGroup[] = [
 ];
 
 export const DEMO_PROJECTS: DemoProject[] = [
-  { id: PROJECT_CONTOSO, name: 'contoso-web', path: `${HOME}\\work\\contoso-web`, github_url: 'https://github.com/contoso/contoso-web', default_agent: 'claude', group_id: GROUP_CONTOSO, position: 0, lastOpenedMinutesAgo: 2, createdDaysAgo: 140 },
+  // The dev URL is the scaffold's own Vite port (its `dev` script, which the Command Terminal
+  // recording lists); the guest page is what src/App.tsx renders there.
+  { id: PROJECT_CONTOSO, name: 'contoso-web', path: `${HOME}\\work\\contoso-web`, github_url: 'https://github.com/contoso/contoso-web', default_agent: 'claude', group_id: GROUP_CONTOSO, position: 0, lastOpenedMinutesAgo: 2, createdDaysAgo: 140, dev_url: 'http://localhost:5173/', guest_page: 'contoso-web.html' },
   { id: PROJECT_PETCLINIC, name: 'spring-petclinic', path: `${HOME}\\oss\\spring-petclinic`, github_url: 'https://github.com/spring-projects/spring-petclinic', default_agent: 'codex', group_id: GROUP_OSS, position: 1, lastOpenedMinutesAgo: 35, createdDaysAgo: 61 },
   { id: PROJECT_BOUTIQUE, name: 'online-boutique', path: `${HOME}\\oss\\online-boutique`, github_url: 'https://github.com/GoogleCloudPlatform/microservices-demo', default_agent: 'codex', group_id: GROUP_OSS, position: 2, lastOpenedMinutesAgo: 90, createdDaysAgo: 24 },
 ];
@@ -282,11 +327,11 @@ const BOUTIQUE = `${HOME}\\oss\\online-boutique`;
 
 export const DEMO_TASKS: DemoTask[] = [
   // contoso-web
-  { id: 'task-cw-auth', projectId: PROJECT_CONTOSO, display_id: 1, title: 'Add user auth flow', description: 'Implement OAuth2 login with GitHub and Google providers', lane: 'todo', position: 0, agent: null, session_id: null, worktree_folder: null, branch_name: null, pr_number: null, pr_url: null, pr_state: null, pr_merge_readiness: null, base_branch: null, labels: ['feature', 'security'], priority: 2, attachment_count: 1, createdDaysAgo: 3, updatedMinutesAgo: 340 },
+  { id: TASK_AUTH, projectId: PROJECT_CONTOSO, display_id: 1, title: 'Add user auth flow', description: 'Implement OAuth2 login with GitHub and Google providers', lane: 'todo', position: 0, agent: null, session_id: null, worktree_folder: null, branch_name: null, pr_number: null, pr_url: null, pr_state: null, pr_merge_readiness: null, base_branch: null, labels: ['feature', 'security'], priority: 2, attachment_count: 1, createdDaysAgo: 3, updatedMinutesAgo: 340 },
   { id: 'task-cw-api-errors', projectId: PROJECT_CONTOSO, display_id: 2, title: 'Refactor API error handling', description: 'Standardize error responses and add error codes', lane: 'todo', position: 1, agent: null, session_id: null, worktree_folder: null, branch_name: null, pr_number: null, pr_url: null, pr_state: null, pr_merge_readiness: null, base_branch: null, labels: ['refactor'], priority: 1, attachment_count: 0, createdDaysAgo: 5, updatedMinutesAgo: 1500 },
-  { id: 'task-cw-websocket', projectId: PROJECT_CONTOSO, display_id: 3, title: 'Fix WebSocket reconnection', description: 'Handle dropped connections with exponential backoff', lane: 'planning', position: 0, agent: 'claude', session_id: SESSION_WEBSOCKET, worktree_folder: 'fix-websocket-abc123', branch_name: 'fix-websocket-reconnection', pr_number: null, pr_url: null, pr_state: null, pr_merge_readiness: null, base_branch: 'main', labels: ['bug'], priority: 3, attachment_count: 0, createdDaysAgo: 1, updatedMinutesAgo: 4 },
+  { id: TASK_WEBSOCKET, projectId: PROJECT_CONTOSO, display_id: 3, title: 'Fix WebSocket reconnection', description: 'Handle dropped connections with exponential backoff', lane: 'planning', position: 0, agent: 'claude', session_id: SESSION_WEBSOCKET, worktree_folder: 'fix-websocket-abc123', branch_name: 'fix-websocket-reconnection', pr_number: null, pr_url: null, pr_state: null, pr_merge_readiness: null, base_branch: 'main', labels: ['bug'], priority: 3, attachment_count: 0, createdDaysAgo: 1, updatedMinutesAgo: 4 },
   { id: TASK_MIDDLEWARE, projectId: PROJECT_CONTOSO, display_id: 4, title: 'Extract auth middleware', description: 'Move auth logic into reusable Express middleware', lane: 'executing', position: 0, agent: 'claude', session_id: SESSION_MIDDLEWARE, worktree_folder: 'auth-middleware-def456', branch_name: 'extract-auth-middleware', pr_number: null, pr_url: null, pr_state: null, pr_merge_readiness: null, base_branch: 'main', labels: ['refactor'], priority: 2, attachment_count: 0, createdDaysAgo: 2, updatedMinutesAgo: 1 },
-  { id: 'task-cw-api-client', projectId: PROJECT_CONTOSO, display_id: 5, title: 'Generate API client types', description: 'Request and response interfaces for every route in server/routes.ts, and apiFetch generic over them', lane: 'executing', position: 1, agent: 'claude', session_id: SESSION_API_CLIENT, worktree_folder: 'api-types-ghi789', branch_name: 'generate-api-types', pr_number: null, pr_url: null, pr_state: null, pr_merge_readiness: null, base_branch: 'main', labels: ['feature'], priority: 1, attachment_count: 0, createdDaysAgo: 2, updatedMinutesAgo: 12 },
+  { id: TASK_API_CLIENT, projectId: PROJECT_CONTOSO, display_id: 5, title: 'Generate API client types', description: 'Request and response interfaces for every route in server/routes.ts, and apiFetch generic over them', lane: 'executing', position: 1, agent: 'claude', session_id: SESSION_API_CLIENT, worktree_folder: 'api-types-ghi789', branch_name: 'generate-api-types', pr_number: null, pr_url: null, pr_state: null, pr_merge_readiness: null, base_branch: 'main', labels: ['feature'], priority: 1, attachment_count: 0, createdDaysAgo: 2, updatedMinutesAgo: 12 },
   { id: 'task-cw-empty-states', projectId: PROJECT_CONTOSO, display_id: 8, title: 'Onboarding empty states', description: 'First-run screens for the dashboard, projects, and billing pages before any data exists', lane: 'planning', position: 1, agent: null, session_id: SESSION_EMPTY_STATES, worktree_folder: 'empty-states-stu901', branch_name: 'onboarding-empty-states', pr_number: null, pr_url: null, pr_state: null, pr_merge_readiness: null, base_branch: 'main', labels: ['design'], priority: 2, attachment_count: 3, createdDaysAgo: 4, updatedMinutesAgo: 95 },
   { id: 'task-cw-rate-limit', projectId: PROJECT_CONTOSO, display_id: 6, title: 'Add rate limiting', description: 'Implement per-user rate limiting on API endpoints', lane: 'review', position: 0, agent: 'copilot', session_id: SESSION_RATE_LIMIT, worktree_folder: 'rate-limit-jkl012', branch_name: 'add-rate-limiting', pr_number: 42, pr_url: 'https://github.com/contoso/contoso-web/pull/42', pr_state: 'open', base_branch: 'main', labels: ['feature'], priority: 2, attachment_count: 0, createdDaysAgo: 3, updatedMinutesAgo: 22 },
   { id: 'task-cw-integration', projectId: PROJECT_CONTOSO, display_id: 7, title: 'Integration test coverage', description: 'Add integration tests for auth and billing flows', lane: 'testing', position: 0, agent: 'cursor', session_id: SESSION_INTEGRATION, worktree_folder: 'integration-tests-mno345', branch_name: 'integration-tests', pr_number: 38, pr_url: 'https://github.com/contoso/contoso-web/pull/38', pr_state: 'open', pr_merge_readiness: 'blocked', base_branch: 'main', labels: ['tests'], priority: 1, attachment_count: 0, createdDaysAgo: 4, updatedMinutesAgo: 6 },
@@ -381,12 +426,28 @@ export const DEMO_AGENT_OVERRIDES: Record<string, Record<string, unknown>> = {
  * The script the page runs after the mock has loaded. Everything above is inlined as JSON; the
  * only code is the small applier that turns offsets into timestamps and pushes rows.
  */
+/**
+ * The code points that are not one cell wide, as flat [lo, hi, lo, hi, ...] ranges: `wide` for
+ * two cells, `zero` for none. Built by buildCellWidthTable in demo-scrollback.ts from the app's own
+ * width table; the seed's frame applier clips rows by cell with it.
+ */
+export interface DemoCellWidthTable {
+  wide: number[];
+  zero: number[];
+}
+
 export function buildDemoPreConfig(options: {
   scrollback?: DemoScrollbackMap;
   changes?: DemoChangesMap;
   peeks?: Record<string, string[]>;
   ends?: Record<string, { durationMs: number; stopReason: string }>;
   openFrames?: Record<string, { serialized: string; peek: string[] }>;
+  /**
+   * What a still paints for a session whose window mounted at the tiled width (loadDemoTiledFrames):
+   * the tiled recording's final frame, and a working session's opening frame. Only the sessions
+   * the manifest gives a tiled sibling; the rest paint the single recording's frames above.
+   */
+  tiledFrames?: Record<string, { serialized: string; openFrame: { serialized: string; peek: string[] } | null }>;
   peekTimelines?: Record<string, Array<{ t: number; lines: string[] }>>;
   messageTrails?: Record<string, Array<{ t: number; uuid: string; ts: number; text: string }>>;
   /** How many trail lines main keeps per session (MESSAGE_TRAIL_MAX_ENTRIES), so a replay slices as it does. */
@@ -394,6 +455,10 @@ export function buildDemoPreConfig(options: {
   liveTailMs?: number;
   currentProjectId?: string;
   appVersion?: string;
+  /** Cell widths for the frame applier (buildCellWidthTable); every code point outside the ranges is one cell. */
+  cellWidths?: DemoCellWidthTable;
+  /** Each scaffolded project's git history (loadDemoHistory), keyed by project name. */
+  history?: Record<string, DemoHistory>;
 } = {}): string {
   const dataset = {
     groups: DEMO_GROUPS,
@@ -423,6 +488,7 @@ export function buildDemoPreConfig(options: {
   // The frame and Monitor peek at the moment the live frame opens each working session
   // (loadDemoOpenFrames): what a still and the captures show for it.
   const openFrames = options.openFrames ?? {};
+  const tiledFrames = options.tiledFrames ?? {};
   // How each working session's Monitor peek changes as its recording plays (loadDemoPeekTimelines):
   // the motion a Monitor card shows on the desktop, on the recording's own clock.
   const peekTimelines = options.peekTimelines ?? {};
@@ -454,9 +520,12 @@ export function buildDemoPreConfig(options: {
       var changes = ${JSON.stringify(changes)};
       var peeks = ${JSON.stringify(peeks)};
       var openFrames = ${JSON.stringify(openFrames)};
+      var tiledFrames = ${JSON.stringify(tiledFrames)};
       var peekTimelines = ${JSON.stringify(peekTimelines)};
       var messageTrails = ${JSON.stringify(messageTrails)};
       var messageTrailMaxEntries = ${JSON.stringify(messageTrailMaxEntries)};
+      var cellWidths = ${JSON.stringify(options.cellWidths ?? { wide: [], zero: [] })};
+      var history = ${JSON.stringify(options.history ?? {})};
       var now = Date.now();
       function minutesAgo(minutes) { return new Date(now - minutes * 60000).toISOString(); }
       function daysAgo(days) { return minutesAgo(days * 1440); }
@@ -493,7 +562,18 @@ export function buildDemoPreConfig(options: {
         return Math.max(0, duration - tail);
       }
 
+      // An EMPTY install: the welcome screen a first launch lands on. The frame's boot script sets
+      // window.__demoInstall from the scene; nothing but the returning-user markers is seeded, so
+      // the renderer hydrates with no project and mounts the welcome screen, whose agent detection
+      // grid reads the same agent list the sample install reports.
+      var emptyInstall = window.__demoInstall === 'empty';
+
       window.__mockPreConfigure(function (state) {
+        if (emptyInstall) {
+          if (data.appVersion) state.config.lastWhatsNewShownVersion = data.appVersion;
+          mockState = state;
+          return { currentProjectId: null };
+        }
         data.groups.forEach(function (group) {
           state.projectGroups.push({ id: group.id, name: group.name, position: group.position, is_collapsed: group.is_collapsed });
         });
@@ -503,6 +583,11 @@ export function buildDemoPreConfig(options: {
             default_agent: project.default_agent, group_id: project.group_id, position: project.position,
             last_opened: minutesAgo(project.lastOpenedMinutesAgo), created_at: daysAgo(project.createdDaysAgo),
           });
+          // The project's Browser default URL, which every task's Browser pane opens on unless
+          // the task pins its own (Settings, Browser, Default URL).
+          if (project.dev_url) {
+            state.projectConfigs[project.path] = Object.assign({}, state.projectConfigs[project.path], { browser: { defaultUrl: project.dev_url } });
+          }
           (data.lanesByProject[project.id] || []).forEach(function (lane, index) {
             state.swimlanes.push({
               id: 'lane-' + project.id.replace(/^proj-/, '') + '-' + lane.slug,
@@ -574,6 +659,74 @@ export function buildDemoPreConfig(options: {
       }
       window.__mockAgentListOverrides = data.agentOverrides;
 
+      // Dictation needs nothing seeded. The renderer's whole pipeline runs for real on a press
+      // (the hotkey, the mic request the mock grants, the engine start, the audio worklet over
+      // the silent stream demo/boot.js supplies), and the chip shows its live state. What the
+      // engine would transcribe cannot be shown: with the popup experience the words land in
+      // the terminal on release, drawn by the CLI's own echo, and no mock can produce that.
+
+      // Quick Find answers from the sample install itself: a keyword match over the tasks, the
+      // backlog, and each session's events, scoped the way the palette asks (this project or all
+      // of them). The desktop runs FTS5 in main over the same rows; here the rows are the index,
+      // so a visitor's query finds what the desktop's would, ranked title matches first.
+      function searchSnippet(text, query) {
+        var haystack = String(text || '');
+        var at = haystack.toLowerCase().indexOf(query);
+        if (at === -1) return null;
+        var start = Math.max(0, at - 40);
+        var snippet = (start > 0 ? '…' : '') + haystack.slice(start, Math.min(haystack.length, at + query.length + 60));
+        var offset = at - start + (start > 0 ? 1 : 0);
+        return { snippet: snippet, matchStart: offset, matchEnd: offset + query.length };
+      }
+      window.electronAPI.search.everything = function (request) {
+        var query = String((request && request.query) || '').trim().toLowerCase();
+        if (!query || !mockState) return Promise.resolve([]);
+        var scopeProject = request && request.scope === 'all' ? null : (request && request.currentProjectId) || null;
+        var inScope = function (projectId) { return !scopeProject || projectId === scopeProject; };
+        var hits = [];
+        var taskHit = function (task, archived) {
+          if (!inScope(task.projectId)) return;
+          var fromTitle = searchSnippet(task.title, query);
+          var match = fromTitle || searchSnippet(task.description, query);
+          if (!match) return;
+          hits.push({
+            kind: 'task', projectId: task.projectId, projectName: projectsById[task.projectId].name,
+            snippet: match.snippet, matchStart: match.matchStart, matchEnd: match.matchEnd,
+            taskId: task.id, displayId: task.display_id, taskTitle: task.title, archived: archived,
+            snippetField: fromTitle ? 'title' : 'description',
+          });
+        };
+        mockState.tasks.forEach(function (task) { taskHit(task, false); });
+        mockState.archivedTasks.forEach(function (task) { taskHit(task, true); });
+        mockState.backlogTasks.forEach(function (item) {
+          if (!inScope(item.projectId)) return;
+          var fromTitle = searchSnippet(item.title, query);
+          var match = fromTitle || searchSnippet(item.description, query);
+          if (!match) return;
+          hits.push({
+            kind: 'backlog', projectId: item.projectId, projectName: projectsById[item.projectId].name,
+            snippet: match.snippet, matchStart: match.matchStart, matchEnd: match.matchEnd,
+            backlogId: item.id, backlogTitle: item.title, snippetField: fromTitle ? 'title' : 'description',
+          });
+        });
+        mockState.sessions.forEach(function (session) {
+          if (!session.taskId || !inScope(session.projectId)) return;
+          var task = tasksById[session.taskId];
+          if (!task) return;
+          (mockState.eventCache[session.id] || []).forEach(function (event) {
+            var match = searchSnippet((event.tool || '') + ' ' + (event.detail || ''), query);
+            if (!match) return;
+            hits.push({
+              kind: 'session_event', projectId: session.projectId, projectName: projectsById[session.projectId].name,
+              snippet: match.snippet, matchStart: match.matchStart, matchEnd: match.matchEnd,
+              taskId: task.id, taskTitle: task.title, sessionId: session.id, agentName: task.agent || projectsById[session.projectId].default_agent,
+              eventTs: event.ts, eventKey: session.id + ':' + event.ts, eventType: event.type,
+            });
+          });
+        });
+        return Promise.resolve(hits);
+      };
+
       // Monitor rows are DERIVED from the sessions so the two views cannot disagree. The output
       // peek is the recording's own last lines as the terminal displays them (rendered at build
       // time by loadDemoPeeks), or for a working session the lines at the moment the frame opens
@@ -583,7 +736,7 @@ export function buildDemoPreConfig(options: {
         if (open) return open.peek;
         return peeks[session.id] || session.peek;
       }
-      window.__mockMonitorRows = data.sessions.map(function (session) {
+      window.__mockMonitorRows = (emptyInstall ? [] : data.sessions).map(function (session) {
         var project = projectsById[session.projectId];
         var task = session.taskId ? tasksById[session.taskId] : null;
         return {
@@ -640,9 +793,26 @@ export function buildDemoPreConfig(options: {
       var replays = {};
       var recordingCache = {};
       var replayTimers = {};
+      // An index entry names the recording file and the grid it was made at (demo/vite.config.mts);
+      // the grid rides on the replay entry so a terminal's first resize can be answered before
+      // the file is fetched.
+      function gridOf(indexed) { return { cols: indexed.cols, rows: indexed.rows }; }
+      function seededSession(sessionId) {
+        for (var index = 0; index < data.sessions.length; index++) if (data.sessions[index].id === sessionId) return data.sessions[index];
+        return null;
+      }
       data.sessions.forEach(function (session) {
         if (!recordings || !recordings.sessions[session.id]) return;
-        replays[session.id] = { file: recordings.sessions[session.id], startedAt: null, tail: session.activity === 'thinking' ? (session.liveTailMs || LIVE_TAIL_MS) : 0, projectId: session.projectId };
+        var indexed = recordings.sessions[session.id];
+        // A session the manifest also recorded at the tiled width carries both layouts, the way
+        // a Command Terminal boot does (spawnTransient below); the width its window mounts at
+        // picks one (layoutFor).
+        replays[session.id] = {
+          file: indexed.file, grid: gridOf(indexed), startedAt: null,
+          tail: session.activity === 'thinking' ? (session.liveTailMs || LIVE_TAIL_MS) : 0,
+          projectId: session.projectId,
+          layouts: indexed.tiled ? { single: indexed, tiled: indexed.tiled } : null,
+        };
       });
       function fetchRecording(file) {
         if (!recordingCache[file]) {
@@ -772,9 +942,9 @@ export function buildDemoPreConfig(options: {
             if (entry.frameOnly) {
               // This terminal plays frames, not bytes: re-arm the same timeline and repaint it
               // at the moment the cycle opens on.
-              var cols = mountedGeometry[sessionId] ? mountedGeometry[sessionId].cols : 0;
-              var current = scheduleFrameTimeline(sessionId, entry, recording, cols);
-              emitBytes(sessionId, REPAINT + fitFrameToCols(current || (open ? open.serialized : recording.serialized), cols), entry.projectId);
+              var grid = mountedGeometry[sessionId];
+              var current = scheduleFrameTimeline(sessionId, entry, recording, grid);
+              emitBytes(sessionId, REPAINT + fitFrameToGrid(current || (open ? open.serialized : recording.serialized), grid, recording.rows), entry.projectId);
             } else {
               emitBytes(sessionId, REPAINT + (open ? open.serialized : ''), entry.projectId);
               scheduleStreamBytes(sessionId, entry, recording);
@@ -785,10 +955,38 @@ export function buildDemoPreConfig(options: {
         }
         scheduleSessionClock(sessionId, entry, clock);
       }
-      /** Queue the chunks still ahead of the session's clock, and return the ones already behind it. */
+      // A session's clock is its SINGLE recording's: the seed starts it at page open from
+      // data.ends, and the card, the sidebar count, and the Monitor all end on it. A terminal that
+      // mounted at the tiled width plays the session's tiled recording, a second run of the same
+      // prompt with its own length, so that recording's bytes and frames are laid on the session
+      // clock shifted to START where the session's clock does: the variant plays from its first
+      // byte at the moment the session's clock began, the terminal shows however far that run has
+      // got, and a variant shorter than the stretch already elapsed has finished, so the terminal
+      // opens on its final frame and stays there while the session's clock runs on, exactly as
+      // the still paints it (loadDemoTiledFrames). Without the shift the variant re-based the
+      // clock on its own length, and a session the board showed as working flipped to needs-you
+      // the moment a narrow window opened on it. A session the seed did not clock (a spawn, a
+      // Command Terminal boot) has no data.ends entry and plays its own recording unshifted.
+      function sessionDurationMs(sessionId, recording) {
+        var end = data.ends[sessionId];
+        if (end && typeof end.durationMs === 'number') return end.durationMs;
+        var last = recording.stream[recording.stream.length - 1];
+        return last ? last.t : 0;
+      }
+      function recordingEndMs(recording) {
+        var last = recording.stream[recording.stream.length - 1];
+        return last ? last.t : 0;
+      }
+      /**
+       * Queue the chunks still ahead of the session's clock, and return the ones already behind
+       * it. A recording that has ENDED behind the clock (its last chunk is behind it, which is
+       * where a tiled variant shorter than the session's elapsed stretch sits) returns its final
+       * frame rather than the whole stream: the frame is the same picture, at a tenth of the bytes.
+       */
       function scheduleStreamBytes(sessionId, entry, recording) {
         if (!replayTimers[sessionId]) replayTimers[sessionId] = [];
         var elapsed = Date.now() - entry.startedAt;
+        if (recordingEndMs(recording) <= elapsed && typeof recording.serialized === 'string') return recording.serialized;
         var head = '';
         recording.stream.forEach(function (chunk) {
           if (chunk.t <= elapsed) { head += chunk.data; return; }
@@ -797,13 +995,14 @@ export function buildDemoPreConfig(options: {
         return head;
       }
       // A terminal on any other grid plays the recording's FRAMES instead of its bytes. A frame
-      // reflows where a stream cannot, so the same recording is live at any size: the 15-row
+      // is physical rows, so it fits any size without a row spilling into the next: the 15-row
       // bottom panel shows the last 15 rows of a 37-row frame, which is what a terminal scrolled
-      // to the bottom shows anyway, and a display scaled to 125 percent gets the frame fitted to
-      // its width. Each entry replaces the screen rather than appending, so the terminal never
-      // grows and the repaint is one screen of bytes.
-      var REPAINT = '\\x1b[2J\\x1b[3J\\x1b[H';
-      function scheduleFrameTimeline(sessionId, entry, recording, cols) {
+      // to the bottom shows anyway, and a narrower grid gets each row cut at its edge. Each entry
+      // replaces the screen rather than appending, so the terminal never grows and the repaint is
+      // one screen of bytes. The repaint leaves the alternate screen first: an alt frame enters it
+      // again itself, and a normal one must not land in the alt buffer the previous tick left.
+      var REPAINT = '\\x1b[?1049l\\x1b[2J\\x1b[3J\\x1b[H';
+      function scheduleFrameTimeline(sessionId, entry, recording, grid) {
         if (!replayTimers[sessionId]) replayTimers[sessionId] = [];
         var timeline = recording.frameTimeline || [];
         var elapsed = Date.now() - entry.startedAt;
@@ -811,15 +1010,14 @@ export function buildDemoPreConfig(options: {
         timeline.forEach(function (step) {
           if (step.t <= elapsed) { current = step.frame; return; }
           replayTimers[sessionId].push(setTimeout(function () {
-            emitBytes(sessionId, REPAINT + fitFrameToCols(step.frame, cols), entry.projectId);
+            emitBytes(sessionId, REPAINT + fitFrameToGrid(step.frame, grid, recording.rows), entry.projectId);
           }, Math.max(0, entry.startedAt + step.t - Date.now())));
         });
         return current;
       }
       function liveScrollback(sessionId, entry) {
         return fetchRecording(entry.file).then(function (recording) {
-          var last = recording.stream[recording.stream.length - 1];
-          var duration = last ? last.t : 0;
+          var duration = sessionDurationMs(sessionId, recording);
           if (entry.startedAt === null) {
             // A pre-seeded working session has been running for a while: everything but its
             // last stretch is already scrollback, and that stretch streams from here.
@@ -865,107 +1063,239 @@ export function buildDemoPreConfig(options: {
       // reflows in a different grid, and the session stays on it there: a live stream cannot be
       // re-laid out without the CLI.
       var mountedGeometry = {};
-      // A frame serialized at the recording's width still holds rows the CLI drew to that width
-      // with characters: rules of box-drawing glyphs, bands of styled spaces. On a narrower grid
-      // those wrap into a stub row and push the frame's cursor a row down, where the desktop's
-      // CLI would have drawn them to the new width. Cut such trailing runs at the grid's width;
-      // a row that carries real text past it is left to wrap, as text does anywhere.
-      // Two things overrun a narrower grid: a right-aligned tail the CLI placed with a
-      // cursor-forward sized to its own width (Claude's "/rc" at the footer's edge), and rules or
-      // bands drawn to that width. The gap shrinks first, so the tail ends at this width as the CLI
-      // would align it; then trailing rule glyphs and spaces are cut. Real text past the width is
-      // left to wrap. The serializer's final cursor move is relative to the frame's bottom, so a
-      // row that no longer wraps below the cursor is what keeps the cursor on its row.
-      var FRAME_SEQUENCE = /^\x1b\\[[0-9;?]*[A-Za-z]/;
-      var CURSOR_FORWARD = /^\x1b\\[(\\d*)C$/;
-      var RULE_OR_SPACE = /[ ─-╿]/;
-      // Box drawing AND block elements: Claude rules with ─, Copilot borders with ┃, and Codex
-      // draws its input band with ▄ and ▀, which sit past the box-drawing range.
-      var RULE_GLYPH = /[\\u2500-\\u259F]/;
-      function fitFrameToCols(frame, cols) {
-        if (!cols) return frame;
-        return frame.split('\\r\\n').map(function (row) {
-          var tokens = [];
-          var index = 0;
-          while (index < row.length) {
-            if (row.charAt(index) === '\x1b') {
-              var match = FRAME_SEQUENCE.exec(row.slice(index));
-              var sequence = match ? match[0] : row.charAt(index);
-              var forward = CURSOR_FORWARD.exec(sequence);
-              tokens.push(forward ? { forward: Math.max(1, parseInt(forward[1] || '1', 10)) } : { sequence: sequence });
-              index += sequence.length;
-            } else {
-              var end = row.indexOf('\x1b', index);
-              if (end === -1) end = row.length;
-              tokens.push({ text: row.slice(index, end) });
-              index = end;
-            }
+      // A frame is PHYSICAL rows (scripts/lib/demo-frame-serializer.js): one row per recorded
+      // row, each self-contained, joined with \\r\\n, behind the alt-screen switch when the
+      // recording was on the alternate screen, and ending in one absolute cursor position for
+      // the recorded grid. Fitting it to the mounted grid is then row by row:
+      //
+      // - A row wider than the grid is CUT at the grid's edge, never left to wrap. A CLI would
+      //   have re-laid its prose out at this width; a wrap mid-word is what nothing would draw.
+      //   A right-aligned tail the CLI placed with a cursor-forward sized to its own width
+      //   (Claude's "/rc" at the footer's edge, Copilot's timing beside its border) is pulled in
+      //   first by shrinking that gap, so it ends at this edge as the CLI would align it.
+      // - A row narrower than the grid that ends in a HORIZONTAL rule glyph is extended with
+      //   that glyph, so the frame's lines reach the edge the way the desktop drew them. Only
+      //   horizontal glyphs: a vertical bar extended sideways is a stripe, which is exactly what
+      //   Copilot's right border became. Gaps are never grown: a box border followed by a
+      //   one-cell gap and a sentence would put the sentence at the right margin.
+      // - Widths are counted in CELLS from the app's own table (cellWidths), so a wide glyph
+      //   cuts where the terminal will put it. Autowrap is off while the rows are written, so a
+      //   cell the two still disagree on overwrites the last column instead of wrapping.
+      // - The cursor is recomputed for the mounted row count: a 37-row frame in a 15-row panel
+      //   scrolls 22 rows up, and the cursor's row moves with them.
+      var FRAME_SEQUENCE = /^\\x1b\\[[0-9;?]*[A-Za-z]/;
+      var CURSOR_FORWARD = /^\\x1b\\[(\\d*)C$/;
+      var ERASE_CHARS = /^\\x1b\\[(\\d*)X$/;
+      var ALT_PREFIX = '\\x1b[?1049h\\x1b[H';
+      var CURSOR_SUFFIX = /\\x1b\\[(\\d+);(\\d+)H$/;
+      var HORIZONTAL_RULE_GLYPHS = '\\u2500\\u2501\\u2504\\u2505\\u2508\\u2509\\u254C\\u254D\\u2550\\u2574\\u2576\\u2578\\u257A\\u257C\\u257E\\u2580\\u2581\\u2582\\u2583\\u2584\\u2585\\u2586\\u2587\\u2588\\u2594';
+      function inRanges(ranges, codepoint) {
+        var low = 0;
+        var high = ranges.length / 2 - 1;
+        while (low <= high) {
+          var middle = (low + high) >> 1;
+          if (codepoint < ranges[middle * 2]) high = middle - 1;
+          else if (codepoint > ranges[middle * 2 + 1]) low = middle + 1;
+          else return true;
+        }
+        return false;
+      }
+      function cellWidth(codepoint) {
+        if (inRanges(cellWidths.zero, codepoint)) return 0;
+        if (inRanges(cellWidths.wide, codepoint)) return 2;
+        return 1;
+      }
+      function textWidth(text) {
+        var width = 0;
+        for (var index = 0; index < text.length; index++) {
+          var codepoint = text.codePointAt(index);
+          if (codepoint > 0xffff) index++;
+          width += cellWidth(codepoint);
+        }
+        return width;
+      }
+      // The longest prefix of the text that is at most the given number of cells wide; a wide
+      // glyph that would straddle the edge is left out.
+      function clipText(text, cells) {
+        var width = 0;
+        var index = 0;
+        while (index < text.length) {
+          var codepoint = text.codePointAt(index);
+          var advance = codepoint > 0xffff ? 2 : 1;
+          var glyphWidth = cellWidth(codepoint);
+          if (width + glyphWidth > cells) break;
+          width += glyphWidth;
+          index += advance;
+        }
+        return { text: text.slice(0, index), width: width };
+      }
+      function tokenizeRow(row) {
+        var tokens = [];
+        var index = 0;
+        while (index < row.length) {
+          if (row.charAt(index) === '\\x1b') {
+            var match = FRAME_SEQUENCE.exec(row.slice(index));
+            var sequence = match ? match[0] : row.charAt(index);
+            var forward = CURSOR_FORWARD.exec(sequence);
+            var erase = ERASE_CHARS.exec(sequence);
+            if (forward) tokens.push({ forward: Math.max(1, parseInt(forward[1] || '1', 10)) });
+            else if (erase) tokens.push({ erase: Math.max(1, parseInt(erase[1] || '1', 10)) });
+            else tokens.push({ sequence: sequence });
+            index += sequence.length;
+          } else {
+            var end = row.indexOf('\\x1b', index);
+            if (end === -1) end = row.length;
+            tokens.push({ text: row.slice(index, end) });
+            index = end;
           }
-          function render() {
-            return tokens.map(function (token) {
-              if (token.text !== undefined) return token.text;
-              if (token.forward !== undefined) return token.forward > 0 ? '\x1b[' + token.forward + 'C' : '';
-              return token.sequence;
-            }).join('');
+        }
+        return tokens;
+      }
+      function renderTokens(tokens) {
+        return tokens.map(function (token) {
+          if (token.text !== undefined) return token.text;
+          if (token.forward !== undefined) return token.forward > 0 ? '\\x1b[' + token.forward + 'C' : '';
+          if (token.erase !== undefined) return token.erase > 0 ? '\\x1b[' + token.erase + 'X' : '';
+          return token.sequence;
+        }).join('');
+      }
+      function rowWidth(tokens) {
+        return tokens.reduce(function (sum, token) {
+          if (token.text !== undefined) return sum + textWidth(token.text);
+          if (token.forward !== undefined) return sum + token.forward;
+          return sum;
+        }, 0);
+      }
+      // An erase reaches from the cursor to its count, so one past the edge is clamped to the
+      // cells left, wherever the row's width otherwise lands.
+      function clampErases(tokens, cols) {
+        var position = 0;
+        var changed = false;
+        tokens.forEach(function (token) {
+          if (token.text !== undefined) position += textWidth(token.text);
+          else if (token.forward !== undefined) position += token.forward;
+          else if (token.erase !== undefined && token.erase > cols - position) {
+            token.erase = Math.max(0, cols - position);
+            changed = true;
           }
-          var excess = tokens.reduce(function (sum, token) { return sum + (token.text !== undefined ? token.text.length : token.forward || 0); }, 0) - cols;
-          if (excess === 0) return row;
-          // WIDER than the recording. A CLI draws its rules and bands to the width it was given,
-          // so on a wider grid they stop short and the frame reads as though it fills only part of
-          // the terminal. A rule is the one run that can honestly be stretched: extend it with its
-          // own glyph, and the frame's horizontal lines reach the edge the way the desktop drew
-          // them. Nothing else is touched. A cursor-forward gap in particular must NOT be grown:
-          // the serializer emits one at every point it joined a wrapped row, so widening gaps
-          // shoves the continuation of a sentence out to the right margin. The CLI chose its wrap
-          // points at the recorded width, and only the CLI could re-wrap that prose.
-          if (excess < 0) {
-            var deficit = -excess;
-            for (var grow = tokens.length - 1; grow >= 0; grow--) {
-              var end = tokens[grow];
-              if (end.sequence !== undefined) continue;
-              if (end.text === undefined || end.text.length === 0) break;
-              var glyph = end.text.charAt(end.text.length - 1);
-              if (!RULE_GLYPH.test(glyph)) break;
-              var run = '';
-              while (run.length < deficit) run += glyph;
-              end.text += run;
-              return render();
-            }
-            return row;
+        });
+        return changed;
+      }
+      function fitRow(row, cols) {
+        var tokens = tokenizeRow(row);
+        var erasesClamped = clampErases(tokens, cols);
+        var width = rowWidth(tokens);
+        if (width === cols) return erasesClamped ? renderTokens(tokens) : row;
+        if (width < cols) {
+          // Only a row whose LAST painted thing is a horizontal rule glyph is stretched.
+          for (var last = tokens.length - 1; last >= 0; last--) {
+            var end = tokens[last];
+            if (end.sequence !== undefined) continue;
+            if (end.text === undefined || end.text.length === 0) break;
+            var glyph = end.text.charAt(end.text.length - 1);
+            if (HORIZONTAL_RULE_GLYPHS.indexOf(glyph) === -1) break;
+            var run = '';
+            while (run.length < cols - width) run += glyph;
+            end.text += run;
+            return renderTokens(tokens);
           }
-          for (var gap = tokens.length - 1; gap >= 0 && excess > 0; gap--) {
-            if (tokens[gap].forward === undefined) continue;
-            var shrink = Math.min(excess, tokens[gap].forward - 1);
-            tokens[gap].forward -= shrink;
-            excess -= shrink;
+          return erasesClamped ? renderTokens(tokens) : row;
+        }
+        // NARROWER. Pull a right-aligned tail in by shrinking the gaps before it, last gap first,
+        // each down to one cell; then cut whatever still overruns at the edge.
+        var excess = width - cols;
+        for (var gap = tokens.length - 1; gap >= 0 && excess > 0; gap--) {
+          if (tokens[gap].forward === undefined) continue;
+          var shrink = Math.min(excess, tokens[gap].forward - 1);
+          tokens[gap].forward -= shrink;
+          excess -= shrink;
+        }
+        if (excess === 0) return renderTokens(tokens);
+        var kept = [];
+        var used = 0;
+        var cut = false;
+        for (var index = 0; index < tokens.length; index++) {
+          var token = tokens[index];
+          if (token.sequence !== undefined) { kept.push(token); continue; }
+          var room = cols - used;
+          if (token.erase !== undefined) {
+            if (room > 0) kept.push({ erase: Math.min(token.erase, room) });
+            continue;
           }
-          for (var tail = tokens.length - 1; tail >= 0 && excess > 0; tail--) {
-            var token = tokens[tail];
-            if (token.sequence !== undefined) continue;
-            if (token.forward !== undefined) { var drop = Math.min(excess, token.forward); token.forward -= drop; excess -= drop; continue; }
-            var keep = token.text.length;
-            while (keep > 0 && excess > 0 && RULE_OR_SPACE.test(token.text.charAt(keep - 1))) { keep -= 1; excess -= 1; }
-            token.text = token.text.slice(0, keep);
-            if (excess > 0) return row;
+          if (room <= 0) { cut = true; break; }
+          if (token.forward !== undefined) {
+            var forward = Math.min(token.forward, room);
+            kept.push({ forward: forward });
+            used += forward;
+            if (forward < token.forward) { cut = true; break; }
+            continue;
           }
-          return render();
-        }).join('\\r\\n');
+          var textCells = textWidth(token.text);
+          if (textCells <= room) { kept.push(token); used += textCells; continue; }
+          var clipped = clipText(token.text, room);
+          kept.push({ text: clipped.text });
+          used += clipped.width;
+          cut = true;
+          break;
+        }
+        // The dropped tail may have carried the row's reset; every clipped row gets one.
+        if (cut) kept.push({ sequence: '\\x1b[0m' });
+        return renderTokens(kept);
+      }
+      function fitFrameToGrid(frame, grid, recordedRows) {
+        if (!grid || !grid.cols || !grid.rows) return frame;
+        var alt = frame.indexOf(ALT_PREFIX) === 0;
+        var body = alt ? frame.slice(ALT_PREFIX.length) : frame;
+        var cursor = CURSOR_SUFFIX.exec(body);
+        var rows = (cursor ? body.slice(0, cursor.index) : body).split('\\r\\n').map(function (row) { return fitRow(row, grid.cols); });
+        var fitted = (alt ? ALT_PREFIX : '') + '\\x1b[?7l' + rows.join('\\r\\n') + '\\x1b[?7h';
+        if (!cursor) return fitted;
+        // The suffix is screen-relative for the RECORDED row count; back to the frame's own row,
+        // then to the screen row the mounted terminal shows it on. A cursor scrolled off the top
+        // is left where the rows put it.
+        var frameRow = parseInt(cursor[1], 10) - 1 + Math.max(0, rows.length - (recordedRows || rows.length));
+        var screenRow = frameRow - Math.max(0, rows.length - grid.rows);
+        if (screenRow < 0) return fitted;
+        return fitted + '\\x1b[' + (screenRow + 1) + ';' + Math.max(1, Math.min(grid.cols, parseInt(cursor[2], 10))) + 'H';
       }
       function geometryFits(sessionId, recording) {
         var geometry = mountedGeometry[sessionId];
         if (!geometry || !recording.cols || !recording.rows) return true;
         return geometry.cols === recording.cols && geometry.rows === recording.rows;
       }
-      function layoutFileFor(entry, cols) {
-        // A boot recorded for each layout its window can open in: the one for this width.
-        var singleCols = recordings && recordings.geometry && recordings.geometry.commandTerminal ? recordings.geometry.commandTerminal.cols : null;
-        if (!entry.layouts || !singleCols) return entry.file;
-        return cols < singleCols ? entry.layouts.tiled : entry.layouts.single;
+      // A recording made for each layout its window can open in (a Command Terminal boot, or a
+      // session the manifest gives a tiled sibling): the one for this width. A pane narrower
+      // than the single recording takes the tiled one, which is the recording it shows at the
+      // larger scale whether it then holds it or plays its frames; a pane at least the single
+      // width takes the single, since a held grid never scales up.
+      function layoutFor(entry, cols) {
+        if (!entry.layouts || !entry.layouts.single || !entry.layouts.tiled) return null;
+        return cols < entry.layouts.single.cols ? entry.layouts.tiled : entry.layouts.single;
+      }
+      function applyLayout(entry, cols) {
+        var layout = layoutFor(entry, cols);
+        if (!layout) return;
+        entry.file = layout.file;
+        entry.grid = gridOf(layout);
+      }
+      // What a still paints for a session: the single recording's frame (scrollback, which the
+      // seed set to a working session's opening frame above), or the tiled recording's when the
+      // window mounted at the tiled width and the manifest recorded one. The tiled recording is
+      // a second run of the same prompt, so its own opening frame is the moment its bytes
+      // would open at; the session's clock, trail and diff stay the single recording's.
+      function stillFrameFor(sessionId, entry) {
+        var tiled = tiledFrames[sessionId];
+        if (entry && entry.layouts && tiled && entry.file === entry.layouts.tiled.file) {
+          var seeded = seededSession(sessionId);
+          var working = !!seeded && seeded.activity === 'thinking' && !!data.ends[sessionId];
+          return working && tiled.openFrame ? tiled.openFrame.serialized : tiled.serialized;
+        }
+        return scrollback[sessionId] || '';
       }
       window.electronAPI.sessions.getScrollback = function (sessionId) {
         var entry = replays[sessionId];
         if (live && entry) {
-          if (mountedGeometry[sessionId]) entry.file = layoutFileFor(entry, mountedGeometry[sessionId].cols);
+          if (mountedGeometry[sessionId]) applyLayout(entry, mountedGeometry[sessionId].cols);
           return fetchRecording(entry.file).then(function (recording) {
             if (geometryFits(sessionId, recording)) return liveScrollback(sessionId, entry);
             // The bytes cannot replay into this grid, so the terminal paints a parsed frame
@@ -978,26 +1308,89 @@ export function buildDemoPreConfig(options: {
             // "never emit bytes to this session", nothing about whether it is finished.
             entry.frameOnly = true;
             entry.mounted = true;
-            var cols = mountedGeometry[sessionId] ? mountedGeometry[sessionId].cols : 0;
+            var grid = mountedGeometry[sessionId];
             if (entry.tail > 0) {
               clearReplayTimers(sessionId);
-              var last = recording.stream[recording.stream.length - 1];
               var openFrame = openFrames[sessionId];
-              var current = scheduleFrameTimeline(sessionId, entry, recording, cols);
-              scheduleSessionClock(sessionId, entry, { durationMs: last ? last.t : 0, endPeek: recording.peek, endedOnItsOwn: endedOnItsOwn(recording) });
-              return fitFrameToCols(current || (openFrame ? openFrame.serialized : recording.serialized), cols);
+              var current = scheduleFrameTimeline(sessionId, entry, recording, grid);
+              scheduleSessionClock(sessionId, entry, { durationMs: sessionDurationMs(sessionId, recording), endPeek: recording.peek, endedOnItsOwn: endedOnItsOwn(recording) });
+              return fitFrameToGrid(current || (openFrame ? openFrame.serialized : recording.serialized), grid, recording.rows);
             }
             // A session already at its end: the frame is the recording's end, so the row's peek
             // and a finished session's state read as they would at the end here too.
             clearReplayTimers(sessionId);
             if (recording.peek && recording.peek.length) setMonitorPeek(sessionId, recording.peek);
             if (endedOnItsOwn(recording)) finishSession(sessionId);
-            return fitFrameToCols(recording.serialized, cols);
+            return fitFrameToGrid(recording.serialized, grid, recording.rows);
           });
         }
-        if (scrollback[sessionId]) return Promise.resolve(scrollback[sessionId]);
+        // A still paints its frame through the same applier the live frame uses: the renderer
+        // resizes before it asks for the scrollback, so the mounted grid is known, and a frame
+        // handed over raw wraps at the grid's edge wherever the pane is narrower than the
+        // recording and not held (below HOLD_MIN_SCALE). Held, the fit is the frame itself.
+        var stillFrame = stillFrameFor(sessionId, entry);
+        if (stillFrame) {
+          var stillGrid = mountedGeometry[sessionId];
+          return Promise.resolve(stillGrid ? fitFrameToGrid(stillFrame, stillGrid, entry && entry.grid ? entry.grid.rows : undefined) : stillFrame);
+        }
         if (entry && recordings) return fetchRecording(entry.file).then(function (recording) { return recording.serialized; });
         return Promise.resolve('');
+      };
+
+      // ---- the conversation viewer -----------------------------------------------------
+      // The viewer reads the agent's transcript, which main parses out of the agent's own
+      // history file on the desktop. The sample install commits one per session the manifest
+      // marks (derived at record time by main's own parsers, never written by hand), and the
+      // build emits it beside the recordings; it is fetched when a viewer opens, since a docs
+      // figure of the viewer is the one thing that needs it. A session with no transcript falls
+      // through to the mock's empty answer, which is what the desktop shows for a session whose
+      // history file is gone.
+      var TRANSCRIPT_REVISION = 1;
+      var transcriptCache = {};
+      function fetchTranscript(file) {
+        if (!transcriptCache[file]) {
+          transcriptCache[file] = fetch(recordings.transcriptsBase + file).then(function (response) {
+            if (!response.ok) throw new Error('[demo] transcript ' + file + ' returned ' + response.status);
+            return response.json();
+          });
+        }
+        return transcriptCache[file];
+      }
+      function indexedTranscript(sessionId) {
+        return recordings && recordings.transcripts ? recordings.transcripts[sessionId] || null : null;
+      }
+      function agentOf(row) {
+        var seeded = seededSession(row.id);
+        if (seeded) return seeded.agent;
+        var task = row.taskId ? tasksById[row.taskId] : null;
+        var project = projectsById[row.projectId];
+        return (task && task.agent) || (project ? project.default_agent : 'claude');
+      }
+      function transcriptSessionMeta(row) {
+        return { sessionId: row.id, agentName: agentOf(row), startedAt: row.startedAt, exitedAt: row.exitedAt || null, isolatedSwimlaneId: null, status: row.status };
+      }
+      var originalTranscriptGet = window.electronAPI.transcripts.get;
+      window.electronAPI.transcripts.get = function (input) {
+        var row = sessionById(input.sessionId);
+        var indexed = row ? indexedTranscript(row.id) : null;
+        if (!row || !indexed) return originalTranscriptGet.apply(this, arguments);
+        // The viewer polls while the session runs; nothing here ever changes, so a caller that
+        // has this revision gets the short answer main gives on an idle tick.
+        if (input.knownRevision === TRANSCRIPT_REVISION) return Promise.resolve({ unchanged: true, revision: TRANSCRIPT_REVISION });
+        return fetchTranscript(indexed.file).then(function (transcript) {
+          var task = row.taskId ? mockState.tasks.find(function (candidate) { return candidate.id === row.taskId; }) : null;
+          return {
+            sessionId: row.id, taskId: row.taskId, taskTitle: task ? task.title : '', agentName: agentOf(row),
+            startedAt: row.startedAt, sessionStatus: row.status, source: 'live', sourcePath: null,
+            entries: transcript.entries, degraded: false, sessions: [transcriptSessionMeta(row)], revision: TRANSCRIPT_REVISION,
+          };
+        });
+      };
+      var originalTranscriptList = window.electronAPI.transcripts.listSessions;
+      window.electronAPI.transcripts.listSessions = function (taskId) {
+        var rows = mockState ? mockState.sessions.filter(function (row) { return row.taskId === taskId && !!indexedTranscript(row.id); }) : [];
+        if (rows.length === 0) return originalTranscriptList.apply(this, arguments);
+        return Promise.resolve(rows.map(transcriptSessionMeta));
       };
 
       // ---- what a drag or a click starts -----------------------------------------------
@@ -1098,8 +1491,8 @@ export function buildDemoPreConfig(options: {
         seedUsage(id, agent);
         // The boot recorded for this task in this mode. A task the visitor created has none and
         // gets the project's Command Terminal boot: the agent starting with nothing to do yet.
-        var file = recordings ? (recordings.spawns[mockTask.id + ':' + permissionMode] || recordings.terminals[mockTask.projectId] || null) : null;
-        if (file) replays[id] = { file: file, startedAt: Date.now(), tail: 0, projectId: mockTask.projectId };
+        var indexed = recordings ? (recordings.spawns[mockTask.id + ':' + permissionMode] || recordings.terminals[mockTask.projectId] || null) : null;
+        if (indexed) replays[id] = { file: indexed.file, grid: gridOf(indexed), startedAt: Date.now(), tail: 0, projectId: mockTask.projectId };
         announceSession(row, 'thinking');
         announceMonitorRow(row, mockTask, agent, permissionMode);
         return row;
@@ -1164,9 +1557,9 @@ export function buildDemoPreConfig(options: {
             return session.transient && session.projectId === input.projectId && session.status === 'running' && session.id !== result.session.id;
           });
           var single = recordings ? recordings.terminals[input.projectId] || null : null;
-          var tiledFile = recordings ? recordings.terminals[input.projectId + '-tiled'] || null : null;
-          var file = (tiled && tiledFile) || single;
-          if (file) replays[result.session.id] = { file: file, startedAt: Date.now(), tail: 0, projectId: input.projectId, layouts: single && tiledFile ? { single: single, tiled: tiledFile } : null };
+          var tiledIndexed = recordings ? recordings.terminals[input.projectId + '-tiled'] || null : null;
+          var indexed = (tiled && tiledIndexed) || single;
+          if (indexed) replays[result.session.id] = { file: indexed.file, grid: gridOf(indexed), startedAt: Date.now(), tail: 0, projectId: input.projectId, layouts: single && tiledIndexed ? { single: single, tiled: tiledIndexed } : null };
           seedUsage(result.session.id, agent);
           announceSession(result.session, 'idle');
           announceMonitorRow(result.session, null, agent, data.defaultPermissionMode);
@@ -1179,6 +1572,35 @@ export function buildDemoPreConfig(options: {
       // size. A replay cannot repaint, but a boot recorded at both sizes can be swapped: a
       // resize across the single-window width switches the session to the other recording and
       // repaints it from a cleared screen at the same point in the boot.
+      // A replayed session is HELD at its recording's grid whenever the pane can show that grid
+      // at a readable size: main answers the renderer's resize with a held grid, and the terminal
+      // conforms (resizes to the recording's grid and scales its font to fit; useTerminal's
+      // conformToHeldGrid), so the bytes replay exactly, at any frame size and on any display.
+      // The floor is the scale the pane would need: below it the type would be too small to read,
+      // so the terminal keeps its own grid and plays frames instead. The 15-row bottom panel is
+      // the case that stays on frames (a 37-row recording would want 40 percent type).
+      var HOLD_MIN_SCALE = 0.6;
+      function heldGridFor(entry, cols, rows) {
+        if (!entry || !entry.grid || !entry.grid.cols || !entry.grid.rows) return null;
+        if (cols === entry.grid.cols && rows === entry.grid.rows) return null;
+        var scale = Math.min(cols / entry.grid.cols, rows / entry.grid.rows);
+        return scale >= HOLD_MIN_SCALE ? { cols: entry.grid.cols, rows: entry.grid.rows } : null;
+      }
+      // The last grid the RENDERER named for each session, before any hold. A held session's
+      // mountedGeometry is the recording's grid, which can stay identical across a real window
+      // resize, so it cannot be what decides whether the window moved. It is kept apart rather
+      // than folded into mountedGeometry because the frame fitter and geometryFits both need the
+      // grid the terminal actually has, which is the held one.
+      var naturalGeometry = {};
+      // Read by demo/measure.mjs --geometry: the grid each surface fits at the frame, which is
+      // what the capture matrix records at. __resizeCalls cannot serve, since it also logs the
+      // held grid a conformed terminal echoes back.
+      window.__demoNaturalGeometry = naturalGeometry;
+      // The grid each session was last ANSWERED with a hold at. A held terminal resizes its own
+      // xterm to that grid and reports it back, so the seed sees two kinds of resize for one
+      // session: the window's natural grid, and the terminal echoing the grid it was just held
+      // at. Only the first describes the window.
+      var heldAnswer = {};
       var originalResize = window.electronAPI.sessions.resize;
       window.electronAPI.sessions.resize = function (sessionId, cols, rows) {
         // The renderer resizes before it asks for the scrollback, so a mount's grid is known when
@@ -1186,34 +1608,117 @@ export function buildDemoPreConfig(options: {
         // terminal (a window tiling beside a new one, the panel's terminal handed to a task window)
         // brings no new getScrollback: the desktop's PTY resize has the CLI repaint for the new
         // grid, and here the session repaints from a cleared screen with whichever of its bytes or
-        // its frame fits that grid, switching boot recordings by layout on the way.
+        // its frame fits that grid, switching boot recordings by layout on the way. The grid the
+        // renderer names is its NATURAL one, at the configured font, whether or not it is held;
+        // the boot is chosen by that width, and the held grid, when there is one, is the grid the
+        // terminal will actually have.
         var previous = mountedGeometry[sessionId];
-        mountedGeometry[sessionId] = { cols: cols, rows: rows };
+        var previousNatural = naturalGeometry[sessionId];
+        var previousHeld = heldAnswer[sessionId];
         var entry = replays[sessionId];
-        var changed = !!previous && (previous.cols !== cols || previous.rows !== rows);
+        // The terminal reporting exactly the grid it was last held at is the conform LANDING,
+        // not the window moving. It must change nothing: treating it as a natural resize fires a
+        // repaint on every conform, which reached a session whose replay is already at its end
+        // and pushed a whole frame into a terminal that should have received nothing.
+        var conformEcho = !!previousHeld && cols === previousHeld.cols && rows === previousHeld.rows;
+        if (entry && !conformEcho) applyLayout(entry, cols);
+        var held = conformEcho ? previousHeld : (recordings ? heldGridFor(entry, cols, rows) : null);
+        var effective = held || { cols: cols, rows: rows };
+        mountedGeometry[sessionId] = effective;
+        heldAnswer[sessionId] = held;
+        if (!conformEcho) naturalGeometry[sessionId] = { cols: cols, rows: rows };
+        // A repaint follows a real WINDOW resize, so the natural grid decides, not the held one.
+        // While a session is held the held grid can be identical either side of a resize (a
+        // Command Terminal that tiles still fits its recording's grid), and keying off it alone
+        // skipped the repaint entirely. Whether it skipped depended on where the natural width
+        // fell against the single-window threshold, which moves with the platform's font metrics:
+        // Windows crossed it and Linux CI did not, so the tiling case passed locally and failed
+        // on every CI run.
+        var changed = !conformEcho
+          && ((!!previousNatural && (previousNatural.cols !== cols || previousNatural.rows !== rows))
+            || (!!previous && (previous.cols !== effective.cols || previous.rows !== effective.rows)));
+        var answer = originalResize.apply(this, arguments);
+        if (held) answer = answer.then(function (base) { return Object.assign({}, base, { colsChanged: false, refused: true, held: held }); });
         if (live && entry && changed) {
-          entry.file = layoutFileFor(entry, cols);
           fetchRecording(entry.file).then(function (recording) {
             if (geometryFits(sessionId, recording)) {
-              return liveScrollback(sessionId, entry).then(function (head) { emitBytes(sessionId, '\x1b[2J\x1b[3J\x1b[H' + head, entry.projectId); });
+              return liveScrollback(sessionId, entry).then(function (head) { emitBytes(sessionId, REPAINT + head, entry.projectId); });
             }
             clearReplayTimers(sessionId);
-            emitBytes(sessionId, '\x1b[2J\x1b[3J\x1b[H' + fitFrameToCols(recording.serialized, cols), entry.projectId);
+            emitBytes(sessionId, REPAINT + fitFrameToGrid(recording.serialized, effective, recording.rows), entry.projectId);
           });
         }
-        return originalResize.apply(this, arguments);
+        return answer;
       };
 
       // The working tree each recorded session left behind, keyed by its task's worktree folder,
-      // so a task's Changes panel shows what its agent changed. Nothing is committed on a scratch
-      // clone, so the Working and Branch scopes show the same files and Staged is empty.
+      // so a task's Changes panel shows what its agent changed, in three scopes. The Branch scope is everything the branch
+      // changes against its base, which with nothing committed is the whole recorded diff. The
+      // split between Working and Staged follows what an agent does with a NEW file: it stages
+      // it (git add) so the file is tracked and shows in git diff --cached, while its edits
+      // to existing files stay unstaged. So added files are the staged set and modified files
+      // the working set, derived from the recorded statuses rather than authored per task; a
+      // session that only edited existing files has an empty Staged tab, as it would.
+      function scopeOf(diff, keep) {
+        var files = diff.files.filter(keep);
+        return {
+          files: files,
+          totalInsertions: files.reduce(function (sum, file) { return sum + (file.insertions || 0); }, 0),
+          totalDeletions: files.reduce(function (sum, file) { return sum + (file.deletions || 0); }, 0),
+        };
+      }
       var diffByWorktree = {};
       data.tasks.forEach(function (task) {
         var diff = task.session_id && changes[task.session_id];
         if (!diff || !task.worktree_folder) return;
-        diffByWorktree[task.worktree_folder] = { working: diff, branch: diff, staged: { files: [], totalInsertions: 0, totalDeletions: 0 } };
+        diffByWorktree[task.worktree_folder] = {
+          working: scopeOf(diff, function (file) { return file.status !== 'A'; }),
+          staged: scopeOf(diff, function (file) { return file.status === 'A'; }),
+          branch: diff,
+        };
       });
       window.__mockGitDiffByWorktree = diffByWorktree;
+
+      // A scaffolded project's real history (loadDemoHistory), served per worktree the way the
+      // desktop's git reads it: the History pane's graph, the diff a selected commit introduces,
+      // the header's branch summary, each file's history, and the blame gutter over the working
+      // tree the session left. A task branch has no commits of its own, so its tip IS the base
+      // and the graph's three anchors coincide, which is what a fresh worktree shows.
+      var commitGraphByWorktree = {};
+      var branchSummaryByWorktree = {};
+      var blameByWorktree = {};
+      var fileHistoryByWorktree = {};
+      var diffByCommit = {};
+      data.tasks.forEach(function (task) {
+        var project = projectsById[task.projectId];
+        var projectHistory = project && history[project.name];
+        if (!projectHistory || !task.worktree_folder) return;
+        var tip = projectHistory.commits[0];
+        commitGraphByWorktree[task.worktree_folder] = {
+          commits: projectHistory.commits, tipHash: projectHistory.tipHash, baseHash: projectHistory.tipHash,
+          mergeBaseHash: projectHistory.tipHash, currentBranch: task.branch_name, truncated: false,
+        };
+        branchSummaryByWorktree[task.worktree_folder] = {
+          currentBranch: task.branch_name, ahead: 0, behind: 0,
+          lastCommit: { hash: tip.shortHash, subject: tip.subject, timestamp: tip.authorTimestamp },
+        };
+        var byPath = {};
+        projectHistory.commits.forEach(function (commit) {
+          var diff = projectHistory.diffs[commit.hash];
+          (diff ? diff.files : []).forEach(function (file) {
+            if (!byPath[file.path]) byPath[file.path] = { commits: [] };
+            byPath[file.path].commits.push({ hash: commit.hash, shortHash: commit.shortHash, authorName: commit.authorName, authorTimestamp: commit.authorTimestamp, subject: commit.subject });
+          });
+        });
+        fileHistoryByWorktree[task.worktree_folder] = byPath;
+        if (task.session_id && projectHistory.blame[task.session_id]) blameByWorktree[task.worktree_folder] = projectHistory.blame[task.session_id];
+        Object.keys(projectHistory.diffs).forEach(function (hash) { diffByCommit[hash] = projectHistory.diffs[hash]; });
+      });
+      window.__mockCommitGraphByWorktree = commitGraphByWorktree;
+      window.__mockBranchSummaryByWorktree = branchSummaryByWorktree;
+      window.__mockBlameByWorktree = blameByWorktree;
+      window.__mockFileHistoryByWorktree = fileHistoryByWorktree;
+      window.__mockGitDiffByCommit = diffByCommit;
 
       // A deterministic usage dashboard: fourteen days of sessions per project, seeded so every
       // boot draws the same charts, scaled by the project's share of the sample install.

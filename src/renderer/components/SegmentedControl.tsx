@@ -3,6 +3,14 @@ import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
 export interface SegmentedControlOption<T extends string> {
   value: T;
   label: string;
+  /**
+   * Accessible name, when the visible label is not the whole story. Defaults to
+   * `label`. Needed wherever `trailing` carries meaning the label does not: the
+   * board toolbar's Backlog option has a count badge, and the option's name is
+   * always set from here rather than read off the rendered text, so that count
+   * would otherwise be lost to a screen reader at every width.
+   */
+  ariaLabel?: string;
   /** Optional leading glyph. Render at 14px to sit on the 14px label. */
   icon?: React.ReactNode;
   /** Optional trailing node, e.g. a `CountBadge`. */
@@ -55,6 +63,14 @@ interface SegmentedControlProps<T extends string> {
    * corner radius. Overrides `ground`.
    */
   quiet?: boolean;
+  /**
+   * Extra classes on every option's label span. Opt-in, for a group that has to
+   * shed its text in a tight row: the board toolbar passes a container-query
+   * class that hides the label and shows an icon in its place. Omitted, nothing
+   * changes. The option button always carries `aria-label`, so a hidden label
+   * never leaves the option unnamed.
+   */
+  labelClassName?: string;
   /** Stretch to fill the container, options sharing the width equally. */
   fullWidth?: boolean;
   /** Group-level test hook. */
@@ -121,6 +137,7 @@ export function SegmentedControl<T extends string>({
   onChange,
   ground = 'control',
   quiet = false,
+  labelClassName = '',
   fullWidth = false,
   testId,
   ariaLabel,
@@ -130,6 +147,8 @@ export function SegmentedControl<T extends string>({
   const trackRef = useRef<HTMLDivElement>(null);
   const rowRef = useRef<HTMLDivElement>(null);
   const optionRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  /** Pending re-measure while an ancestor transform is still running. */
+  const retryRef = useRef<number | null>(null);
   const [thumb, setThumb] = useState<{ left: number; width: number } | null>(null);
 
   const activeIndex = Math.max(0, options.findIndex((option) => option.value === value));
@@ -145,17 +164,63 @@ export function SegmentedControl<T extends string>({
    * The row is the positioning context and carries no border or padding, so its
    * border box, padding box, and content box coincide: the thumb's containing
    * block origin is exactly `rowRect.left`, with no correction term.
+   *
+   * The catch, and the bug this exists to stop: `getBoundingClientRect` reports
+   * TRANSFORMED geometry, and every dialog in the app enters at `scale(0.96)`
+   * (`dialog-content-in`). A measurement taken during that animation sizes the
+   * thumb 4% small, and NOTHING ever corrects it, because the only correction
+   * here is a ResizeObserver and ResizeObserver reports the LAYOUT box, which a
+   * transform does not change - so no callback fires when the animation ends.
+   * The wrong thumb is permanent for the life of the dialog.
+   *
+   * Measured in a preview: a When control sampled 67.89 against an
+   * `offsetWidth` of 71, a ratio of 0.9562, and stayed 2.84px narrow. It looked
+   * intermittent because what varies is whether the layout effect lands before
+   * or during the animation's first frame.
+   *
+   * The untransformed width comes from `getComputedStyle`, so the ratio between
+   * it and the rect IS the ancestor scale, and dividing it out makes the
+   * measurement scale-invariant. `offsetWidth` was tried for this and is not
+   * good enough: it rounds to an integer, so on a 142px row it cannot see a
+   * scale closer to 1 than about 0.35%, which left the thumb 0.31px narrow when
+   * the retry below stopped a frame early. The computed width is fractional and
+   * exact, so the loop can run until the transform is genuinely gone.
    */
   const measure = useCallback(() => {
-    const active = optionRefs.current[activeIndex];
-    const row = rowRef.current;
-    if (!active || !row) return;
-    const rowRect = row.getBoundingClientRect();
-    const activeRect = active.getBoundingClientRect();
-    const next = { left: activeRect.left - rowRect.left, width: activeRect.width };
-    setThumb((current) =>
-      current && current.left === next.left && current.width === next.width ? current : next,
-    );
+    // A hoisted inner function rather than the callback scheduling itself: a
+    // `useCallback` initializer that names its own binding reads, to the
+    // compiler rules, as a use before declaration.
+    function measureOnce(): void {
+      const active = optionRefs.current[activeIndex];
+      const row = rowRef.current;
+      if (!active || !row) return;
+      const rowRect = row.getBoundingClientRect();
+      const activeRect = active.getBoundingClientRect();
+
+      // `width` resolves against `box-sizing`, and the row sets no border or
+      // padding, so this is its border-box width with no transform applied. It is
+      // `auto` (NaN here) only when the row is not being rendered, which is the
+      // one case with nothing to measure anyway.
+      const layoutWidth = Number.parseFloat(getComputedStyle(row).width);
+      const transformed = layoutWidth > 0 && Math.abs(rowRect.width - layoutWidth) > 0.05;
+      const divisor = transformed ? rowRect.width / layoutWidth : 1;
+      const next = {
+        left: (activeRect.left - rowRect.left) / divisor,
+        width: activeRect.width / divisor,
+      };
+      setThumb((current) =>
+        current && current.left === next.left && current.width === next.width ? current : next,
+      );
+
+      // The correction is exact at every frame, but the LAYOUT it corrects is not
+      // final until the animation is: a mid-animation reflow would leave the thumb
+      // on a stale option width. So keep re-measuring until the transform is gone.
+      // Self-terminating, the entrance is ~150ms, and at rest the branch is dead.
+      if (transformed) {
+        retryRef.current = requestAnimationFrame(measureOnce);
+      }
+    }
+    measureOnce();
   }, [activeIndex]);
 
   useLayoutEffect(() => {
@@ -169,7 +234,12 @@ export function SegmentedControl<T extends string>({
     for (const option of optionRefs.current) {
       if (option) observer.observe(option);
     }
-    return () => observer.disconnect();
+    return () => {
+      observer.disconnect();
+      // The pending frame closes over the activeIndex that scheduled it, so it
+      // must not outlive this effect.
+      if (retryRef.current !== null) cancelAnimationFrame(retryRef.current);
+    };
   }, [measure, options]);
 
   const focusOption = (index: number) => {
@@ -262,6 +332,13 @@ export function SegmentedControl<T extends string>({
               // Roving tabindex: the group is one tab stop, arrows move within it.
               tabIndex={selected ? 0 : -1}
               disabled={optionDisabled}
+              // Unconditional, not only when `labelClassName` hides the label:
+              // `hidden` takes the span out of the accessibility tree, so without
+              // this a collapsed option has no accessible name at all. When the
+              // label IS showing it repeats the visible text, which is harmless -
+              // but it also REPLACES whatever `trailing` contributed, which is why
+              // an option with a meaningful badge passes its own `ariaLabel`.
+              aria-label={option.ariaLabel ?? option.label}
               title={option.title}
               onClick={() => onChange(option.value)}
               data-testid={option.testId}
@@ -277,7 +354,7 @@ export function SegmentedControl<T extends string>({
               } ${optionDisabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}
             >
               {option.icon}
-              <span>{option.label}</span>
+              <span className={labelClassName}>{option.label}</span>
               {option.trailing}
             </button>
           );
