@@ -69,6 +69,22 @@ describe('CK GO relayed from a trusted transport', () => {
     expect(after.description).toContain('> ya no aplica');
   });
 
+  it('DONE closes only a card in Ready, through the same move the app uses', async () => {
+    db.prepare(`INSERT INTO swimlanes (id, name, position, color, created_at) VALUES ('ready-lane', 'Ready', 22, '#64748b', ?)`)
+      .run(new Date().toISOString());
+    const ready = tasks.create({ title: 'Churn scan', description: 'Hecho.', swimlane_id: 'ready-lane', labels: ['approved'] });
+    const onTaskMove = vi.fn(async () => {});
+    const r = await handleRecordHumanGo({ taskId: ready.id, decision: 'done', comment: 'revisada y en master' }, context({ onTaskMove }));
+    expect(r).toMatchObject({ success: true, data: { closed: true } });
+    const doneId = (db.prepare("SELECT id FROM swimlanes WHERE role='done'").get() as { id: string }).id;
+    expect(onTaskMove).toHaveBeenCalledWith(expect.objectContaining({ taskId: ready.id, targetSwimlaneId: doneId }));
+    expect(tasks.getById(ready.id)!.description).toContain('> revisada y en master');
+
+    const executing = tasks.create({ title: 'X', description: 'Y.', swimlane_id: executingId, labels: ['approved'] });
+    expect(await handleRecordHumanGo({ taskId: executing.id, decision: 'done' }, context({ onTaskMove }))).toMatchObject({ success: false });
+    expect(onTaskMove).toHaveBeenCalledOnce();
+  });
+
   it('a stale question cannot be answered after the card changed', async () => {
     const task = tasks.create({ title: 'X', description: 'Y.', swimlane_id: todoId, labels: ['approved', 'no-auto'] });
     const r = await handleRecordHumanGo({ taskId: task.id, decision: 'go', expectedRevision: task.revision + 5 }, context());

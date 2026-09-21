@@ -880,10 +880,10 @@ export function registerTaskTools(
     server.registerTool(
       'kangentic_record_human_go',
       {
-        description: 'Admin transport only (never offered to agent sessions). Record CK\'s GO or NO for a held task, relayed from a trusted local channel such as the router answering a Telegram question. GO appends the comment, adds go-ck, clears needs-info/needs-human/manual-hold/no-auto, and on an active stage paused by a question records the answer and resumes it. It never authorizes production execution. NO archives the task with the reason.',
+        description: 'Admin transport only (never offered to agent sessions). Record CK\'s GO or NO for a held task, relayed from a trusted local channel such as the router answering a Telegram question. GO appends the comment, adds go-ck, clears needs-info/needs-human/manual-hold/no-auto, and on an active stage paused by a question records the answer and resumes it. It never authorizes production execution. NO archives the task with the reason. DONE moves a card that is in Ready to Done, like the app does; it never merges or pushes.',
         inputSchema: z.object({
           taskId: z.string().min(1),
-          decision: z.enum(['go', 'no']),
+          decision: z.enum(['go', 'no', 'done']),
           comment: z.string().max(2_000).optional(),
           source: z.string().max(40).optional(),
           expectedRevision: z.number().int().optional(),

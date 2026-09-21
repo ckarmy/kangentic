@@ -21,10 +21,11 @@ const quote = (text: string) => text.split(/\r?\n/).map((line) => `> ${line}`).j
 export const handleRecordHumanGo: CommandHandler = async (params, context): Promise<CommandResponse> => {
   if (context.actor !== 'human') return { success: false, error: 'Only a trusted human transport can record a GO' };
   const taskId = typeof params.taskId === 'string' ? params.taskId.trim() : '';
-  const decision = params.decision === 'no' ? 'no' : params.decision === 'go' ? 'go' : null;
+  const decision = params.decision === 'no' ? 'no' : params.decision === 'go' ? 'go'
+    : params.decision === 'done' ? 'done' : null;
   const comment = typeof params.comment === 'string' ? params.comment.trim().slice(0, 2_000) : '';
   const source = typeof params.source === 'string' && params.source.trim() ? params.source.trim().slice(0, 40) : 'externo';
-  if (!taskId || !decision) return { success: false, error: 'taskId and decision (go|no) are required' };
+  if (!taskId || !decision) return { success: false, error: 'taskId and decision (go|no|done) are required' };
 
   const database = context.getProjectDb();
   const tasks = new TaskRepository(database);
@@ -37,6 +38,20 @@ export const handleRecordHumanGo: CommandHandler = async (params, context): Prom
   const stamp = new Date().toISOString();
   const labels = task.labels ?? [];
   const lower = labels.map((label) => label.trim().toLowerCase());
+
+  // DONE: CK reviewed the result in Ready and closes it, exactly like dragging
+  // the card to Done in the app (same onTaskMove path). Only from Ready: it
+  // never skips review, and it never merges or pushes anything.
+  if (decision === 'done') {
+    if (column.name !== 'Ready') return { success: false, error: `Only a card in Ready can be closed, not one in ${column.name ?? 'this column'}` };
+    const done = database.prepare("SELECT id FROM swimlanes WHERE role = 'done' ORDER BY position LIMIT 1").get() as { id: string } | undefined;
+    if (!done) return { success: false, error: 'This board has no Done column' };
+    const note = `${task.description ?? ''}\n\n## CK la cerró (${source}, ${stamp})\n${quote(comment || 'revisada')}`;
+    tasks.update({ id: task.id, description: note });
+    const position = (database.prepare('SELECT COUNT(*) AS n FROM tasks WHERE swimlane_id = ? AND archived_at IS NULL').get(done.id) as { n: number }).n;
+    await context.onTaskMove({ taskId: task.id, targetSwimlaneId: done.id, targetPosition: position });
+    return { success: true, data: { closed: true }, message: 'Moved to Done after CK reviewed it.' };
+  }
 
   if (decision === 'no') {
     const description = `${task.description ?? ''}\n\n## CK dijo que no (${source}, ${stamp})\n${quote(comment || 'sin comentario')}`;

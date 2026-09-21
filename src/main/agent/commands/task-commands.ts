@@ -1561,7 +1561,9 @@ export function handleMoveTaskToProject(
     return { success: false, error: `Task #${task.display_id} still has a worktree on disk and cannot be moved to another project.` };
   }
   const normalizedLabels = (task.labels ?? []).map((label) => label.trim().toLowerCase());
-  if (routerTaskHeld(normalizedLabels) || routerTextSensitive(`${task.title}\n${task.description}`)) {
+  // CK's GO (go-ck) lets the Inbox hand a sensitive card to its project; the
+  // target keeps every other guard, and deletion stays strict.
+  if (routerGuarded(normalizedLabels, `${task.title}\n${task.description}`)) {
     return { success: false, error: 'Server guard refused relocation of held or sensitive work' };
   }
 
