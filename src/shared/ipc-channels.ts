@@ -264,6 +264,14 @@ export const IPC = {
   // The view preference itself is NOT a monitor channel: it rides the existing global
   // config merge (`config.set`), so there is one persistence path, not two.
   MONITOR_GET_SNAPSHOT: 'monitor:getSnapshot',
+  MONITOR_GET_TASK_OVERVIEW: 'monitor:getTaskOverview',
+  MONITOR_GET_TASK_CLOSEOUT: 'monitor:getTaskCloseout',
+  MONITOR_PREPARE_DELIVERY: 'monitor:prepareDelivery',
+  MONITOR_CONFIRM_DELIVERY: 'monitor:confirmDelivery',
+  MONITOR_PREPARE_PUSH: 'monitor:preparePush',
+  MONITOR_CONFIRM_PUSH: 'monitor:confirmPush',
+  MONITOR_ANSWER_TASK: 'monitor:answerTask',
+  MONITOR_RESUME_ANSWERED_TASK: 'monitor:resumeAnsweredTask',
   MONITOR_CHANGED: 'monitor:changed',
   // Subscription handshake for MONITOR_CHANGED. Main builds and pushes the
   // cross-project snapshot only while at least one renderer is subscribed;

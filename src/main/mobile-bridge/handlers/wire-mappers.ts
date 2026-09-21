@@ -300,6 +300,7 @@ export function toBoardColumnWire(swimlane: Swimlane): BoardColumnWire {
 
 export function toBoardTaskWire(task: Task): BoardTaskWire {
   return {
+    human_response_revision: task.revision,
     id: task.id,
     display_id: task.display_id,
     title: task.title,

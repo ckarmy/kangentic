@@ -10,6 +10,7 @@ import { useProjectStore } from '../../stores/project-store';
 import { useSessionStore } from '../../stores/session-store';
 import { trailModeFor } from '../board/CardMessageTrail';
 import { MonitorToolbar } from './MonitorToolbar';
+import { TaskOverview } from './TaskOverview';
 import { MonitorSummaryCards } from './MonitorSummaryCards';
 import { MonitorCard } from './MonitorCard';
 import { CountBadge } from '../CountBadge';
@@ -67,6 +68,7 @@ function columnsForWidth(width: number): number {
 }
 
 export function MonitorBody() {
+  const [surface, setSurface] = useState<'sessions' | 'all' | 'attention'>('all');
   const { rows, loading, loaded, view } = useMonitorStore(
     useShallow((state) => ({
       rows: state.rows,
@@ -181,7 +183,7 @@ export function MonitorBody() {
   const wantedPeekKey = useSessionStore(
     useCallback(
       (state: ReturnType<typeof useSessionStore.getState>) => {
-        if (!isCardsLayout) return '';
+        if (surface !== 'sessions' || !isCardsLayout) return '';
         const wanted: string[] = [];
         for (const row of filteredRows) {
           const trail = state.sessionMessageTrails[row.sessionId];
@@ -190,7 +192,7 @@ export function MonitorBody() {
         }
         return wanted.sort().join('\n');
       },
-      [filteredRows, isCardsLayout, trailMode],
+      [filteredRows, isCardsLayout, trailMode, surface],
     ),
   );
   useMonitorPeekSubscription(wantedPeekKey);
@@ -304,6 +306,13 @@ export function MonitorBody() {
 
   return (
     <>
+      <nav className="flex flex-wrap gap-2 p-3 border-b border-edge" aria-label="Vistas del monitor">
+        {([['all', 'Todas las tarjetas'], ['attention', 'Necesita de mí'], ['sessions', 'Sesiones']] as const).map(([value, label]) => (
+          <button key={value} type="button" aria-pressed={surface === value} onClick={() => setSurface(value)}
+            className={`px-3 py-2 rounded text-sm ${surface === value ? 'bg-surface-hover text-fg' : 'text-fg-muted'}`}>{label}</button>
+        ))}
+      </nav>
+      {surface !== 'sessions' ? <TaskOverview attentionOnly={surface === 'attention'} /> : <>
       {/* Summary ABOVE the controls, deliberately. The tiles follow the Projects
           SCOPE - the projects the user chose to watch ARE "the whole machine" as
           far as they are concerned, and counts for hidden projects above cards
@@ -445,6 +454,7 @@ export function MonitorBody() {
           onClose={() => setRowMenu(null)}
         />
       )}
+      </>}
     </>
   );
 }

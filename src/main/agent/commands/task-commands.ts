@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import { TaskRepository } from '../../db/repositories/task-repository';
+import { TaskCloseoutRepository } from '../../db/repositories/task-closeout-repository';
 import { AttachmentRepository } from '../../db/repositories/attachment-repository';
 import { BacklogAttachmentRepository } from '../../db/repositories/backlog-attachment-repository';
 import { SessionRepository } from '../../db/repositories/session-repository';
@@ -481,7 +482,7 @@ export const handleUpdateTask: CommandHandler = (
   const currentGuardLabels = (task.labels ?? []).map((label) => label.trim().toLowerCase());
   const isHumanAction = context.actor === 'human';
   if (!isHumanAction
-      && (routerTaskHeld(currentGuardLabels) || routerTextSensitive(`${task.title}\n${task.description}`))) {
+      && routerGuarded(currentGuardLabels, `${task.title}\n${task.description}`)) {
     return { success: false, error: 'Agents may not mutate a held or sensitive task; human action is required' };
   }
   if (!isHumanAction && newLabels !== null) {
@@ -1064,7 +1065,7 @@ export const handleMoveTask: CommandHandler = (
     return { success: false, error: 'Agents may not move tasks to Done; human approval is required' };
   }
   const normalizedLabels = (task.labels ?? []).map((label) => label.trim().toLowerCase());
-  if (routerTaskHeld(normalizedLabels) || routerTextSensitive(`${task.title}\n${task.description}`)) {
+  if (routerGuarded(normalizedLabels, `${task.title}\n${task.description}`)) {
     return { success: false, error: 'Server guard refused an agent move for held or sensitive work' };
   }
 
@@ -1114,9 +1115,25 @@ const ROUTER_HOLD_LABELS = new Set([
   'needs-info', 'needs-human',
 ]);
 
+/**
+ * `go-ck` is CK's recorded GO (kangentic_record_human_go, admin transport only).
+ * It lifts the risk labels and the sensitive-word text guard for that card, but
+ * never a pending question or a manual pause, and never deletion or relocation.
+ */
+export const HUMAN_GO_LABEL = 'go-ck';
+const ROUTER_GO_LIFTS = new Set(['production', 'risky', 'pedro']);
+
 export function routerTaskHeld(labels: string[]): boolean {
   const approved = labels.includes('approved');
-  return labels.some((label) => ROUTER_HOLD_LABELS.has(label) && (label !== 'pedro' || !approved));
+  const go = labels.includes(HUMAN_GO_LABEL);
+  return labels.some((label) => ROUTER_HOLD_LABELS.has(label)
+    && (label !== 'pedro' || !approved)
+    && !(go && ROUTER_GO_LIFTS.has(label)));
+}
+
+/** Held, or sensitive text without CK's recorded GO. */
+export function routerGuarded(labels: string[], text: string): boolean {
+  return routerTaskHeld(labels) || (!labels.includes(HUMAN_GO_LABEL) && routerTextSensitive(text));
 }
 
 /**
@@ -1149,7 +1166,7 @@ export const handleRouteTask: CommandHandler = async (
   if (!task) return { success: false, error: `Task "${taskIdParam}" not found` };
   const normalizedLabels = task.labels.map((label) => label.trim().toLowerCase());
   const text = `${task.title}\n${task.description}`;
-  if (routerTaskHeld(normalizedLabels) || routerTextSensitive(text)) {
+  if (routerGuarded(normalizedLabels, text)) {
     return { success: false, error: 'Server guard refused automatic routing for a held or sensitive task' };
   }
 
@@ -1206,6 +1223,31 @@ export function nextRouteStage(stage: string, workflow: string): string | null {
 }
 
 /**
+ * A completed stage may be completed again only by a genuine rework run: the
+ * task is back in that stage with a newer revision, and a session started for
+ * it after the prior completion at least a minute ago. A delayed MCP retry from
+ * the earlier run has no such session, so it stays a duplicate and cannot skip
+ * the rework (Review -> Executing -> Review).
+ */
+export const ROUTE_REWORK_MIN_SESSION_AGE_MS = 60_000;
+
+export function isRouteStageRework(
+  db: ReturnType<CommandContext['getProjectDb']>,
+  task: { id: string; revision: number },
+  current: { name: string },
+  stage: string,
+  prior: { taskRevision: number; updatedAt?: string },
+  now = Date.now(),
+): boolean {
+  if (current.name !== stage || task.revision <= prior.taskRevision || !prior.updatedAt) return false;
+  const row = db.prepare(`SELECT started_at FROM sessions
+    WHERE task_id = ? AND started_at > ? ORDER BY started_at DESC LIMIT 1`)
+    .get(task.id, prior.updatedAt) as { started_at: string } | undefined;
+  if (!row) return false;
+  return now - Date.parse(row.started_at) >= ROUTE_REWORK_MIN_SESSION_AGE_MS;
+}
+
+/**
  * Finish one successful routed stage. Unlike the general move tool, the target
  * is derived server-side from the dispatch workflow and can never be Done.
  * The claim is durable before lifecycle work starts, so duplicate tool calls do
@@ -1226,8 +1268,7 @@ export const handleCompleteRouteStage: CommandHandler = (
   const task = resolveTask(taskRepo, taskIdParam);
   if (!task) return { success: false, error: `Task "${taskIdParam}" not found` };
   const labels = task.labels.map((label) => label.trim().toLowerCase());
-  if (routerTaskHeld(labels)
-      || routerTextSensitive(`${task.title}\n${task.description}`)) {
+  if (routerGuarded(labels, `${task.title}\n${task.description}`)) {
     return { success: false, error: 'Server guard refused automatic stage completion for held or sensitive work' };
   }
   const current = db.prepare('SELECT id, name FROM swimlanes WHERE id = ?')
@@ -1236,7 +1277,7 @@ export const handleCompleteRouteStage: CommandHandler = (
   const dispatch = taskRepo.getLatestRouteDispatch(task.id);
   if (!dispatch) return { success: false, error: 'Task has no router dispatch' };
   const priorCompletion = taskRepo.getLatestRouteStageCompletion(dispatch.dispatchId, expectedStage);
-  if (priorCompletion?.status === 'completed') {
+  if (priorCompletion?.status === 'completed' && !isRouteStageRework(db, task, current, expectedStage, priorCompletion)) {
     const priorTarget = db.prepare('SELECT name FROM swimlanes WHERE id = ?')
       .get(priorCompletion.targetSwimlaneId) as { name: string } | undefined;
     return {
@@ -1275,6 +1316,15 @@ export const handleCompleteRouteStage: CommandHandler = (
   const targetName = nextRouteStage(current.name, dispatch.workflow);
   if (!targetName) {
     return { success: false, error: `Workflow ${dispatch.workflow} cannot auto-advance from ${current.name}` };
+  }
+  if (targetName === 'Ready') {
+    const report = new TaskCloseoutRepository(db).get(task.id, task.revision);
+    if (!report) {
+      return { success: false, error: 'Ready requires a current task result. Read the task revision and call kangentic_record_task_result before completing this stage.' };
+    }
+    if (report.checks.length === 0 || report.checks.some((check) => check.result === 'failed')) {
+      return { success: false, error: 'Ready requires documented checks with no failed results. Record actual evidence; explain not-run checks without claiming they passed.' };
+    }
   }
   const target = resolveColumn(db, targetName, 'todo', { includeArchivedDone: false });
   if ('error' in target) return { success: false, error: target.error };

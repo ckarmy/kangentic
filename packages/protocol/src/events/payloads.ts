@@ -289,6 +289,8 @@ export interface BoardColumnWire {
 
 /** Phone-needed subset of the desktop's Task row. A non-null `session_id` is the live-session signal the phone's triage view keys on. */
 export interface BoardTaskWire {
+  /** Present only when the desktop supports human answer/resume actions. */
+  human_response_revision?: number;
   id: string;
   display_id: number;
   title: string;
@@ -601,7 +603,12 @@ export function parseBoardColumnWire(value: JsonValue): BoardColumnWire {
 /** Narrows one board-task row. Throws on a malformed required field. */
 export function parseBoardTaskWire(value: JsonValue): BoardTaskWire {
   if (!isRecord(value)) throw new Error('board task must be an object');
+  if (value.human_response_revision !== undefined
+      && (typeof value.human_response_revision !== 'number' || !Number.isSafeInteger(value.human_response_revision) || value.human_response_revision < 0)) {
+    throw new Error('board task has an invalid human_response_revision');
+  }
   return {
+    ...(typeof value.human_response_revision === 'number' ? { human_response_revision: value.human_response_revision } : {}),
     id: requireString(value, 'id', 'board task'),
     display_id: requireNumber(value, 'display_id', 'board task'),
     title: requireString(value, 'title', 'board task'),

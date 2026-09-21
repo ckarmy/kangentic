@@ -592,16 +592,18 @@ export class TaskRepository {
     targetSwimlaneId: string;
     taskRevision: number;
     status: 'pending' | 'completed' | 'failed';
+    updatedAt: string;
   } | null {
-    const row = this.db.prepare(`SELECT target_swimlane_id, task_revision, status
+    const row = this.db.prepare(`SELECT target_swimlane_id, task_revision, status, updated_at
       FROM route_stage_completions
       WHERE dispatch_id = ? AND stage = ?
       ORDER BY task_revision DESC LIMIT 1`).get(dispatchId, stage) as {
         target_swimlane_id: string;
         task_revision: number;
         status: 'pending' | 'completed' | 'failed';
+        updated_at: string;
       } | undefined;
-    return row ? { targetSwimlaneId: row.target_swimlane_id, taskRevision: row.task_revision, status: row.status } : null;
+    return row ? { targetSwimlaneId: row.target_swimlane_id, taskRevision: row.task_revision, status: row.status, updatedAt: row.updated_at } : null;
   }
 
   /**

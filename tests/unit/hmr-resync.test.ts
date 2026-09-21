@@ -290,6 +290,7 @@ describe('HMR store re-sync', () => {
       { file: 'pop-out-store.ts', key: 'popOutStore', selfAccepts: true },
       { file: 'updater-store.ts', key: 'updaterStore', selfAccepts: true },
       { file: 'monitor-store.ts', key: 'monitorStore', selfAccepts: true },
+      { file: 'task-overview-store.ts', key: 'taskOverviewStore', selfAccepts: true },
       { file: 'announcements-store.ts', key: 'announcementsStore', selfAccepts: true },
     ];
     const violations: string[] = [];

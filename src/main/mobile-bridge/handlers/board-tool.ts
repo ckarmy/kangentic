@@ -35,6 +35,10 @@ export async function handleBoardTool(
   if (!isRecord(payload.params)) {
     return { type: 'capability-response', requestId: request.requestId, ok: false, error: '"params" must be an object' };
   }
+  if (['answer_task_question', 'resume_answered_task', 'get_task_result', 'prepare_task_delivery', 'prepare_task_push', 'get_task_delivery_operation'].includes(payload.tool)
+      && (typeof payload.params.project !== 'string' || !payload.params.project)) {
+    return { type: 'capability-response', requestId: request.requestId, ok: false, error: 'Explicit project is required for task result and human response actions' };
+  }
 
   const projectId = (typeof payload.params.project === 'string' ? payload.params.project : undefined)
     ?? context.currentProjectId

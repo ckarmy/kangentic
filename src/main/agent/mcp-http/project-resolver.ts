@@ -272,6 +272,15 @@ export class RequestResolver {
     return this.cachedProjects;
   }
 
+  /**
+   * A human-actor context for one project. Only the admin-token-only
+   * kangentic_record_human_go tool uses it, to relay CK's GO from a trusted
+   * local transport; agent sessions never register that tool.
+   */
+  humanContextFor(projectId: string): CommandContext | null {
+    return buildCommandContextForProject(this.ipcContext, projectId, 'human');
+  }
+
   private makeResolved(project: Project, selector: string): ResolvedProject | { error: string } {
     // Default project short-circuits to the pre-built context so we
     // skip the IPC-wiring overhead for the most common path.

@@ -94,6 +94,9 @@ export const MOBILE_EXCLUDED_BOARD_TOOLS: ReadonlySet<string> = new Set([
   'route_task',
   'complete_route_stage',
   'sync_external_draft',
+  'prepare_draft',
+  'request_human_input',
+  'record_task_result',
 ]);
 
 /** True only for a `commandHandlers` key that is both classified here and not on the exclusion list. */

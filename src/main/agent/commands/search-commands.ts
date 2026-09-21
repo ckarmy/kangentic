@@ -241,7 +241,7 @@ export const handleFindTask: CommandHandler = (
       if (task.worktree_path) parts.push(`worktree: ${task.worktree_path}`);
       if (task.pr_url) parts.push(`PR: ${task.pr_url}`);
       else if (task.pr_number) parts.push(`PR #${task.pr_number}`);
-      parts.push(`#${task.display_id}, id: ${task.id}`);
+      parts.push(`#${task.display_id}, id: ${task.id}, revision: ${task.revision}`);
       return `- ${parts.join(' | ')}`;
     });
     sections.push(lines.join('\n'));
@@ -263,6 +263,7 @@ export const handleFindTask: CommandHandler = (
     data: {
       tasks: taskMatches.map((task) => ({
         id: task.id,
+        revision: task.revision,
         displayId: task.display_id,
         title: task.title,
         description: task.description,
@@ -338,6 +339,7 @@ export const handleGetCurrentTask: CommandHandler = (
 
   const toData = (task: Task) => ({
     id: task.id,
+    revision: task.revision,
     displayId: task.display_id,
     title: task.title,
     description: task.description,
@@ -369,7 +371,7 @@ export const handleGetCurrentTask: CommandHandler = (
     const task = matches[0];
     return {
       success: true,
-      message: `Current task: #${task.display_id} "${task.title}" [${task.archived_at ? 'Done' : (swimlaneMap.get(task.swimlane_id) ?? 'Unknown')}]`,
+      message: `Current task: #${task.display_id} "${task.title}" [${task.archived_at ? 'Done' : (swimlaneMap.get(task.swimlane_id) ?? 'Unknown')}] | id: ${task.id} | revision: ${task.revision}`,
       data: toData(task),
     };
   }

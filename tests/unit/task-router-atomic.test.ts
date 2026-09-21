@@ -1,13 +1,29 @@
+import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { vi } from 'vitest';
 import { handleCompleteRouteStage, handleCreateTask, handleDeleteTask, handleMoveTask, handlePrepareDraft, handleRequestHumanInput, handleRouteTask, handleSyncExternalDraft, handleUpdateTask, nextRouteStage, routerTextSensitive } from '../../src/main/agent/commands/task-commands';
 import { runProjectMigrations } from '../../src/main/db/migrations/project-schema';
 import { SessionRepository } from '../../src/main/db/repositories/session-repository';
+import { TaskCloseoutRepository } from '../../src/main/db/repositories/task-closeout-repository';
 import { TaskRepository, taskFingerprint } from '../../src/main/db/repositories/task-repository';
 import { labelsAfterHumanDraftApproval, restorePendingRouteDestination, retireOrphanTaskSessions, routeLifecycleNeedsRecovery } from '../../src/main/ipc/handlers/task-move';
 import { handleCreateBacklogTask, handlePromoteBacklog, handleUpdateBacklogItem } from '../../src/main/agent/commands/backlog-commands';
 import { SwimlaneRepository } from '../../src/main/db/repositories/swimlane-repository';
+
+function closeoutReport(taskId: string, checks = [{ command: 'npx vitest run', result: 'passed' as const, evidence: 'Passed.' }]) {
+  return {
+    version: 1 as const,
+    taskId,
+    summary: 'Implemented and verified.',
+    files: [],
+    checks,
+    head: 'a'.repeat(40),
+    delivery: 'No push performed.',
+    deployment: 'No deployment performed.',
+    nextAction: 'Human review.',
+  };
+}
 
 describe('atomic task router contract', () => {
   let db: Database.Database;
@@ -405,6 +421,10 @@ describe('atomic task router contract', () => {
     const context = { projectId: 'project-1', getProjectDb: () => db, onTaskMove } as any;
 
     for (const [stage, expected] of [['Executing', reviewId], ['Review', verifyId], ['Verify', readyId]] as const) {
+      if (stage === 'Verify') {
+        const current = tasks.getById(task.id)!;
+        new TaskCloseoutRepository(db).save(task.id, current.revision, closeoutReport(task.id));
+      }
       const response = await handleCompleteRouteStage({ taskId: task.id, stage }, context);
       expect(response.success).toBe(true);
       await vi.waitFor(() => expect(tasks.getById(task.id)!.swimlane_id).toBe(expected));
@@ -413,6 +433,68 @@ describe('atomic task router contract', () => {
     expect(retry.success).toBe(true);
     expect(retry.data).toMatchObject({ duplicate: true, target: 'Ready' });
     expect(onTaskMove).toHaveBeenCalledTimes(3);
+  });
+
+  it('requires a current closeout before direct Executing and Review transitions into Ready', async () => {
+    const direct = tasks.create({ title: 'Direct ready', description: 'A bounded direct task.', swimlane_id: todoId });
+    tasks.routeFromTodo({
+      taskId: direct.id, targetSwimlaneId: executingId, targetPosition: 0,
+      expectedRevision: direct.revision, expectedFingerprint: taskFingerprint(direct, 'project-1'),
+      policyVersion: 'policy-1', profileId: 'profile-balanced', workflow: 'direct',
+      dispatchId: '55666666-5555-4555-8555-555555555555', projectId: 'project-1',
+    });
+    const review = tasks.create({ title: 'Reviewed ready', description: 'A bounded reviewed task.', swimlane_id: todoId });
+    tasks.routeFromTodo({
+      taskId: review.id, targetSwimlaneId: executingId, targetPosition: 0,
+      expectedRevision: review.revision, expectedFingerprint: taskFingerprint(review, 'project-1'),
+      policyVersion: 'policy-1', profileId: 'profile-balanced', workflow: 'review',
+      dispatchId: '55777777-5555-4555-8555-555555555555', projectId: 'project-1',
+    });
+    const onTaskMove = vi.fn(async (input) => tasks.move(input));
+    const context = { projectId: 'project-1', getProjectDb: () => db, onTaskMove } as any;
+
+    const missing = handleCompleteRouteStage({ taskId: direct.id, stage: 'Executing' }, context);
+    expect(missing).toMatchObject({ success: false, error: expect.stringMatching(/result|closeout/i) });
+    expect(onTaskMove).not.toHaveBeenCalled();
+
+    const directCurrent = tasks.getById(direct.id)!;
+    new TaskCloseoutRepository(db).save(direct.id, directCurrent.revision, closeoutReport(direct.id));
+    expect(handleCompleteRouteStage({ taskId: direct.id, stage: 'Executing' }, context)).toMatchObject({ success: true, data: { target: 'Ready' } });
+    await vi.waitFor(() => expect(tasks.getById(direct.id)!.swimlane_id).toBe(readyId));
+
+    expect(handleCompleteRouteStage({ taskId: review.id, stage: 'Executing' }, context)).toMatchObject({ success: true, data: { target: 'Review' } });
+    await vi.waitFor(() => expect(tasks.getById(review.id)!.swimlane_id).toBe(reviewId));
+    const reviewCurrent = tasks.getById(review.id)!;
+    new TaskCloseoutRepository(db).save(review.id, reviewCurrent.revision, closeoutReport(review.id));
+    expect(handleCompleteRouteStage({ taskId: review.id, stage: 'Review' }, context)).toMatchObject({ success: true, data: { target: 'Ready' } });
+    await vi.waitFor(() => expect(tasks.getById(review.id)!.swimlane_id).toBe(readyId));
+  });
+
+  it.each([
+    ['stale', (taskId: string, revision: number) => ({ revision: revision - 1, report: closeoutReport(taskId) })],
+    ['empty checks', (taskId: string, revision: number) => ({ revision, report: closeoutReport(taskId, []) })],
+    ['failed check', (taskId: string, revision: number) => ({ revision, report: closeoutReport(taskId, [{ command: 'npx vitest run', result: 'failed' as const, evidence: 'Failed.' }]) })],
+  ])('refuses a %s closeout before Verify can enter Ready', (kind, makeCloseout) => {
+    const task = tasks.create({ title: `Reject ${kind} closeout`, description: 'A bounded test task.', swimlane_id: todoId });
+    tasks.routeFromTodo({
+      taskId: task.id, targetSwimlaneId: verifyId, targetPosition: 0,
+      expectedRevision: task.revision, expectedFingerprint: taskFingerprint(task, 'project-1'),
+      policyVersion: 'policy-1', profileId: 'profile-balanced', workflow: 'test',
+      dispatchId: `55888888-5555-4555-8555-55555555555${kind === 'stale' ? '1' : kind === 'empty checks' ? '2' : '3'}`,
+      projectId: 'project-1',
+    });
+    const current = tasks.getById(task.id)!;
+    const closeout = makeCloseout(task.id, current.revision);
+    new TaskCloseoutRepository(db).save(task.id, closeout.revision, closeout.report);
+    const onTaskMove = vi.fn(async (input) => tasks.move(input));
+
+    const response = handleCompleteRouteStage({ taskId: task.id, stage: 'Verify' }, {
+      projectId: 'project-1', getProjectDb: () => db, onTaskMove,
+    } as any);
+
+    expect(response).toMatchObject({ success: false, error: expect.stringMatching(/result|closeout|check/i) });
+    expect(tasks.getById(task.id)!.swimlane_id).toBe(verifyId);
+    expect(onTaskMove).not.toHaveBeenCalled();
   });
 
   it('deduplicates a repeated completion while its move is in flight', async () => {
@@ -427,6 +509,8 @@ describe('atomic task router contract', () => {
     const pending = new Promise<void>((resolve) => { release = resolve; });
     const onTaskMove = vi.fn(async (input) => { await pending; tasks.move(input); });
     const context = { projectId: 'project-1', getProjectDb: () => db, onTaskMove } as any;
+    const routed = tasks.getById(task.id)!;
+    new TaskCloseoutRepository(db).save(task.id, routed.revision, closeoutReport(task.id));
     const first = await handleCompleteRouteStage({ taskId: task.id, stage: 'Executing' }, context);
     const duplicate = await handleCompleteRouteStage({ taskId: task.id, stage: 'Executing' }, context);
     expect(first.success).toBe(true);
@@ -456,6 +540,7 @@ describe('atomic task router contract', () => {
 
     const onTaskMove = vi.fn(async (input) => tasks.move(input));
     const context = { projectId: 'project-1', getProjectDb: () => db, onTaskMove } as any;
+    new TaskCloseoutRepository(db).save(task.id, routed.revision, closeoutReport(task.id));
     const recovered = await handleCompleteRouteStage({ taskId: task.id, stage: 'Executing' }, context);
     expect(recovered.success).toBe(true);
     expect(recovered.data).toMatchObject({ duplicate: false, target: 'Ready' });
@@ -489,6 +574,45 @@ describe('atomic task router contract', () => {
     expect(staleAfterRework.data).toMatchObject({ duplicate: true, target: 'Review' });
     expect(tasks.getById(task.id)!.swimlane_id).toBe(executingId);
     expect(onTaskMove).toHaveBeenCalledOnce();
+  });
+
+  it('a genuine rework run can complete its stage again', async () => {
+    const task = tasks.create({ title: 'Reworked task', description: 'A task that requires review and verification.', swimlane_id: todoId });
+    tasks.routeFromTodo({
+      taskId: task.id, targetSwimlaneId: executingId, targetPosition: 0,
+      expectedRevision: task.revision, expectedFingerprint: taskFingerprint(task, 'project-1'),
+      policyVersion: 'policy-1', profileId: 'profile-balanced', workflow: 'review-test',
+      dispatchId: '78787878-7878-4878-8878-787878787878', projectId: 'project-1',
+    });
+    const onTaskMove = vi.fn(async (input) => tasks.move(input));
+    const context = { projectId: 'project-1', getProjectDb: () => db, onTaskMove } as any;
+    expect((await handleCompleteRouteStage({ taskId: task.id, stage: 'Executing' }, context)).success).toBe(true);
+    await vi.waitFor(() => expect(tasks.getById(task.id)!.swimlane_id).toBe(reviewId));
+
+    // Review took a while; then the reviewer sends it back and a new
+    // Executing session starts.
+    db.prepare('UPDATE route_stage_completions SET updated_at = ? WHERE dispatch_id = ?')
+      .run(new Date(Date.now() - 10 * 60_000).toISOString(), '78787878-7878-4878-8878-787878787878');
+    tasks.move({ taskId: task.id, targetSwimlaneId: executingId, targetPosition: 0 });
+    const insertSession = (startedAt: string) => db.prepare(`INSERT INTO sessions
+      (id, task_id, session_type, command, cwd, status, started_at)
+      VALUES (?, ?, 'claude_agent', 'claude', '.', 'running', ?)`)
+      .run(crypto.randomUUID(), task.id, startedAt);
+
+    // A session that has just started is not yet proof of new work.
+    insertSession(new Date(Date.now() - 5_000).toISOString());
+    const tooSoon = await handleCompleteRouteStage({ taskId: task.id, stage: 'Executing' }, context);
+    expect(tooSoon.data).toMatchObject({ duplicate: true });
+    expect(onTaskMove).toHaveBeenCalledOnce();
+
+    insertSession(new Date(Date.now() - 2 * 60_000).toISOString());
+    db.prepare('DELETE FROM sessions WHERE task_id = ? AND started_at > ?')
+      .run(task.id, new Date(Date.now() - 60_000).toISOString());
+    const rework = await handleCompleteRouteStage({ taskId: task.id, stage: 'Executing' }, context);
+    expect(rework.success).toBe(true);
+    expect(rework.data).toMatchObject({ duplicate: false, target: 'Review' });
+    await vi.waitFor(() => expect(tasks.getById(task.id)!.swimlane_id).toBe(reviewId));
+    expect(onTaskMove).toHaveBeenCalledTimes(2);
   });
 
   it('recovers only the matching pending dispatch and retires orphan PTYs before retry', async () => {

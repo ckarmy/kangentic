@@ -187,3 +187,5 @@ export {
 } from './events/payloads';
 
 export type { Transport, TransportState, Unsubscribe } from './transport/transport';
+export { parseTaskCloseout, parseTaskCloseoutSnapshot, type TaskCloseoutReport, type TaskCloseoutSnapshot } from './task-closeout';
+export type { TaskDeliveryConfirmation, TaskDeliveryCommitResult, TaskDeliveryOperation, TaskPushPreview, TaskDeliveryPreview } from './task-delivery';

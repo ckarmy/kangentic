@@ -435,6 +435,14 @@ const api: ElectronAPI = {
   // spans every registered project by design.
   monitor: {
     getSnapshot: () => ipcRenderer.invoke(IPC.MONITOR_GET_SNAPSHOT),
+    getTaskOverview: () => ipcRenderer.invoke(IPC.MONITOR_GET_TASK_OVERVIEW),
+    getTaskCloseout: (taskId, projectId) => ipcRenderer.invoke(IPC.MONITOR_GET_TASK_CLOSEOUT, taskId, projectId),
+    prepareDelivery: (taskId, projectId) => ipcRenderer.invoke(IPC.MONITOR_PREPARE_DELIVERY, taskId, projectId),
+    preparePush: (taskId, projectId) => ipcRenderer.invoke(IPC.MONITOR_PREPARE_PUSH, taskId, projectId),
+    confirmPush: (taskId, revision, fingerprint, projectId) => ipcRenderer.invoke(IPC.MONITOR_CONFIRM_PUSH, taskId, revision, fingerprint, projectId),
+    confirmDelivery: (taskId, confirmation, projectId) => ipcRenderer.invoke(IPC.MONITOR_CONFIRM_DELIVERY, taskId, confirmation, projectId),
+    answerTask: (taskId, answer, expectedRevision, projectId) => ipcRenderer.invoke(IPC.MONITOR_ANSWER_TASK, taskId, answer, expectedRevision, projectId),
+    resumeAnsweredTask: (taskId, expectedRevision, projectId) => ipcRenderer.invoke(IPC.MONITOR_RESUME_ANSWERED_TASK, taskId, expectedRevision, projectId),
     subscribe: () => ipcRenderer.invoke(IPC.MONITOR_SUBSCRIBE),
     unsubscribe: () => ipcRenderer.invoke(IPC.MONITOR_UNSUBSCRIBE),
     revealTask: (projectId, taskId) => ipcRenderer.invoke(IPC.MONITOR_REVEAL_TASK, projectId, taskId),

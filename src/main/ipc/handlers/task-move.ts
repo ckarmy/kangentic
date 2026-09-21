@@ -46,6 +46,7 @@ import { reportAutoCommandOutcome } from '../helpers/auto-command-outcome';
 import { restartSessionForSettingsChange } from './session-reconcile';
 import type { Task, Swimlane, SessionRecord, TaskUpdateInput } from '../../../shared/types';
 import type { AtomicRouteInput } from '../../db/repositories/task-repository';
+import { acknowledgeDraftApproval } from '../../../shared/draft-approval-description';
 
 /**
  * Per-task AbortController to cancel in-flight moves when a newer move
@@ -474,6 +475,10 @@ export async function handleTaskMove(
         if (approvedLabels !== task.labels) {
           task = tasks.update({ id: task.id, labels: approvedLabels });
           console.log(`[TASK_MOVE] Recorded human approval for task ${task.id.slice(0, 8)} (Draft -> Approved)`);
+        }
+        if (['renderer', 'mobile'].includes(origin) && fromLane?.name === 'Draft' && rawToLane?.name === 'Approved') {
+          const description = acknowledgeDraftApproval(task.description);
+          if (description !== task.description) task = tasks.update({ id: task.id, description });
         }
         // Leaving the quiet Draft is the human GO boundary. Detach the Trello
         // mirror in the same locked lifecycle before any worktree/session work,

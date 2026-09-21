@@ -20,6 +20,10 @@ import type { IpcContext } from '../ipc/ipc-context';
 import type { AppConfig } from '../../shared/types';
 import { RequestResolver } from './mcp-http/project-resolver';
 import { prResolveOptionsFromGitConfig } from '../pr/pr-linking';
+import { resumeAnsweredTask } from '../monitor/resume-answered-task';
+import { readTaskCloseout } from '../monitor/task-closeout';
+import { prepareTaskDelivery, prepareTaskPush } from '../monitor/task-delivery';
+import { readDeliveryOperation } from '../monitor/delivery-operation';
 
 /**
  * Resolve a project ID to a CommandContext, or return null if the project
@@ -37,6 +41,13 @@ export function buildCommandContextForProject(
 
   return {
     actor,
+    readTaskResult: (taskId) => readTaskCloseout(ipcContext, projectId, taskId),
+    prepareTaskDelivery: actor === 'human' ? (taskId) => prepareTaskDelivery(ipcContext, projectId, taskId) : undefined,
+    prepareTaskPush: actor === 'human' ? (taskId) => prepareTaskPush(ipcContext, projectId, taskId) : undefined,
+    readDeliveryOperation: actor === 'human' ? (taskId, operationId) => readDeliveryOperation(getProjectDb(projectId), taskId, operationId) : undefined,
+    onAnsweredTaskResume: actor === 'human'
+      ? (taskId, expectedRevision) => resumeAnsweredTask(ipcContext, projectId, taskId, expectedRevision)
+      : undefined,
     projectId,
     getProjectDb: () => getProjectDb(projectId),
     getProjectPath: () => projectPath,

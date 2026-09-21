@@ -5634,6 +5634,14 @@ export interface ElectronAPI {
      *  250ms, so this is cheap in practice - but it is not the O(projects) it was
      *  once described as, and a project with many concurrent agents pays per agent. */
     getSnapshot: () => Promise<MonitorSnapshot>;
+    getTaskOverview: () => Promise<import('./task-overview').TaskOverviewSnapshot>;
+    getTaskCloseout: (taskId: string, projectId: string) => Promise<import('./task-closeout').TaskCloseoutSnapshot>;
+    prepareDelivery: (taskId: string, projectId: string) => Promise<import('./task-delivery').TaskDeliveryPreview>;
+    preparePush: (taskId: string, projectId: string) => Promise<import('./task-delivery').TaskPushPreview>;
+    confirmPush: (taskId: string, revision: number, fingerprint: string, projectId: string) => Promise<import('./task-delivery').TaskDeliveryCommitResult>;
+    confirmDelivery: (taskId: string, confirmation: import('./task-delivery').TaskDeliveryConfirmation, projectId: string) => Promise<import('./task-delivery').TaskDeliveryCommitResult>;
+    answerTask: (taskId: string, answer: string, expectedRevision: number, projectId: string) => Promise<{ success: boolean; error?: string }>;
+    resumeAnsweredTask: (taskId: string, expectedRevision: number, projectId: string) => Promise<void>;
     /** Register this renderer as a live monitor consumer and get a fresh snapshot
      *  back. Main only builds and pushes MONITOR_CHANGED snapshots while at least
      *  one renderer is subscribed, so an unmounted monitor costs no per-event

@@ -14,6 +14,7 @@ import { useUpdaterStore } from './stores/updater-store';
 import { useAnnouncementsStore } from './stores/announcements-store';
 import { useUsageDashboardStore } from './stores/usage-dashboard-store';
 import { useMonitorStore } from './stores/monitor-store';
+import { useTaskOverviewStore } from './stores/task-overview-store';
 import { usePopOutStore } from './stores/pop-out-store';
 import { receivePopOutOpenSet } from './pop-out/pop-out-changed';
 import { useDictationStore } from './stores/dictation-store';
@@ -892,6 +893,7 @@ if (import.meta.hot) {
     // main-process truth (no-ops while the monitor is closed).
     if (useMonitorStore.getState().monitorOpen) {
       void useMonitorStore.getState().loadSnapshot();
+      void useTaskOverviewStore.getState().refresh();
     }
     // Pop-out windows Pattern B: re-hydrate which surfaces are currently detached.
     usePopOutStore.getState().loadOpen();

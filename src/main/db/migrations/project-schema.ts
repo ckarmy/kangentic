@@ -1494,6 +1494,28 @@ export function runProjectMigrations(db: Database.Database): void {
     db.exec('ALTER TABLE tasks ADD COLUMN pr_merge_readiness TEXT DEFAULT NULL');
   }
 
+  // Result evidence survives worktree cleanup and task archival. Explicit task
+  // deletion removes it through the same foreign-key lifecycle.
+  db.exec(`CREATE TABLE IF NOT EXISTS task_closeouts (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    task_revision INTEGER NOT NULL,
+    report_json TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+  )`);
+
+  db.exec(`CREATE TABLE IF NOT EXISTS task_delivery_operations (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN ('commit', 'push')),
+    request_hash TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('running', 'succeeded', 'uncertain')),
+    result_json TEXT,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(task_id, kind, request_hash)
+  )`);
+
   // Persistent cache of remote board items for the Import dialog, keyed by
   // (source, repository, external_id). Lets the dialog paint instantly on open
   // and reconcile only items changed since the cache's high-water mark

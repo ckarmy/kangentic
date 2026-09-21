@@ -9,6 +9,12 @@ export interface CommandContext {
    * `agent` (fail closed) for every existing MCP/test caller.
    */
   actor?: 'agent' | 'human';
+  /** Human transport only. Not exposed as an MCP tool or agent capability. */
+  onAnsweredTaskResume?: (taskId: string, expectedRevision: number) => Promise<void>;
+  readTaskResult?: (taskId: string) => Promise<import('../../../shared/task-closeout').TaskCloseoutSnapshot>;
+  prepareTaskDelivery?: (taskId: string) => Promise<import('../../../shared/task-delivery').TaskDeliveryPreview>;
+  prepareTaskPush?: (taskId: string) => Promise<import('../../../shared/task-delivery').TaskPushPreview>;
+  readDeliveryOperation?: (taskId: string, operationId: string) => import('@kangentic/protocol').TaskDeliveryOperation | null;
   /**
    * The project this call is scoped to. Bound to the REQUEST's project, not the
    * active one, exactly like `getProjectPath` - a cross-project tool call must

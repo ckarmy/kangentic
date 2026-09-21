@@ -3797,6 +3797,28 @@
           generatedAt: '2026-01-01T00:00:00.000Z',
         });
       },
+      getTaskOverview: function () {
+        return Promise.resolve(window.__mockTaskOverview || {
+          tasks: [], unavailableProjects: [], generatedAt: '2026-01-01T00:00:00.000Z',
+        });
+      },
+      getTaskCloseout: function () {
+        return Promise.resolve({ state: 'missing', message: 'No result configured in this mock.' });
+      },
+      prepareDelivery: function () {
+        return Promise.reject(new Error('No hay un worktree disponible en esta demostración.'));
+      },
+      preparePush: function () { return Promise.reject(new Error('Push unavailable in demo.')); },
+      confirmPush: function () { return Promise.reject(new Error('Push unavailable in demo.')); },
+      confirmDelivery: function () {
+        return Promise.reject(new Error('No se realizan commits en esta demostración.'));
+      },
+      answerTask: function () {
+        return Promise.resolve({ success: false, error: 'Answer persistence is not configured in this mock.' });
+      },
+      resumeAnsweredTask: function () {
+        return Promise.reject(new Error('Session resume is not configured in this mock.'));
+      },
       // Subscription handshake (monitor:subscribe / monitor:unsubscribe). The
       // mock has no push pipeline to gate, so subscribe just returns the same
       // seeded snapshot getSnapshot serves; the call log lets a spec assert the

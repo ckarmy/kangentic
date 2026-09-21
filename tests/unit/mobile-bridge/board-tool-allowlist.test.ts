@@ -44,6 +44,11 @@ describe('mobile board tool allowlist parity', () => {
     expect(isBoardToolAllowedForVerb('search_tasks', 'board-tool-write')).toBe(false);
   });
 
+  it('classifies get_task_result as a read-only mobile capability', () => {
+    expect(isBoardToolAllowedForVerb('get_task_result', 'board-tool-read')).toBe(true);
+    expect(isBoardToolAllowedForVerb('get_task_result', 'board-tool-write')).toBe(false);
+  });
+
   it('a mutating tool is reachable only via board-tool-write', () => {
     expect(isBoardToolAllowedForVerb('update_task', 'board-tool-write')).toBe(true);
     expect(isBoardToolAllowedForVerb('update_task', 'board-tool-read')).toBe(false);

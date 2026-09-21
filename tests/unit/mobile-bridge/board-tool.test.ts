@@ -15,6 +15,7 @@ const searchTasksHandler = vi.fn();
 const updateTaskHandler = vi.fn();
 const queryDbHandler = vi.fn();
 const moveTaskHandler = vi.fn();
+const getTaskResultHandler = vi.fn();
 
 vi.mock('../../../src/main/agent/commands', () => ({
   commandHandlers: {
@@ -24,6 +25,7 @@ vi.mock('../../../src/main/agent/commands', () => ({
     // Present in commandHandlers but deliberately excluded from the mobile
     // surface - covered by the dedicated move-task verb instead.
     move_task: (...args: unknown[]) => moveTaskHandler(...args),
+    get_task_result: (...args: unknown[]) => getTaskResultHandler(...args),
   },
 }));
 
@@ -50,6 +52,7 @@ describe('handleBoardTool', () => {
     updateTaskHandler.mockReset();
     queryDbHandler.mockReset();
     moveTaskHandler.mockReset();
+    getTaskResultHandler.mockReset();
     buildCommandContextForProjectMock.mockReset();
     buildCommandContextForProjectMock.mockReturnValue({ getProjectPath: () => '/projects/proj-1' });
   });
@@ -135,5 +138,25 @@ describe('handleBoardTool', () => {
   it('rejects a non-object params field', async () => {
     const response = await handleBoardTool(fakeRequest('board-tool-read', { tool: 'search_tasks', params: 'nope' }), fakeContext('proj-1'));
     expect(response.ok).toBe(false);
+  });
+
+  it('requires an explicit project for get_task_result rather than using the ambient project', async () => {
+    const response = await handleBoardTool(fakeRequest('board-tool-read', { tool: 'get_task_result', params: { taskId: 'task-1' } }), fakeContext('proj-1'));
+
+    expect(response.ok).toBe(false);
+    expect(response.error).toMatch(/explicit project/i);
+    expect(getTaskResultHandler).not.toHaveBeenCalled();
+    expect(buildCommandContextForProjectMock).not.toHaveBeenCalled();
+  });
+
+  it('allows get_task_result through the read allowlist when its project is explicit', async () => {
+    getTaskResultHandler.mockReturnValue({ success: true, data: { state: 'missing', message: 'No result.' } });
+    const response = await handleBoardTool(fakeRequest('board-tool-read', {
+      tool: 'get_task_result', params: { project: 'proj-other', taskId: 'task-1' },
+    }), fakeContext('proj-1'));
+
+    expect(response).toMatchObject({ ok: true, payload: { result: { state: 'missing' } } });
+    expect(buildCommandContextForProjectMock).toHaveBeenCalledWith(expect.anything(), 'proj-other', 'human');
+    expect(getTaskResultHandler).toHaveBeenCalledOnce();
   });
 });

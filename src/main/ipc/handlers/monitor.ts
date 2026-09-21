@@ -18,6 +18,13 @@ import type { WebContents } from 'electron';
 import { IPC } from '../../../shared/ipc-channels';
 import { broadcast } from '../../pop-out/window-broadcast';
 import { buildMonitorSnapshot } from '../../monitor/monitor-aggregator';
+import { buildTaskOverview } from '../../monitor/task-overview';
+import { buildCommandContextForProject } from '../../agent/mcp-project-context';
+import { handleHumanResponse } from '../../agent/commands/human-response';
+import { resumeAnsweredTask } from '../../monitor/resume-answered-task';
+import { readTaskCloseout } from '../../monitor/task-closeout';
+import { prepareTaskDelivery, confirmTaskDelivery, prepareTaskPush, confirmTaskPush } from '../../monitor/task-delivery';
+import type { TaskDeliveryConfirmation } from '../../../shared/task-delivery';
 import { MonitorPeekTracker } from '../../monitor/monitor-peek-tracker';
 import { buildTaskDetailBundle } from '../../monitor/task-detail-bundle';
 import type { IpcContext } from '../ipc-context';
@@ -30,6 +37,21 @@ import type { IpcContext } from '../ipc-context';
 const MONITOR_PUSH_DEBOUNCE_MS = 250;
 
 export function registerMonitorHandlers(context: IpcContext): void {
+  ipcMain.handle(IPC.MONITOR_GET_TASK_OVERVIEW, () => buildTaskOverview(context));
+  ipcMain.handle(IPC.MONITOR_GET_TASK_CLOSEOUT, (_, taskId: string, projectId: string) => readTaskCloseout(context, projectId, taskId));
+  ipcMain.handle(IPC.MONITOR_PREPARE_DELIVERY, (_, taskId: string, projectId: string) => prepareTaskDelivery(context, projectId, taskId));
+  ipcMain.handle(IPC.MONITOR_PREPARE_PUSH, (_, taskId: string, projectId: string) => prepareTaskPush(context, projectId, taskId));
+  ipcMain.handle(IPC.MONITOR_CONFIRM_PUSH, (_, taskId: string, revision: number, fingerprint: string, projectId: string) => confirmTaskPush(context, projectId, taskId, revision, fingerprint));
+  ipcMain.handle(IPC.MONITOR_CONFIRM_DELIVERY, (_, taskId: string, confirmation: TaskDeliveryConfirmation, projectId: string) => confirmTaskDelivery(context, projectId, taskId, confirmation));
+  ipcMain.handle(IPC.MONITOR_RESUME_ANSWERED_TASK, (_, taskId: string, expectedRevision: number, projectId: string) =>
+    resumeAnsweredTask(context, projectId, taskId, expectedRevision));
+  ipcMain.handle(IPC.MONITOR_ANSWER_TASK, async (_, taskId: string, answer: string, expectedRevision: number, projectId: string) => {
+    if (typeof projectId !== 'string' || !projectId) return { success: false, error: 'Project is required' };
+    const commandContext = buildCommandContextForProject(context, projectId, 'human');
+    if (!commandContext) return { success: false, error: 'Project is unavailable' };
+    const result = await handleHumanResponse({ taskId, answer, expectedRevision }, commandContext);
+    return { success: result.success, error: result.error };
+  });
   let pushTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**

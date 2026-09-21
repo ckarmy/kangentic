@@ -14,6 +14,10 @@
  * fails that test instead of silently breaking phones.
  */
 export const BOARD_TOOL_READ_NAMES = [
+  'get_task_result',
+  'prepare_task_delivery',
+  'prepare_task_push',
+  'get_task_delivery_operation',
   'search_tasks',
   'find_task',
   'get_current_task',
@@ -32,6 +36,8 @@ export const BOARD_TOOL_READ_NAMES = [
 ] as const;
 
 export const BOARD_TOOL_WRITE_NAMES = [
+  'answer_task_question',
+  'resume_answered_task',
   'create_task',
   'update_task',
   'delete_task',

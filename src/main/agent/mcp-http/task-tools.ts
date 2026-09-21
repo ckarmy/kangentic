@@ -837,11 +837,29 @@ export function registerTaskTools(
   );
   }
 
-  // --- kangentic_complete_route_stage ---
+  // --- kangentic_record_task_result ---
+  server.registerTool(
+    'kangentic_record_task_result',
+    {
+      description: 'Record a durable task result before final handoff. Does not advance the task or verify claims. Report JSON schema: version=1, taskId=full UUID, summary, files:string[], checks:{command,result:passed|failed|not-run,evidence}[], head=Git HEAD SHA, delivery, deployment, nextAction. Use actual results and explicitly state work not performed. Never claim unrun checks passed.',
+      inputSchema: z.object({
+        taskId: z.string().min(1),
+        expectedRevision: z.number().int().nonnegative(),
+        report: z.string().min(1).max(64 * 1024),
+        project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
+      }),
+      annotations: MUTATING_ANNOTATIONS,
+    },
+    async ({ taskId, expectedRevision, report, project }) => withProject(resolver, project, async (ctx) => {
+      const refused = requireOwnTask(ctx, taskId);
+      return refused ?? await callHandler('record_task_result', { taskId, expectedRevision, report }, ctx, 'Failed to record task result');
+    }),
+  );
+
   server.registerTool(
     'kangentic_complete_route_stage',
     {
-      description: 'Advance a successfully completed routed task to the one next column allowed by its stored workflow. The server derives the target, deduplicates retries, rechecks safety labels/text, and never moves to Done. Call only after the current stage has genuinely succeeded; on failure or uncertainty, leave the task in place for a human.',
+      description: 'Advance a successfully completed routed task to the one next column allowed by its stored workflow. The server derives the target, deduplicates retries, rechecks safety labels/text, and never moves to Done. Before the final transition to Ready, record a result with kangentic_record_task_result at the current task revision, including documented checks and no failed results. Call only after the current stage has genuinely succeeded; on failure or uncertainty, leave the task in place for a human.',
       inputSchema: z.object({
         taskId: z.string().min(1).describe('Task ID for the current routed task.'),
         stage: z.enum(['Planning', 'Executing', 'Review', 'Verify'])
@@ -857,6 +875,29 @@ export function registerTaskTools(
       );
     }),
   );
+
+  if (options.allowAdministrativeTools !== false) {
+    server.registerTool(
+      'kangentic_record_human_go',
+      {
+        description: 'Admin transport only (never offered to agent sessions). Record CK\'s GO or NO for a held task, relayed from a trusted local channel such as the router answering a Telegram question. GO appends the comment, adds go-ck, clears needs-info/needs-human/manual-hold/no-auto, and on an active stage paused by a question records the answer and resumes it. It never authorizes production execution. NO archives the task with the reason.',
+        inputSchema: z.object({
+          taskId: z.string().min(1),
+          decision: z.enum(['go', 'no']),
+          comment: z.string().max(2_000).optional(),
+          source: z.string().max(40).optional(),
+          expectedRevision: z.number().int().optional(),
+          project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
+        }),
+        annotations: MUTATING_ANNOTATIONS,
+      },
+      async ({ taskId, decision, comment, source, expectedRevision, project }) => withProject(resolver, project, async (_ctx, resolved) => {
+        const human = resolver.humanContextFor(resolved.projectId);
+        if (!human) return { content: [{ type: 'text' as const, text: 'Project context unavailable' }], isError: true };
+        return callHandler('record_human_go', { taskId, decision, comment, source, expectedRevision }, human, 'Failed to record GO');
+      }),
+    );
+  }
 
   server.registerTool(
     'kangentic_request_human_input',

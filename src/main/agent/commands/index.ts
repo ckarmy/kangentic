@@ -20,6 +20,10 @@ import { handleGetSessionFiles, handleGetSessionEvents } from './session-files-c
 import { handleGetActivityIntervals } from './activity-interval-commands';
 import { handleReserveDevPorts, handleCheckDevPorts } from './dev-port-commands';
 import type { CommandHandler } from './types';
+import { handleHumanResponse, handleResumeAnsweredTask } from './human-response';
+import { handleRecordHumanGo } from './human-go';
+import { handleGetTaskResult, handleRecordTaskResult } from './task-result';
+import { handlePrepareTaskDelivery, handlePrepareTaskPush, handleGetDeliveryOperation } from './task-delivery';
 
 /**
  * Registry mapping command method names to their handler functions.
@@ -27,6 +31,14 @@ import type { CommandHandler } from './types';
  * dispatch tool calls into the right handler.
  */
 export const commandHandlers: Record<string, CommandHandler> = {
+  answer_task_question: handleHumanResponse,
+  record_human_go: handleRecordHumanGo,
+  record_task_result: handleRecordTaskResult,
+  get_task_result: handleGetTaskResult,
+  prepare_task_delivery: handlePrepareTaskDelivery,
+  prepare_task_push: handlePrepareTaskPush,
+  get_task_delivery_operation: handleGetDeliveryOperation,
+  resume_answered_task: handleResumeAnsweredTask,
   create_task: handleCreateTask,
   update_task: handleUpdateTask,
   sync_external_draft: handleSyncExternalDraft,

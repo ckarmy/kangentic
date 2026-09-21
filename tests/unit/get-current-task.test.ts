@@ -99,6 +99,7 @@ describe('handleGetCurrentTask', () => {
     taskFixtures.push(makeTask({
       id: 'task-a',
       display_id: 42,
+      revision: 7,
       title: 'Add MCP tool',
       worktree_path: '/projects/example/.kangentic/worktrees/add-mcp-tool',
     }));
@@ -112,6 +113,8 @@ describe('handleGetCurrentTask', () => {
     expect(result.data).not.toBeNull();
     expect((result.data as { id: string }).id).toBe('task-a');
     expect((result.data as { displayId: number }).displayId).toBe(42);
+    expect((result.data as { revision: number }).revision).toBe(7);
+    expect(result.message).toContain('revision: 7');
   });
 
   it('matches by worktree slug when cwd is a subdirectory inside the worktree', () => {
