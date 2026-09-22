@@ -387,7 +387,7 @@ describe('atomic task router contract', () => {
     expect(stripHold.error).toMatch(/remove protected/);
     const promoted = handlePromoteBacklog({ itemIds: [itemId], column: 'Executing' }, context);
     expect(promoted.success).toBe(false);
-    expect(promoted.error).toMatch(/only to To Do/);
+    expect(promoted.error).toMatch(/only to Draft or To Do/);
 
     const viaCreateTask = await handleCreateTask({ title: 'Backlog approved', column: 'Backlog', labels: ['approved'] }, context);
     expect(viaCreateTask.success).toBe(false);

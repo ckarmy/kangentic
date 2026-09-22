@@ -433,6 +433,25 @@ describe('#682: queued submissions and same-instant siblings', () => {
     expect(await verifier('/merge-pull-request', sentAt, 'submitted')).toBe(true);
   });
 
+  it('confirms a long message the CLI recorded inside its <pasted_content> envelope (0.42.0-luuk.2, task #14)', async () => {
+    // Claude Code wraps a long bracketed paste; the Executing rules on #14 sat
+    // in the queue wrapped like this while the burst reported them unconfirmed.
+    const verifier = createSlashCommandVerifier(jsonlPath)!;
+    const sentAt = Date.now();
+    const rules = 'Implementa solamente el alcance de esta tarea. Delegacion: trabaja solo por defecto.';
+    appendEntry(queueEntry('enqueue', `<pasted_content id="5c39">\n${rules}\n</pasted_content id="5c39">`, 10));
+
+    expect(await verifier(rules, sentAt, 'submitted')).toBe(true);
+  });
+
+  it('still rejects a pasted envelope whose text is not exactly the command', async () => {
+    const verifier = createSlashCommandVerifier(jsonlPath)!;
+    const sentAt = Date.now();
+    appendEntry(queueEntry('enqueue', '<pasted_content id="aa11">\nsomething else\n</pasted_content id="aa11">', 10));
+
+    expect(await verifier('Implementa solamente el alcance.', sentAt, 'submitted')).toBe(false);
+  });
+
   it('does not confirm from an enqueue whose content is not exactly the command', async () => {
     const verifier = createSlashCommandVerifier(jsonlPath)!;
     const sentAt = Date.now();

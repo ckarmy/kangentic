@@ -46,3 +46,20 @@ it('uses a live isolated session, not a stale task session identifier', () => {
   expect(snapshot.tasks[0].attention.kind).toBe('unknown');
   expect(snapshot.tasks[1].attention.kind).toBe('blocked');
 });
+
+it('reads the router summary only while fresh, and tolerates a missing file', async () => {
+  const { readRouterReasons } = await import('../../src/main/monitor/task-overview');
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'router-summary-')), 'kangentic-resumen.json');
+  const now = Date.parse('2026-09-22T12:30:00Z');
+  fs.writeFileSync(file, JSON.stringify({
+    generado: '2026-09-22T12:15:53.837Z',
+    paraCK: [{ proyecto: 'Kangentic Inbox', n: 32, motivo: 'su entregable es producción' }],
+  }));
+  expect(readRouterReasons(file, now).get('Kangentic Inbox#32')).toBe('su entregable es producción');
+  expect(readRouterReasons(file, now + 3 * 60 * 60_000).size).toBe(0);
+  expect(readRouterReasons(path.join(path.dirname(file), 'missing.json'), now).size).toBe(0);
+  fs.rmSync(path.dirname(file), { recursive: true, force: true });
+});

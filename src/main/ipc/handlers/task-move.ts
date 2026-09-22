@@ -47,7 +47,8 @@ import { loadTaskProfile } from '../helpers/task-profile';
 import { reportAutoCommandOutcome } from '../helpers/auto-command-outcome';
 import { deliverExitMessage } from '../helpers/exit-message-delivery';
 import { resolveInjectionVerifier } from '../helpers/agent-spawn';
-import { reconcileTaskSessionRef, restartSessionForSettingsChange } from './session-reconcile';
+import { buildMessageEscalation, recordMessageRunOutcome } from '../helpers/agent-message-delivery';
+import { reconcileTaskSessionRef } from './session-reconcile';
 import type { AutoCommandMode, Task, Swimlane, SessionRecord, TaskUpdateInput } from '../../../shared/types';
 import type { AtomicRouteInput } from '../../db/repositories/task-repository';
 import { acknowledgeDraftApproval } from '../../../shared/draft-approval-description';
@@ -740,7 +741,7 @@ export async function handleTaskMove(
           const enterSummary = await enterEngine.executeTransition(task, toLane, 'enter', {
             signal,
             alreadyDelivered: deliveredMessageId ? new Set([deliveredMessageId]) : undefined,
-            deliverToAgent: async (message, mode) => {
+            deliverToAgent: async (message, mode, _runSignal, runId) => {
               // Re-read, never the Phase-1 snapshot. The enter group runs
               // OUTSIDE withTaskLock on purpose (a run_script row would
               // otherwise hold the lock for its whole budget), so between
@@ -752,7 +753,7 @@ export async function handleTaskMove(
               // agent-spawn.ts's deliverToAgent, which already re-reads.
               const currentTask = enterRepos.tasks.getById(task.id);
               const liveSession = currentTask?.session_id;
-              if (!liveSession) return;
+              if (!liveSession) return 'none';
               context.terminalSubmitScheduler.scheduleKeystrokes(
                 task.id,
                 liveSession,
@@ -760,9 +761,17 @@ export async function handleTaskMove(
                 {
                   mode,
                   verifier: resolveInjectionVerifier(task.agent, sessionRepo, task.id),
-                  onOutcome: (report) => reportAutoCommandOutcome(context, tasks, task, report, resolvedProjectId),
+                  // Rung 3, the same one the move's own auto_command burst
+                  // has: an unconfirmed message restarts the session with it
+                  // as the prompt, once, never for a confirm-only adapter.
+                  escalate: buildMessageEscalation(context, resolvedProjectId, resolvedProjectPath, task.id),
+                  onOutcome: (report) => {
+                    reportAutoCommandOutcome(context, tasks, task, report, resolvedProjectId);
+                    recordMessageRunOutcome(enterRepos.automationRuns, runId, report);
+                  },
                 },
               );
+              return 'keystrokes';
             },
             showNotification: (notification) => showDesktopNotification(context, notification),
             onProgress: createProgressCallback(context.mainWindow, task.id),
@@ -1245,24 +1254,7 @@ export async function handleTaskMove(
               // Rung 3 of the delivery ladder. Routed through the allowlisted
               // in-place restart rather than a new spawn call, so this adds no
               // spawn entry point (see spawn-entry-point-parity.md).
-              escalate: async (commands) => {
-                if (!resolvedProjectPath) return false;
-                // `restartSessionForSettingsChange` mutates per-task session
-                // state and documents that its caller must hold the task lock.
-                // Taking it here is safe and not reentrant: `scheduleKeystrokes`
-                // is fire-and-forget, so this callback runs well after the
-                // TASK_MOVE handler released the lock.
-                return withTaskLock(task.id, async () => {
-                  const restarted = await restartSessionForSettingsChange(
-                    context,
-                    resolvedProjectId,
-                    resolvedProjectPath,
-                    task.id,
-                    { phase: 'resending-command', resumePrompt: commands.join('\n') },
-                  );
-                  return restarted.ok;
-                });
-              },
+              escalate: buildMessageEscalation(context, resolvedProjectId, resolvedProjectPath, task.id),
               onOutcome: (report) => reportAutoCommandOutcome(context, tasks, task, report, resolvedProjectId),
             });
             // Record what the burst applied so the NEXT move diffs against the

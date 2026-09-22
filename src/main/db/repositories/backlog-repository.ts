@@ -120,12 +120,18 @@ export class BacklogRepository {
     const description = input.description ?? existing.description;
     const priority = input.priority ?? existing.priority;
     const labels = input.labels ?? existing.labels;
+    // undefined = untouched, null = cleared.
+    const dueDate = input.dueDate === undefined ? existing.due_date : input.dueDate;
+    const externalMetadata = input.externalMetadata === undefined ? existing.external_metadata : input.externalMetadata;
 
     this.db.prepare(`
       UPDATE backlog_tasks
-      SET title = ?, description = ?, priority = ?, labels = ?, updated_at = ?
+      SET title = ?, description = ?, priority = ?, labels = ?, due_date = ?, external_metadata = ?, updated_at = ?
       WHERE id = ?
-    `).run(title, description, priority, JSON.stringify(labels), now, input.id);
+    `).run(
+      title, description, priority, JSON.stringify(labels), dueDate,
+      externalMetadata ? JSON.stringify(externalMetadata) : null, now, input.id,
+    );
 
     return {
       ...existing,
@@ -133,6 +139,8 @@ export class BacklogRepository {
       description,
       priority,
       labels,
+      due_date: dueDate,
+      external_metadata: externalMetadata,
       updated_at: now,
     };
   }

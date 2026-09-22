@@ -906,12 +906,29 @@ Find attachment IDs with `kangentic_query_db`, e.g. `SELECT id, filename, task_i
 
 ### kangentic_list_backlog
 
-List items in the backlog staging area. Items have priority levels and labels for organization.
+List items in the backlog staging area. Items have priority levels, labels, an optional due date and optional external metadata. Ordered by due date, soonest first, undated last (ties keep the backlog's manual order).
+
+The response's `data` is a JSON array; each entry is `{ id, title, description, priority, priorityLabel, labels, dueDate, assignee, externalMetadata, createdAt }`, where `dueDate` is `YYYY-MM-DD` or null and `externalMetadata` is an object or null.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `priority` | number | No | Filter by priority: 0=none, 1=low, 2=medium, 3=high, 4=urgent |
 | `query` | string | No | Search keyword to filter by title, description, or labels |
+| `dueOnOrBefore` | string | No | `YYYY-MM-DD`. Only items due on or before this date; undated items are excluded |
+
+### kangentic_create_backlog_item
+
+Create an item in the backlog staging area. It never lands on the board and never starts an agent. Returns the new item in `data` (same fields as `kangentic_list_backlog`, except `priority` is the label and `priorityValue` the number). An agent cannot set `approved`.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `title` | string | Yes | Item title (max 200 characters) |
+| `description` | string | No | Item description (max 10,000 characters) |
+| `priority` | number | No | 0=none (default), 1=low, 2=medium, 3=high, 4=urgent |
+| `labels` | array | No | Strings, or `{name, color}` objects to also set the label color |
+| `dueDate` | string | No | Due date, `YYYY-MM-DD`; must be a real calendar date |
+| `assignee` | string | No | Free-text assignee |
+| `externalMetadata` | object | No | Arbitrary JSON object stored with the item (max 16 KB serialized) |
 
 ### kangentic_search
 
@@ -939,7 +956,7 @@ This tool consolidates what were previously two tools (`kangentic_search_everyth
 
 ### kangentic_promote_backlog
 
-Move backlog tasks to the board, creating tasks in the specified column. The done-role column is refused, the same way [kangentic_create_task](#kangentic_create_task) refuses it.
+Move backlog tasks to the board, creating tasks in the specified column. Agents may target the Draft column (no role, never starts an agent; protected items allowed, since nothing leaves Draft without a human) or the To Do column (protected items need a human). Any other column is refused; the done-role column is refused the same way [kangentic_create_task](#kangentic_create_task) refuses it.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -950,7 +967,7 @@ Attachments on promoted backlog tasks are automatically copied to the new task. 
 
 ### kangentic_update_backlog_item
 
-Update a backlog item's title, description, priority, labels, or attachments. Only the fields you provide are changed; omitted fields are left as-is. The `labels` parameter is a full replacement (not additive) - pass the complete new label set. `attachments` is additive - existing attachments are kept, not replaced.
+Update a backlog item's title, description, priority, labels, due date, external metadata, or attachments. Only the fields you provide are changed; omitted fields are left as-is. The `labels` parameter is a full replacement (not additive) - pass the complete new label set. `attachments` is additive - existing attachments are kept, not replaced.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
@@ -959,6 +976,8 @@ Update a backlog item's title, description, priority, labels, or attachments. On
 | `description` | string | No | New description (max 10,000 characters) |
 | `priority` | number | No | New priority: 0=none, 1=low, 2=medium, 3=high, 4=urgent |
 | `labels` | array | No | Full replacement label set. Strings, or `{name, color}` objects to also set the label color. |
+| `dueDate` | string | No | New due date, `YYYY-MM-DD`. An empty string clears it. |
+| `externalMetadata` | object \| null | No | Full replacement JSON object (max 16 KB serialized). `null` clears it. |
 | `attachments` | array | No | File attachments to ADD to the item: `[{ filePath: string, filename?: string }]`. Additive - existing attachments are kept. Use `kangentic_remove_task_attachment` to remove one. |
 
 Find item IDs with `kangentic_list_backlog` or `kangentic_search_tasks` (with `scope: "backlog"`).

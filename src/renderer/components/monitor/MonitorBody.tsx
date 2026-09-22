@@ -8,6 +8,7 @@ import { useMonitorStore } from '../../stores/monitor-store';
 import { useConfigStore } from '../../stores/config-store';
 import { useProjectStore } from '../../stores/project-store';
 import { useSessionStore } from '../../stores/session-store';
+import { useTaskOverviewStore } from '../../stores/task-overview-store';
 import { trailModeFor } from '../board/CardMessageTrail';
 import { MonitorToolbar } from './MonitorToolbar';
 import { TaskOverview } from './TaskOverview';
@@ -68,7 +69,12 @@ function columnsForWidth(width: number): number {
 }
 
 export function MonitorBody() {
-  const [surface, setSurface] = useState<'sessions' | 'all' | 'attention'>('all');
+  // «Necesita de mí» first: the monitor opens on what needs the user, not on
+  // every card in every project.
+  const [surface, setSurface] = useState<'sessions' | 'all' | 'attention'>('attention');
+  const needsMeCount = useTaskOverviewStore(
+    (state) => state.snapshot?.tasks.filter((task) => task.attention.needsHuman).length ?? null,
+  );
   const { rows, loading, loaded, view } = useMonitorStore(
     useShallow((state) => ({
       rows: state.rows,
@@ -307,9 +313,15 @@ export function MonitorBody() {
   return (
     <>
       <nav className="flex flex-wrap gap-2 p-3 border-b border-edge" aria-label="Vistas del monitor">
-        {([['all', 'Todas las tarjetas'], ['attention', 'Necesita de mí'], ['sessions', 'Sesiones']] as const).map(([value, label]) => (
+        {([['attention', 'Necesita de mí'], ['all', 'Todas las tarjetas'], ['sessions', 'Sesiones']] as const).map(([value, label]) => (
           <button key={value} type="button" aria-pressed={surface === value} onClick={() => setSurface(value)}
-            className={`px-3 py-2 rounded text-sm ${surface === value ? 'bg-surface-hover text-fg' : 'text-fg-muted'}`}>{label}</button>
+            data-testid={`monitor-surface-${value}`}
+            className={`inline-flex items-center gap-2 px-3 py-2 rounded text-sm ${surface === value ? 'bg-surface-hover text-fg' : 'text-fg-muted'}`}>
+            {label}
+            {value === 'attention' && needsMeCount !== null && (
+              <CountBadge count={needsMeCount} variant={needsMeCount > 0 ? 'accent' : 'muted'} size="sm" />
+            )}
+          </button>
         ))}
       </nav>
       {surface !== 'sessions' ? <TaskOverview attentionOnly={surface === 'attention'} /> : <>

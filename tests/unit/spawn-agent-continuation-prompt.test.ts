@@ -211,6 +211,12 @@ function resumePromptArg(engine: ReturnType<typeof makeDeps>['engine']): unknown
   return engine.resumeSuspendedSession.mock.calls[0]?.[3];
 }
 
+/** The column message for the spawn's argv prompt: `columnMessage` of the 8th arg. */
+function spawnMessageArg(engine: ReturnType<typeof makeDeps>['engine']): unknown {
+  const overrides = engine.resumeSuspendedSession.mock.calls[0]?.[7] as { columnMessage?: string } | undefined;
+  return overrides?.columnMessage;
+}
+
 describe('spawnAgent continuationPrompt delivery', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -233,7 +239,10 @@ describe('spawnAgent continuationPrompt delivery', () => {
 
     await runSpawn(executingLane, deps, CONTINUATION);
 
-    expect(resumePromptArg(deps.engine)).toBe('/implement');
+    // Both reach the engine; the intent resolver prefers the column message on
+    // a resume (spawn-intent.test.ts pins that precedence).
+    expect(spawnMessageArg(deps.engine)).toBe('/implement');
+    expect(resumePromptArg(deps.engine)).toBe(CONTINUATION);
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 
@@ -273,6 +282,6 @@ describe('spawnAgent continuationPrompt delivery', () => {
 
     await runSpawn(executingLane, deps, undefined);
 
-    expect(resumePromptArg(deps.engine)).toBe('/task-command');
+    expect(spawnMessageArg(deps.engine)).toBe('/task-command');
   });
 });

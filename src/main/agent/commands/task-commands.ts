@@ -482,7 +482,11 @@ export const handleUpdateTask: CommandHandler = (
   const currentGuardLabels = (task.labels ?? []).map((label) => label.trim().toLowerCase());
   const isHumanAction = context.actor === 'human';
   if (!isHumanAction
-      && routerGuarded(currentGuardLabels, `${task.title}\n${task.description}`)) {
+      && routerGuarded(currentGuardLabels, `${task.title}\n${task.description}`)
+      // The one mutation a guarded task accepts from an agent: ADDING hold
+      // labels and nothing else (the router marking a PROD-held card para-ck).
+      // It only hardens the hold, so it cannot release anything.
+      && !isHoldOnlyLabelAddition(params, task.labels ?? [])) {
     return { success: false, error: 'Agents may not mutate a held or sensitive task; human action is required' };
   }
   if (!isHumanAction && newLabels !== null) {
@@ -1148,6 +1152,52 @@ export function routerTaskHeld(labels: string[]): boolean {
   return labels.some((label) => ROUTER_HOLD_LABELS.has(label)
     && (label !== 'pedro' || !approved)
     && !(go && ROUTER_GO_LIFTS.has(label)));
+}
+
+/**
+ * Labels an agent may ADD to a guarded task. Each one only hardens the hold
+ * (or hands the card to CK), so letting the router mark a PROD-held card
+ * `para-ck` cannot release anything. `go-ck` and `approved` are not here and
+ * stay human-only.
+ */
+export const HOLD_ADDITION_LABELS: ReadonlySet<string> = new Set([
+  'para-ck', 'needs-human', 'manual-hold', 'no-auto', 'needs-info',
+]);
+
+/** update_task params that identify the call rather than change the task. */
+const UPDATE_IDENTITY_PARAMS = new Set(['taskId', 'labels', 'projectId', 'project']);
+/**
+ * Params where an explicit null is itself a write (it CLEARS the pin), so only
+ * `undefined` means "not touched". Every other param treats null as absent,
+ * which is how the MCP tool forwards an omitted field.
+ */
+const UPDATE_NULL_CLEARS_PARAMS = new Set(['model', 'effort', 'permissionMode', 'profile', 'runMode']);
+
+/**
+ * True when an update_task call's ONLY effect is to add hold labels: every
+ * other parameter is absent (null or undefined), every current label is kept,
+ * and every new label is in `HOLD_ADDITION_LABELS`. Anything else (a removal,
+ * a title/description/column/setting change, `go-ck`) is not hold-only and
+ * the guard refuses it as before. Comparison is trimmed and case-insensitive,
+ * matching how the guard reads labels.
+ */
+export function isHoldOnlyLabelAddition(params: Record<string, unknown>, currentLabels: string[]): boolean {
+  for (const [key, value] of Object.entries(params)) {
+    if (UPDATE_IDENTITY_PARAMS.has(key)) continue;
+    if (value === undefined) continue;
+    if (value === null && !UPDATE_NULL_CLEARS_PARAMS.has(key)) continue;
+    return false;
+  }
+  const requested = params.labels;
+  if (!Array.isArray(requested) || !requested.every((label) => typeof label === 'string')) return false;
+  const normalize = (label: string): string => label.trim().toLowerCase();
+  const next = new Set((requested as string[]).map(normalize));
+  const current = new Set(currentLabels.map(normalize));
+  for (const label of current) {
+    if (!next.has(label)) return false;
+  }
+  const added = [...next].filter((label) => !current.has(label));
+  return added.length > 0 && added.every((label) => HOLD_ADDITION_LABELS.has(label));
 }
 
 /** Held, or a declared PROD deliverable without CK's recorded GO. */

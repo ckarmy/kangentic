@@ -212,7 +212,7 @@ describe('handlePromoteBacklog refuseDone wiring', () => {
     const result = handlePromoteBacklog({ itemIds: ['missing-item'], column: 'Merge' }, context);
 
     expect(result.success).toBe(false);
-    expect(result.error).toContain('only to To Do');
+    expect(result.error).toContain('only to Draft or To Do');
   });
 });
 

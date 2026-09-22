@@ -3,6 +3,7 @@ import { getProjectDb } from '../../db/database';
 import { createTransitionEngine, resolveInjectionVerifier } from './agent-spawn';
 import { getProjectRepos } from './project-repos';
 import { reportAutoCommandOutcome } from './auto-command-outcome';
+import { buildMessageEscalation, recordMessageRunOutcome } from './agent-message-delivery';
 import { showDesktopNotification } from '../handlers/system';
 import { createProgressCallback, clearSpawnProgress } from '../../transition-engine/spawn-progress';
 import { withTaskLock } from '../task-lifecycle-lock';
@@ -85,9 +86,9 @@ export async function runAutomationAgain(
         groupBudgetMs: RUN_AGAIN_BUDGET_MS,
         // Fire and forget, like the warm enter path: nothing here cancels the
         // scheduler, so a message queues rather than racing anything.
-        deliverToAgent: async (message, mode) => {
+        deliverToAgent: async (message, mode, _runSignal, runId) => {
           const liveSession = task.session_id;
-          if (!liveSession) return;
+          if (!liveSession) return 'none';
           context.terminalSubmitScheduler.scheduleKeystrokes(
             taskId,
             liveSession,
@@ -95,9 +96,14 @@ export async function runAutomationAgain(
             {
               mode,
               verifier: resolveInjectionVerifier(task.agent, sessionRepo, taskId),
-              onOutcome: (report) => reportAutoCommandOutcome(context, repos.tasks, task, report, projectId),
+              escalate: buildMessageEscalation(context, projectId, projectPath, taskId),
+              onOutcome: (report) => {
+                reportAutoCommandOutcome(context, repos.tasks, task, report, projectId);
+                recordMessageRunOutcome(repos.automationRuns, runId, report);
+              },
             },
           );
+          return 'keystrokes';
         },
         showNotification: (notification) => showDesktopNotification(context, notification),
         onProgress: createProgressCallback(context.mainWindow, taskId),

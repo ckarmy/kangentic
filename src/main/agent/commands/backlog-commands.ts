@@ -19,6 +19,86 @@ function includesApprovedLabel(labels: Array<string | { name: string }>): boolea
   return labels.some((entry) => (typeof entry === 'string' ? entry : entry?.name)?.trim().toLowerCase() === 'approved');
 }
 
+/** Max serialized size of a backlog item's `externalMetadata`. */
+export const BACKLOG_EXTERNAL_METADATA_MAX_BYTES = 16_384;
+
+/**
+ * A calendar date, `YYYY-MM-DD`, that actually exists. Returns the error text,
+ * or null when valid.
+ */
+export function validateDueDate(value: unknown): string | null {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return 'dueDate must be a date in YYYY-MM-DD form';
+  }
+  const parsed = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+    return `dueDate "${value}" is not a real calendar date`;
+  }
+  return null;
+}
+
+/** A plain JSON object under the size cap. Returns the error text, or null. */
+export function validateExternalMetadata(value: unknown): string | null {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return 'externalMetadata must be a JSON object';
+  }
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    return 'externalMetadata must be serializable JSON';
+  }
+  if (Buffer.byteLength(serialized, 'utf8') > BACKLOG_EXTERNAL_METADATA_MAX_BYTES) {
+    return `externalMetadata exceeds ${BACKLOG_EXTERNAL_METADATA_MAX_BYTES} bytes`;
+  }
+  return null;
+}
+
+/** The stable JSON shape list/create/update return for one backlog item. */
+export function backlogItemData(item: {
+  id: string; title: string; description: string; priority: number; labels: string[];
+  due_date: string | null; assignee: string | null; external_metadata: Record<string, unknown> | null; created_at: string;
+}) {
+  return {
+    id: item.id,
+    title: item.title,
+    description: item.description,
+    priority: item.priority,
+    priorityLabel: BACKLOG_PRIORITY_LABELS[item.priority] ?? 'None',
+    labels: item.labels,
+    dueDate: item.due_date,
+    assignee: item.assignee,
+    externalMetadata: item.external_metadata,
+    createdAt: item.created_at,
+  };
+}
+
+/**
+ * Soonest due date first, undated items after, stable otherwise (the input is
+ * the backlog's manual position order). `YYYY-MM-DD` sorts correctly as text.
+ */
+export function sortBacklogByDueDate<T extends { due_date: string | null }>(items: T[]): T[] {
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) => {
+      const leftDue = left.item.due_date;
+      const rightDue = right.item.due_date;
+      if (leftDue && rightDue && leftDue !== rightDue) return leftDue < rightDue ? -1 : 1;
+      if (leftDue && !rightDue) return -1;
+      if (!leftDue && rightDue) return 1;
+      return left.index - right.index;
+    })
+    .map(({ item }) => item);
+}
+
+/**
+ * A Draft column: named like one, no role, and it never starts an agent. The
+ * name check keeps Ready (also agentless) from counting.
+ */
+export function isDraftColumn(lane: { name: string; role: string | null; auto_spawn: boolean }): boolean {
+  return lane.role === null && !lane.auto_spawn && /^(draft|drafts|borrador|borradores|ideas?)$/i.test(lane.name.trim());
+}
+
 const AGENT_PROTECTED_BACKLOG_LABELS = new Set([
   'approved', 'pedro', 'no-auto', 'manual-hold', 'risky', 'production',
 ]);
@@ -29,6 +109,11 @@ export const handleListBacklog: CommandHandler = (
 ): CommandResponse => {
   const priorityFilter = params.priority as number | null;
   const query = (params.query as string | null)?.toLowerCase() ?? null;
+  const dueOnOrBefore = (params.dueOnOrBefore as string | null | undefined) ?? null;
+  if (dueOnOrBefore !== null) {
+    const dueError = validateDueDate(dueOnOrBefore);
+    if (dueError) return { success: false, error: dueError.replace('dueDate', 'dueOnOrBefore') };
+  }
 
   const db = context.getProjectDb();
   const backlogRepo = new BacklogRepository(db);
@@ -46,6 +131,12 @@ export const handleListBacklog: CommandHandler = (
         item.labels.some((label) => label.toLowerCase().includes(query)),
     );
   }
+  if (dueOnOrBefore !== null) {
+    // Items with no due date are not "due on or before" anything.
+    items = items.filter((item) => item.due_date !== null && item.due_date <= dueOnOrBefore);
+  }
+  // Soonest due first, undated last; the backlog's own order breaks ties.
+  items = sortBacklogByDueDate(items);
 
   if (items.length === 0) {
     const filterNote = query ? ` matching "${query}"` : '';
@@ -55,21 +146,14 @@ export const handleListBacklog: CommandHandler = (
   const lines = items.map((item) => {
     const priorityLabel = BACKLOG_PRIORITY_LABELS[item.priority] ?? 'None';
     const labelString = item.labels.length > 0 ? ` [${item.labels.join(', ')}]` : '';
-    return `- ${item.title} (${priorityLabel})${labelString} (id: ${item.id})`;
+    const dueString = item.due_date ? ` (due: ${item.due_date})` : '';
+    return `- ${item.title} (${priorityLabel})${labelString}${dueString} (id: ${item.id})`;
   });
 
   return {
     success: true,
     message: `${items.length} backlog task(s):\n${lines.join('\n')}`,
-    data: items.map((item) => ({
-      id: item.id,
-      title: item.title,
-      description: item.description,
-      priority: item.priority,
-      priorityLabel: BACKLOG_PRIORITY_LABELS[item.priority] ?? 'None',
-      labels: item.labels,
-      createdAt: item.created_at,
-    })),
+    data: items.map(backlogItemData),
   };
 };
 
@@ -82,6 +166,9 @@ export const handleCreateBacklogTask: CommandHandler = (
   const priority = (params.priority as number) ?? 0;
   const rawLabels = (params.labels as Array<string | { name: string; color: string }>) ?? [];
   const attachments = params.attachments as Array<{ filePath: string; filename?: string }> | null;
+  const dueDate = (params.dueDate as string | null | undefined) ?? null;
+  const assignee = (params.assignee as string | null | undefined) ?? null;
+  const externalMetadata = (params.externalMetadata as Record<string, unknown> | null | undefined) ?? null;
 
   // Observability for the "labels dropped on a large description" bug
   // (task #229). Logs the raw `labels` value as received (before the `?? []`
@@ -116,6 +203,15 @@ export const handleCreateBacklogTask: CommandHandler = (
   if (priority < 0 || priority > 4) {
     return { success: false, error: 'Priority must be 0-4 (0=none, 1=low, 2=medium, 3=high, 4=urgent)' };
   }
+  if (dueDate !== null) {
+    const dueError = validateDueDate(dueDate);
+    if (dueError) return { success: false, error: dueError };
+  }
+  if (externalMetadata !== null) {
+    const metadataError = validateExternalMetadata(externalMetadata);
+    if (metadataError) return { success: false, error: metadataError };
+  }
+  const trimmedAssignee = assignee !== null ? String(assignee).trim().slice(0, 200) : '';
 
   const db = context.getProjectDb();
   const backlogRepo = new BacklogRepository(db);
@@ -125,6 +221,9 @@ export const handleCreateBacklogTask: CommandHandler = (
     description,
     priority: priority,
     labels: labelNames,
+    ...(dueDate !== null ? { dueDate } : {}),
+    ...(trimmedAssignee ? { assignee: trimmedAssignee } : {}),
+    ...(externalMetadata !== null ? { externalMetadata } : {}),
   });
 
   // Process file attachments if provided
@@ -151,7 +250,9 @@ export const handleCreateBacklogTask: CommandHandler = (
   const priorityLabel = BACKLOG_PRIORITY_LABELS[item.priority] ?? 'None';
   return {
     success: true,
-    data: { id: item.id, title: item.title, priority: priorityLabel, labels: item.labels },
+    // `priority` stays the LABEL, which create_task's existing callers read;
+    // the number is `priorityValue`.
+    data: { ...backlogItemData(item), priority: priorityLabel, priorityValue: item.priority },
     message: `Created backlog task "${item.title}" (priority: ${priorityLabel}, id: ${item.id})`,
   };
 };
@@ -166,6 +267,9 @@ export const handleUpdateBacklogItem: CommandHandler = (
   const newPriority = (params.priority ?? null) as number | null;
   const rawLabels = (params.labels ?? null) as Array<string | { name: string; color: string }> | null;
   const newAttachments = (params.attachments ?? null) as Array<{ filePath: string; filename?: string }> | null;
+  // undefined = untouched; null = clear.
+  const newDueDate = params.dueDate as string | null | undefined;
+  const newExternalMetadata = params.externalMetadata as Record<string, unknown> | null | undefined;
 
   // Observability for the "labels dropped on a large description" bug
   // (task #229). See the matching note in handleCreateBacklogTask.
@@ -180,6 +284,14 @@ export const handleUpdateBacklogItem: CommandHandler = (
 
   if (newPriority !== null && (newPriority < 0 || newPriority > 4)) {
     return { success: false, error: 'Priority must be 0-4 (0=none, 1=low, 2=medium, 3=high, 4=urgent)' };
+  }
+  if (newDueDate !== undefined && newDueDate !== null) {
+    const dueError = validateDueDate(newDueDate);
+    if (dueError) return { success: false, error: dueError };
+  }
+  if (newExternalMetadata !== undefined && newExternalMetadata !== null) {
+    const metadataError = validateExternalMetadata(newExternalMetadata);
+    if (metadataError) return { success: false, error: metadataError };
   }
 
   const db = context.getProjectDb();
@@ -207,6 +319,14 @@ export const handleUpdateBacklogItem: CommandHandler = (
   if (newPriority !== null) {
     updates.priority = Number(newPriority);
     changedFields.push('priority');
+  }
+  if (newDueDate !== undefined) {
+    updates.dueDate = newDueDate;
+    changedFields.push('dueDate');
+  }
+  if (newExternalMetadata !== undefined) {
+    updates.externalMetadata = newExternalMetadata;
+    changedFields.push('externalMetadata');
   }
 
   const labelColorMap: Record<string, string> = {};
@@ -285,12 +405,8 @@ export const handleUpdateBacklogItem: CommandHandler = (
     success: true,
     message: `Updated ${changedFields.join(', ')} for "${updated.title}".`,
     data: {
-      id: updated.id,
-      title: updated.title,
-      description: updated.description,
-      priority: updated.priority,
+      ...backlogItemData(updated),
       priorityLabel,
-      labels: updated.labels,
       ...(newAttachments !== null ? { attachmentCount: updated.attachment_count, attachmentsAdded } : {}),
     },
   };
@@ -351,15 +467,21 @@ export const handlePromoteBacklog: CommandHandler = (
     return { success: false, error: resolution.error };
   }
   const { swimlane: targetSwimlane } = resolution;
-  if (targetSwimlane.role !== 'todo') {
-    return { success: false, error: 'Agents may promote backlog items only to To Do for human/router review' };
+  const toDraft = isDraftColumn(targetSwimlane);
+  if (targetSwimlane.role !== 'todo' && !toDraft) {
+    return { success: false, error: 'Agents may promote backlog items only to Draft or To Do for human/router review' };
   }
 
-  for (const itemId of itemIds) {
-    const item = backlogRepo.getById(itemId);
-    const labels = item?.labels.map((label) => label.trim().toLowerCase()) ?? [];
-    if (labels.some((label) => AGENT_PROTECTED_BACKLOG_LABELS.has(label))) {
-      return { success: false, error: 'Protected backlog work must be promoted by a human in the UI' };
+  // Draft never starts an agent and nothing leaves it without a human, so a
+  // protected item may land there. To Do is where the router picks work up,
+  // so protected work still needs a human to put it there.
+  if (!toDraft) {
+    for (const itemId of itemIds) {
+      const item = backlogRepo.getById(itemId);
+      const labels = item?.labels.map((label) => label.trim().toLowerCase()) ?? [];
+      if (labels.some((label) => AGENT_PROTECTED_BACKLOG_LABELS.has(label))) {
+        return { success: false, error: 'Protected backlog work must be promoted by a human in the UI' };
+      }
     }
   }
 

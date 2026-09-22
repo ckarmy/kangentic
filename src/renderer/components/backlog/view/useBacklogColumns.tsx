@@ -10,7 +10,23 @@ import type { BacklogTask } from '../../../../shared/types';
 import type { useBoardStore } from '../../../stores/board-store';
 import { BacklogRowActions } from './BacklogRowActions';
 
-export type SortKey = 'select' | 'priority' | 'title' | 'labels' | 'created' | 'actions';
+export type SortKey = 'select' | 'priority' | 'title' | 'labels' | 'due' | 'created' | 'actions';
+
+/**
+ * Sort value for the Due column: the date itself (`YYYY-MM-DD` sorts as text),
+ * with undated items after every dated one in ascending order.
+ */
+export function dueSortValue(item: Pick<BacklogTask, 'due_date'>): string {
+  return item.due_date ?? '9999-12-31~';
+}
+
+/** Today's local date as `YYYY-MM-DD`, for the overdue tint. */
+function localToday(): string {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${now.getFullYear()}-${month}-${day}`;
+}
 
 type Swimlanes = ReturnType<typeof useBoardStore.getState>['swimlanes'];
 
@@ -127,6 +143,20 @@ export function useBacklogColumns(input: {
             })}
           </div>
         ) : null,
+    },
+    {
+      key: 'due' as SortKey,
+      label: 'Due',
+      width: 'w-[110px]',
+      sortValue: dueSortValue,
+      render: (item) => (item.due_date ? (
+        <span
+          className={`text-xs whitespace-nowrap tabular-nums ${item.due_date < localToday() ? 'text-attention' : 'text-fg-muted'}`}
+          data-testid="backlog-due-date"
+        >
+          {item.due_date}
+        </span>
+      ) : null),
     },
     {
       key: 'created' as SortKey,

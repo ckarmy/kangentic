@@ -15,7 +15,7 @@ import { getDevPortForTask } from '../../dev-ports/dev-port-allocator';
 import { agentRegistry } from '../../agent/agent-registry';
 import { buildSessionHistoryReference } from '../../agent/handoff/session-history-reference';
 import { DEFAULT_AGENT, NEVER_AUTO_SPAWN_ROLES } from '../../../shared/types';
-import type { Task, Swimlane, Project, AutoCommandMode } from '../../../shared/types';
+import type { Task, Swimlane, Project } from '../../../shared/types';
 import { showDesktopNotification } from '../handlers/system';
 import { reportAutomationFailures } from './automation-failures';
 import type { IpcContext } from '../ipc-context';
@@ -28,6 +28,8 @@ import { loadTaskProfile } from './task-profile';
 import { buildCommandInjectionVerifier } from '../../transition-engine/injection-plan';
 import type { CommandVerifier } from '../../transition-engine/terminal-submit-scheduler';
 import { reportAutoCommandOutcome } from './auto-command-outcome';
+import { buildMessageEscalation, recordMessageRunOutcome } from './agent-message-delivery';
+import type { DeliverToAgent } from '../../automations/shared/automation-adapter';
 import { emitSpawnProgress, createProgressCallback, clearSpawnProgress } from '../../transition-engine/spawn-progress';
 import { ensureTaskWorktree, ensureTaskBranchCheckout, notifySpawnBlocked } from './task-git';
 import { getProjectRepos } from './project-repos';
@@ -380,12 +382,41 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
 
     emitSpawnProgress(context.mainWindow, task.id, 'detecting-agent');
 
+    // The column's message rides the handoff spawn's own argv prompt, after
+    // the history reference and the task prompt. It used to be typed at the
+    // new agent after the spawn with no restart fallback, so a keystroke burst
+    // the verifier could not confirm left the column's rules undelivered.
+    //
+    // The column's message now lives in its first enabled `send_message`
+    // enter automation rather than in `swimlanes.auto_command`. The task's own
+    // MCP-set command still outranks it, which is the precedence
+    // `resolveEffectiveAutoCommand` exists to keep identical on every path.
+    //
+    // Which interpolator depends on which tier won, and the two genuinely
+    // differ. A task's `auto_command` keeps DROP-AND-COLLAPSE, which is the
+    // rule `task-template-vars-parity.md` states for it. A column's message
+    // is an automation field, and every automation field substitutes
+    // literally, which is also what the field's own editor promises.
+    const handoffColumnMessage = resolveColumnMessage(
+      getProjectRepos(context, options.projectId).automations.listForColumn(toLane.id),
+    );
+    const handoffTaskOverride = task.auto_command?.trim();
+    const handoffEffective = resolveEffectiveAutoCommand(task.auto_command, handoffColumnMessage?.message);
+    const handoffMessage = !options.suppressAutoCommand && handoffEffective?.trim()
+      ? (handoffTaskOverride
+        ? interpolateTaskTemplate(handoffEffective, resolveAutoCommandVars(task))
+        : interpolateTemplate(handoffEffective, resolveAutoCommandVars(task)))
+      : '';
+
     try {
       await engine.resumeSuspendedSession(
         task, toLane.permission_mode, skipPromptTemplate, undefined, signal,
         targetAgent,
         handoffPromptPrefix,
-        resolveSpawnOverrides(task, toLane, project),
+        {
+          ...resolveSpawnOverrides(task, toLane, project),
+          columnMessage: handoffMessage.trim() ? handoffMessage : undefined,
+        },
       );
     } catch (error) {
       if (isAbortError(error)) throw error;
@@ -408,44 +439,9 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
         console.error('[spawnAgent] Failed to finalize handoff:', error);
       }
 
-      // The column's message now lives in its first enabled `send_message`
-      // enter automation rather than in `swimlanes.auto_command`. The task's own
-      // MCP-set command still outranks it, which is the precedence
-      // `resolveEffectiveAutoCommand` exists to keep identical on every path.
-      const columnMessage = resolveColumnMessage(
-        getProjectRepos(context, options.projectId).automations.listForColumn(toLane.id),
-      );
-      const taskOverride = currentTask.auto_command?.trim();
-      const effectiveAutoCommand = resolveEffectiveAutoCommand(currentTask.auto_command, columnMessage?.message);
-      if (!options.suppressAutoCommand && effectiveAutoCommand?.trim()) {
-        // Which interpolator depends on which tier won, and the two genuinely
-        // differ. A task's `auto_command` keeps DROP-AND-COLLAPSE, which is the
-        // rule `task-template-vars-parity.md` states for it. A column's message
-        // is an automation field, and every automation field substitutes
-        // literally through the runner's `interpolateAutomationConfig` - which
-        // is also what the field's own editor promises, in as many words:
-        // "Unknown variable: nope. It will be sent as written."
-        //
-        // The normal path already splits them exactly here (`takeMessage`
-        // swaps a drop-and-collapse task override over a literally-interpolated
-        // column row). This branch is the cross-agent handoff, and it used to
-        // drop-and-collapse BOTH, so the same message delivered one way on a
-        // handoff and another way on every other move.
-        const vars = resolveAutoCommandVars(currentTask);
-        const interpolated = taskOverride
-          ? interpolateTaskTemplate(effectiveAutoCommand, vars)
-          : interpolateTemplate(effectiveAutoCommand, vars);
-        context.terminalSubmitScheduler.scheduleKeystrokes(
-          currentTask.id,
-          currentTask.session_id,
-          [{ text: interpolated, verify: 'submitted' }],
-          {
-            freshlySpawned: true,
-            verifier: resolveInjectionVerifier(targetAgent, sessionRepo, currentTask.id),
-            mode: columnMessage?.mode ?? 'immediate',
-            onOutcome: (report) => reportAutoCommandOutcome(context, tasks, currentTask, report, options.projectId),
-          },
-        );
+      // The column's message was delivered in the spawn's own prompt above.
+      if (handoffMessage.trim()) {
+        console.log(`[spawnAgent] Handoff delivered the column message in the spawn prompt for task ${currentTask.id.slice(0, 8)}`);
       }
     }
 
@@ -522,22 +518,27 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
       : undefined;
     const canResumeDestination = isResumeEligible(destinationResumeRecord);
 
-    // A message takes the spawn's INITIAL PROMPT slot whenever the session has
-    // no task prompt of its own to run: a resume carries it as the next
-    // message, and a promptless fresh spawn (an isolated review column) would
-    // otherwise sit at an empty prompt, emit no 'thinking' event, and make the
-    // keystroke scheduler wait out its full 30s fallback before the message
-    // appears. That reads as "the automation never ran".
+    // The message ALWAYS rides the spawn's own argv prompt now: as a resume's
+    // next message, appended after the task prompt on a fresh spawn, or as the
+    // whole prompt of a promptless fresh spawn (see
+    // `SpawnIntentOptions.columnMessage`).
+    //
+    // 0.42.0-luuk.1 typed it after a fresh spawn that already had a task
+    // prompt. That burst depended on the transcript verifier, which missed the
+    // CLI's `<pasted_content>` wrapper, and the path had no restart fallback:
+    // task #14 entered Executing, the row said "Sent" and the agent worked
+    // without the column's rules. The argv is delivered by the spawn itself,
+    // keeps the message's newlines (keystrokes flatten them), and leaves
+    // nothing for a verifier to get wrong.
     const message = takeMessage(pendingPrompt ?? '');
-    const takesPromptSlot = message !== '' && (canResumeDestination || skipPromptTemplate === true);
-    if (takesPromptSlot && pendingPrompt !== undefined) promptTakenFromRow = pendingPrompt;
+    const deliversInSpawn = message.trim() !== '';
+    if (deliversInSpawn && pendingPrompt !== undefined) promptTakenFromRow = pendingPrompt;
 
     // The continuation prompt (plan-exit auto-move) is a resume-only fallback:
-    // the column's message is the user's explicit automation and wins, and a
-    // fresh spawn has no prior conversation for "proceed" to refer to.
-    const resumePrompt = takesPromptSlot
-      ? message
-      : (canResumeDestination ? options.continuationPrompt : undefined);
+    // the column's message is the user's explicit automation and wins (the
+    // intent resolver prefers `columnMessage`), and a fresh spawn has no prior
+    // conversation for "proceed" to refer to.
+    const resumePrompt = canResumeDestination ? options.continuationPrompt : undefined;
 
     try {
       // Always pass targetAgent so the column's agent_override is respected.
@@ -546,8 +547,17 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
         beforeSpawn, toLane.permission_mode, skipPromptTemplate, resumePrompt, signal,
         targetAgent,
         undefined,
-        resolveSpawnOverrides(beforeSpawn, toLane, project),
+        {
+          ...resolveSpawnOverrides(beforeSpawn, toLane, project),
+          columnMessage: deliversInSpawn ? message : undefined,
+        },
       );
+      if (deliversInSpawn) {
+        console.log(
+          `[spawnAgent] Column message delivered in the spawn prompt for task ${task.id.slice(0, 8)}`
+          + ` (${message.length} chars, ${canResumeDestination ? 'resume' : 'fresh'})`,
+        );
+      }
     } catch (error) {
       if (isAbortError(error)) throw error;
       // This used to be the deepest silent failure on the board path. The
@@ -558,6 +568,8 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
       trackEvent('spawn_failed', { agent: targetAgent, reason: 'resume' });
       reportHandledError(error, { source: 'spawn', reason: 'resume', agent: targetAgent });
       notifySpawnBlocked(context, beforeSpawn, 'agent', error, options.projectId);
+      // Nothing was delivered, so the row must not read as delivered-in-spawn.
+      promptTakenFromRow = null;
       // Rethrown, unlike the old fallback which returned: the runner records
       // the row that asked for the agent as skipped with this reason, so a
       // failed spawn is visible per automation rather than only in the log.
@@ -565,21 +577,27 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
     }
   };
 
-  const deliverToAgent = async (message: string, mode: AutoCommandMode): Promise<void> => {
+  const deliverToAgent: DeliverToAgent = async (message, mode, _signal, runId) => {
     // A recovery move (out of Done) suppresses the column's messages, so
     // everything downstream degrades naturally rather than re-running work.
-    if (options.suppressAutoCommand) return;
+    if (options.suppressAutoCommand) return 'none';
     if (promptTakenFromRow !== null && promptTakenFromRow === message) {
       promptTakenFromRow = null;
-      return;
+      return 'spawn-prompt';
     }
 
     const effective = takeMessage(message);
-    if (!effective) return;
+    if (!effective) return 'none';
 
     const currentTask = tasks.getById(task.id);
-    if (!currentTask?.session_id) return;
+    if (!currentTask?.session_id) return 'none';
 
+    // The session already existed (or a second message row follows the one
+    // that started it), so this one is typed. It gets the same rung 3 the warm
+    // move's auto_command has: if the transcript cannot confirm it, the
+    // session is restarted with it as the prompt, once, and never for a
+    // confirm-only adapter.
+    const runs = options.projectId ? getProjectRepos(context, options.projectId).automationRuns : null;
     context.terminalSubmitScheduler.scheduleKeystrokes(
       currentTask.id,
       currentTask.session_id,
@@ -588,9 +606,16 @@ export async function spawnAgent(options: AgentSpawnOptions): Promise<void> {
         freshlySpawned: true,
         verifier: resolveInjectionVerifier(targetAgent, sessionRepo, currentTask.id),
         mode,
-        onOutcome: (report) => reportAutoCommandOutcome(context, tasks, currentTask, report, options.projectId),
+        escalate: options.projectId
+          ? buildMessageEscalation(context, options.projectId, options.projectPath ?? null, currentTask.id)
+          : undefined,
+        onOutcome: (report) => {
+          reportAutoCommandOutcome(context, tasks, currentTask, report, options.projectId);
+          recordMessageRunOutcome(runs, runId, report);
+        },
       },
     );
+    return 'keystrokes';
   };
 
   try {

@@ -251,7 +251,7 @@ async function scanForSubmittedText(
   const expected = command.trim();
   return scanTail(jsonlPath, command, sentAt, (entry) => {
     const queued = extractQueuedText(entry);
-    if (queued !== null) return queued.trim() === expected;
+    if (queued !== null) return unwrapPastedContent(queued).trim() === expected;
 
     const tagged = extractCommandTagContent(entry);
     if (tagged) {
@@ -263,8 +263,27 @@ async function scanForSubmittedText(
     }
 
     const userText = extractUserText(entry);
-    return userText !== null && userText.trim() === expected;
+    return userText !== null && unwrapPastedContent(userText).trim() === expected;
   });
+}
+
+/**
+ * Strip the CLI's paste envelope.
+ *
+ * Claude Code records a long bracketed paste as
+ * `<pasted_content id="5c39">` + newline + text + newline +
+ * `</pasted_content id="5c39">`, in the queue entry and in the user turn
+ * alike. A column message is typed as one paste, so every message past the
+ * CLI's paste threshold arrived wrapped, the exact-match test never matched
+ * it, and a message the agent HAD received was reported "could not be
+ * confirmed" (0.42.0-luuk.1, task #14: the Executing rules sat in the
+ * transcript as a queued_command while the UI said they did not run). Only the
+ * envelope goes; the text inside is still compared exactly.
+ */
+export function unwrapPastedContent(text: string): string {
+  return text
+    .replace(/<pasted_content id="[^"]*">\r?\n?/g, '')
+    .replace(/\r?\n?<\/pasted_content id="[^"]*">/g, '');
 }
 
 /**

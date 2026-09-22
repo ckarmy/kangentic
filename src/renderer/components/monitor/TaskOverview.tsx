@@ -43,9 +43,13 @@ export function TaskOverview({ attentionOnly }: { attentionOnly: boolean }) {
             className="block w-full text-left p-4 rounded-lg border border-edge bg-surface hover:bg-surface-hover" data-testid="overview-task">
             <p className="text-xs text-fg-muted">{task.projectName} · {task.columnName} · #{task.displayId}</p>
             <h2 className="text-sm font-semibold text-fg mt-1"><button type="button" onClick={() => requestMonitorDetail(task.projectId, task.taskId)} className="text-left hover:underline">{task.title}</button></h2>
-            <p className={`text-sm mt-2 ${task.attention.needsHuman ? 'text-attention' : 'text-fg-muted'}`}>{task.attention.reason}</p>
+            {attentionOnly && task.attention.summary
+              ? <p className="text-sm mt-2 text-attention" data-testid="overview-task-summary">{task.attention.summary}</p>
+              : <>
+                <p className={`text-sm mt-2 ${task.attention.needsHuman ? 'text-attention' : 'text-fg-muted'}`}>{task.attention.reason}</p>
+                <p className="text-sm text-fg-muted mt-1">{task.attention.nextAction}</p>
+              </>}
             {task.attention.needsHuman && task.informationRequired && <p className="text-sm text-fg mt-1 whitespace-pre-wrap">Pregunta registrada: {task.informationRequired}</p>}
-            <p className="text-sm text-fg-muted mt-1">{task.attention.nextAction}</p>
             <TaskCloseout task={task} />
             {task.columnName === 'Ready' && <TaskDelivery task={task} />}
             {task.labels.some((label) => label.trim().toLowerCase() === 'needs-info') && <TaskAnswerForm task={task} />}

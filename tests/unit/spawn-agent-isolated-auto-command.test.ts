@@ -327,6 +327,15 @@ function resumePromptArg(engine: ReturnType<typeof makeDeps>['engine']): unknown
   return engine.resumeSuspendedSession.mock.calls[0]?.[3];
 }
 
+/**
+ * The column message handed to the spawn's argv prompt (0.42.0-luuk.2): the
+ * `columnMessage` of the spawn overrides, the 8th positional arg.
+ */
+function spawnMessageArg(engine: ReturnType<typeof makeDeps>['engine']): unknown {
+  const overrides = engine.resumeSuspendedSession.mock.calls[0]?.[7] as { columnMessage?: string } | undefined;
+  return overrides?.columnMessage;
+}
+
 describe('spawnAgent auto_command injection (isolation-scoped resume check)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -352,7 +361,7 @@ describe('spawnAgent auto_command injection (isolation-scoped resume check)', ()
     expect(deps.sessionRepo.getLatestForTaskByTypeAndIsolation)
       .toHaveBeenCalledWith(TASK_ID, 'claude_agent', ISOLATED_LANE_ID);
     // Delivered as the initial prompt - no 30s keystroke fallback.
-    expect(resumePromptArg(deps.engine)).toBe('/code-review');
+    expect(spawnMessageArg(deps.engine)).toBe('/code-review');
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 
@@ -377,7 +386,7 @@ describe('spawnAgent auto_command injection (isolation-scoped resume check)', ()
 
     await runSpawn(isolatedLane, deps, true);
 
-    expect(resumePromptArg(deps.engine)).toBe('/code-review develop');
+    expect(spawnMessageArg(deps.engine)).toBe('/code-review develop');
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 
@@ -393,7 +402,7 @@ describe('spawnAgent auto_command injection (isolation-scoped resume check)', ()
 
     // Not '/code-review' (empty) and not '/code-review ' (trailing space) -
     // the default from configManager.getEffectiveConfig().git.defaultBaseBranch.
-    expect(resumePromptArg(deps.engine)).toBe('/code-review main');
+    expect(spawnMessageArg(deps.engine)).toBe('/code-review main');
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 
@@ -417,7 +426,7 @@ describe('spawnAgent auto_command injection (isolation-scoped resume check)', ()
     // newlines, see TASK_TEMPLATE_RESOLVERS.attachments in
     // task-template-resolvers.ts), called with the task's own id.
     expect(getPathsForTask).toHaveBeenCalledWith(TASK_ID);
-    expect(resumePromptArg(deps.engine)).toBe('/code-review \n/mock/a.png\n/mock/b.png');
+    expect(spawnMessageArg(deps.engine)).toBe('/code-review \n/mock/a.png\n/mock/b.png');
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 
@@ -448,29 +457,25 @@ describe('spawnAgent auto_command injection (isolation-scoped resume check)', ()
     // Red: swapping resolveAutoCommandVars' `projectPath: options.projectPath ?? null`
     // for `task.worktree_path`, or dropping the field entirely, makes this
     // '/code-review /mock/worktrees/my-task' or '/code-review' instead.
-    expect(resumePromptArg(deps.engine)).toBe('/code-review /mock/main-project');
+    expect(spawnMessageArg(deps.engine)).toBe('/code-review /mock/main-project');
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 
-  it('ISOLATED + fresh from To Do (task prompt present): auto_command follows the task prompt as a keystroke', async () => {
+  it('ISOLATED + fresh from To Do (task prompt present): auto_command is appended to the spawn prompt, never typed', async () => {
     const isolatedLane = makeSwimlane(ISOLATED_LANE_ID, {
       session_target: 'isolated',
       auto_command: '/code-review',
     });
     const deps = makeDeps({ manualPauseRecord: null, resumeRecord: undefined });
 
-    // skipPromptTemplate=false: the task description owns the prompt slot, so the
-    // auto_command must be injected afterward as a keystroke.
+    // skipPromptTemplate=false: the task description owns the prompt slot, and
+    // the column message rides the same argv after it (the engine appends it).
+    // Typing it afterwards is what lost the Executing rules on #14.
     await runSpawn(isolatedLane, deps, false);
 
     expect(resumePromptArg(deps.engine)).toBeUndefined();
-    expect(deps.scheduleKeystrokes).toHaveBeenCalledTimes(1);
-    expect(deps.scheduleKeystrokes).toHaveBeenCalledWith(
-      TASK_ID,
-      FRESH_PTY_SESSION_ID,
-      [{ text: '/code-review', verify: 'submitted' }],
-      expect.objectContaining({ freshlySpawned: true }),
-    );
+    expect(spawnMessageArg(deps.engine)).toBe('/code-review');
+    expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 
   it('ISOLATED + resume: re-entering the isolated column resumes with the auto_command as the resume prompt, no keystroke', async () => {
@@ -483,7 +488,7 @@ describe('spawnAgent auto_command injection (isolation-scoped resume check)', ()
 
     await runSpawn(isolatedLane, deps, true);
 
-    expect(resumePromptArg(deps.engine)).toBe('/code-review');
+    expect(spawnMessageArg(deps.engine)).toBe('/code-review');
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 
@@ -497,24 +502,19 @@ describe('spawnAgent auto_command injection (isolation-scoped resume check)', ()
     // Destination isolation is null (main) - the scoped lookup is asked for it.
     expect(deps.sessionRepo.getLatestForTaskByTypeAndIsolation)
       .toHaveBeenCalledWith(TASK_ID, 'claude_agent', null);
-    expect(resumePromptArg(deps.engine)).toBe('/standup');
+    expect(spawnMessageArg(deps.engine)).toBe('/standup');
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 
-  it('MAIN + fresh from To Do: auto_command injected as a keystroke after the task prompt (unchanged)', async () => {
+  it('MAIN + fresh from To Do: auto_command is appended to the spawn prompt, never typed', async () => {
     const normalLane = makeSwimlane(EXEC_LANE_ID, { session_target: 'main', auto_command: '/standup' });
     const deps = makeDeps({ manualPauseRecord: null, resumeRecord: undefined });
 
     await runSpawn(normalLane, deps, false);
 
     expect(resumePromptArg(deps.engine)).toBeUndefined();
-    expect(deps.scheduleKeystrokes).toHaveBeenCalledTimes(1);
-    expect(deps.scheduleKeystrokes).toHaveBeenCalledWith(
-      TASK_ID,
-      FRESH_PTY_SESSION_ID,
-      [{ text: '/standup', verify: 'submitted' }],
-      expect.objectContaining({ freshlySpawned: true }),
-    );
+    expect(spawnMessageArg(deps.engine)).toBe('/standup');
+    expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 });
 
@@ -625,11 +625,12 @@ describe('spawnAgent auto_command suppression on recovery move out of Done (hand
 
     // The handoff spawn ran (resumeSuspendedSession was called with the target agent).
     expect(deps.engine.resumeSuspendedSession).toHaveBeenCalledTimes(1);
-    // The auto_command must NOT have been injected.
+    // The auto_command must NOT have been injected, by either path.
     expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
+    expect(spawnMessageArg(deps.engine)).toBeUndefined();
   });
 
-  it('handoff branch + suppressAutoCommand=false: scheduleKeystrokes IS called (positive companion)', async () => {
+  it('handoff branch + suppressAutoCommand=false: the auto_command rides the handoff spawn prompt (positive companion)', async () => {
     // Positive companion: same handoff setup but without suppression, confirming
     // the gate works in both directions. Guards against accidentally removing it
     // and having the suppression test pass vacuously.
@@ -648,16 +649,12 @@ describe('spawnAgent auto_command suppression on recovery move out of Done (hand
 
     vi.mocked(resolveTargetAgent).mockReturnValueOnce({ agent: 'codex', isHandoff: true });
 
-    // suppressAutoCommand=false (default): the auto_command must be scheduled.
+    // suppressAutoCommand=false (default): the auto_command must be delivered,
+    // in the spawn's own prompt rather than typed afterwards.
     await runSpawn(codexLane, deps, true, false, PROJECT_ID);
 
     expect(deps.engine.resumeSuspendedSession).toHaveBeenCalledTimes(1);
-    expect(deps.scheduleKeystrokes).toHaveBeenCalledTimes(1);
-    expect(deps.scheduleKeystrokes).toHaveBeenCalledWith(
-      TASK_ID,
-      FRESH_PTY_SESSION_ID,
-      [{ text: '/merge-back', verify: 'submitted' }],
-      expect.objectContaining({ freshlySpawned: true }),
-    );
+    expect(spawnMessageArg(deps.engine)).toBe('/merge-back');
+    expect(deps.scheduleKeystrokes).not.toHaveBeenCalled();
   });
 });

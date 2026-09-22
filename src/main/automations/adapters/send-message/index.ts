@@ -39,7 +39,12 @@ export const sendMessageAdapter: AutomationAdapter = {
     // before it has one, and a user can save a draft they came back to later.
     if (!message) return { detail: 'No message to send.' };
 
-    await context.deliverToAgent(message, config.mode ?? 'immediate', context.signal);
+    const via = await context.deliverToAgent(message, config.mode ?? 'immediate', context.signal, context.runId);
+    // The spawn took it as its own argv prompt: delivered by the spawn itself,
+    // nothing left to confirm. Said plainly, because "Sent" there read as a
+    // keystroke burst whose outcome was still to come.
+    if (via === 'spawn-prompt') return { detail: "Delivered in the agent's opening prompt." };
+    if (via === 'none') return { detail: 'Not sent: the agent has no live session.' };
     // Two words, because the two triggers earn different ones and the run log is
     // where someone checks whether a message actually landed.
     //

@@ -55,6 +55,32 @@ describe('send_message adapter', () => {
     expect(result.detail).toBe('Sent');
   });
 
+  it('reports delivered-in-spawn when the spawn took the message as its opening prompt', async () => {
+    const calls: Array<{ message: string; runId?: string }> = [];
+    const context = {
+      ...makeContext('enter', []),
+      deliverToAgent: async (message: string, _mode: string, _signal: AbortSignal, runId?: string) => {
+        calls.push({ message, runId });
+        return 'spawn-prompt' as const;
+      },
+    } as unknown as AutomationContext;
+    const result = await sendMessageAdapter.execute({ message: '/review' }, context);
+
+    // The run id reaches the caller, so a typed burst can write its outcome back.
+    expect(calls).toEqual([{ message: '/review', runId: 'run-1' }]);
+    expect(result.detail).toBe("Delivered in the agent's opening prompt.");
+  });
+
+  it('does not report Sent when nothing was sent', async () => {
+    const context = {
+      ...makeContext('enter', []),
+      deliverToAgent: async () => 'none' as const,
+    } as unknown as AutomationContext;
+    const result = await sendMessageAdapter.execute({ message: '/review' }, context);
+
+    expect(result.detail).toBe('Not sent: the agent has no live session.');
+  });
+
   it('does not call the agent at all for a row with no message yet', async () => {
     // The picker adds a row before it has one, and a user can save a draft they
     // meant to come back to. That is not a failure and must not reach the agent.

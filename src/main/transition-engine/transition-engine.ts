@@ -9,11 +9,11 @@ import type {
   Swimlane,
   AutomationConfig,
   AutomationTrigger,
-  AutoCommandMode,
   ColumnAutomation,
   NotificationInput,
 } from '../../shared/types';
 import { runAutomations, type AutomationRunSummary } from '../automations/automation-runner';
+import type { DeliverToAgent } from '../automations/shared/automation-adapter';
 import type { AutomationRepository } from '../db/repositories/automation-repository';
 import type { AutomationRunRepository } from '../db/repositories/automation-run-repository';
 import { DEFAULT_SPAWN_PROMPT_TEMPLATE } from '../../shared/task-template-vars';
@@ -83,6 +83,11 @@ export interface SpawnOverrides {
    * an 'always_spawn_new' column. Defaults to false (resume if one exists).
    */
   forceFresh?: boolean;
+  /**
+   * The destination column's message, already interpolated, to deliver in the
+   * spawn's own argv prompt. See `SpawnIntentOptions.columnMessage`.
+   */
+  columnMessage?: string;
 }
 
 export class TransitionEngine {
@@ -149,7 +154,7 @@ export class TransitionEngine {
       // delivery (the exit hook does; see `deliverExitMessage`) is bounded by
       // the same budget that bounds every other row. A caller that only
       // schedules delivery ignores it.
-      deliverToAgent: (message: string, mode: AutoCommandMode, signal: AbortSignal) => Promise<void>;
+      deliverToAgent: DeliverToAgent;
       legacySpawnAgent?: (config: AutomationConfig) => Promise<void>;
       showNotification: (input: NotificationInput) => void;
       onProgress?: (phase: string) => void;
@@ -189,7 +194,7 @@ export class TransitionEngine {
     automation: ColumnAutomation,
     options: {
       signal: AbortSignal;
-      deliverToAgent: (message: string, mode: AutoCommandMode, signal: AbortSignal) => Promise<void>;
+      deliverToAgent: DeliverToAgent;
       showNotification: (input: NotificationInput) => void;
       onProgress?: (phase: string) => void;
       /**
@@ -221,7 +226,7 @@ export class TransitionEngine {
     options: {
       signal: AbortSignal;
       startAgent?: (pendingPrompt?: string) => Promise<void>;
-      deliverToAgent: (message: string, mode: AutoCommandMode, signal: AbortSignal) => Promise<void>;
+      deliverToAgent: DeliverToAgent;
       legacySpawnAgent?: (config: AutomationConfig) => Promise<void>;
       showNotification: (input: NotificationInput) => void;
       onProgress?: (phase: string) => void;
@@ -367,6 +372,7 @@ export class TransitionEngine {
       templateVars: vars,
       resumePrompt,
       forceFresh: spawnOverrides?.forceFresh,
+      columnMessage: spawnOverrides?.columnMessage,
     };
     let intent = resolveSpawnIntent(spawnIntentOptions);
 

@@ -77,7 +77,7 @@ export interface AutomationContext {
    * is what bounds that wait: it is this run's own, so the exit group's budget
    * caps it.
    */
-  deliverToAgent(message: string, mode: AutoCommandMode, signal: AbortSignal): Promise<void>;
+  deliverToAgent: DeliverToAgent;
   showNotification(input: NotificationInput): void;
   /**
    * Run the full agent-spawn pipeline for a legacy `spawn_agent` row. Present
@@ -134,3 +134,29 @@ export interface AutomationAdapter {
    */
   pendingPrompt?(config: AutomationConfig): string | undefined;
 }
+
+/**
+ * How a message reached the agent, as far as the caller can say at the moment
+ * `deliverToAgent` resolves.
+ *
+ * - `spawn-prompt`: it rode the spawn's own argv prompt. Delivered by the
+ *   spawn, so there is nothing left to confirm or escalate.
+ * - `keystrokes`: a burst was scheduled. Its real outcome (confirmed,
+ *   escalated, failed) arrives later and is written back onto the SAME run row
+ *   through `runId`.
+ * - `none`: nothing was sent (no live session, or the message was empty).
+ */
+export type AgentDeliveryVia = 'spawn-prompt' | 'keystrokes' | 'none';
+
+/**
+ * `runId` is the automation run the message belongs to, so the caller can
+ * record the burst's final outcome on the row the user reads. Optional because
+ * the exit path awaits the outcome itself and reports it on that row directly.
+ * Resolving `void` is read as `keystrokes`, the historical behavior.
+ */
+export type DeliverToAgent = (
+  message: string,
+  mode: AutoCommandMode,
+  signal: AbortSignal,
+  runId?: string,
+) => Promise<AgentDeliveryVia | void>;

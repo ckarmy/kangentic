@@ -58,6 +58,23 @@ export interface SpawnIntentOptions {
    * a resumable record is resumed (the create_or_resume behavior).
    */
   forceFresh?: boolean;
+  /**
+   * The destination column's message (its first `send_message` On enter row,
+   * or the task's own auto_command override), already interpolated. When set
+   * it ALWAYS rides the spawn's argv prompt:
+   *  - resume: it is the resumed session's next message (wins over
+   *    `resumePrompt`, which only carries the plan-exit continuation);
+   *  - fresh with a task template: appended after the task prompt
+   *    (`{{task_xml}}{{attachments}}`), separated by a blank line;
+   *  - fresh without a template: it is the whole initial prompt.
+   *
+   * Typing it after the spawn instead depended on a transcript verifier
+   * confirming the keystrokes, and that path had no restart fallback: a miss
+   * left the column's rules undelivered (0.42.0-luuk.1, task #14). The argv
+   * is delivered by the spawn itself and keeps the message's newlines, which
+   * keystroke delivery flattens.
+   */
+  columnMessage?: string;
 }
 
 /**
@@ -91,6 +108,7 @@ export function resolveSpawnIntent(options: SpawnIntentOptions): SpawnIntent {
     taskId, sessionType, sessionRepo, promptTemplate, templateVars, resumePrompt,
     isolatedSwimlaneId = null, forceFresh = false,
   } = options;
+  const columnMessage = options.columnMessage?.trim() ? options.columnMessage : undefined;
 
   const match = sessionRepo?.getLatestForTaskByTypeAndIsolation(taskId, sessionType, isolatedSwimlaneId);
   // forceFresh ('always_spawn_new' columns) spawns fresh even when a resumable
@@ -102,7 +120,7 @@ export function resolveSpawnIntent(options: SpawnIntentOptions): SpawnIntent {
     return {
       mode: 'resume',
       agentSessionId: match!.agent_session_id!,
-      prompt: resumePrompt,
+      prompt: columnMessage ?? resumePrompt,
       retireRecordId: match!.id,
       resumeFromCwd: match!.cwd ?? null,
     };
@@ -119,11 +137,22 @@ export function resolveSpawnIntent(options: SpawnIntentOptions): SpawnIntent {
     // owns the prompt slot and the auto_command is injected as a post-spawn
     // keystroke instead.
     prompt: promptTemplate
-      ? interpolateTaskTemplate(promptTemplate, templateVars)
-      : resumePrompt,
+      ? appendColumnMessage(interpolateTaskTemplate(promptTemplate, templateVars), columnMessage)
+      : (columnMessage ?? resumePrompt),
     // On a forced-fresh entry, retire the prior record we deliberately skipped so
     // it does not linger or get resumed later. (retireRecord no-ops on records
     // not in a retireable state, so passing a non-eligible match.id is safe.)
     retireRecordId: forceFresh ? (match?.id ?? null) : null,
   };
+}
+
+/**
+ * The task prompt followed by the column's message. A blank line separates
+ * them so the agent reads the rules as their own block after the `<task>`
+ * envelope. An empty task prompt yields the message alone.
+ */
+export function appendColumnMessage(taskPrompt: string, columnMessage: string | undefined): string {
+  if (!columnMessage) return taskPrompt;
+  const head = taskPrompt.trimEnd();
+  return head ? `${head}\n\n${columnMessage}` : columnMessage;
 }

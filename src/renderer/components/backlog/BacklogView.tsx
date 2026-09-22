@@ -49,7 +49,16 @@ export function BacklogView() {
   const [contextMenu, setContextMenu] = useState<{ position: { x: number; y: number }; item: BacklogTask } | null>(null);
 
   // --- Sort state (column sort disables drag-to-reorder) ---
-  const [isColumnSorted, setIsColumnSorted] = useState(false);
+  //
+  // A backlog with due dates opens sorted by them (soonest first, undated
+  // last). That default is decided once, frozen the first time the user
+  // touches a sort, so adding the first due date later cannot yank the table
+  // out from under a sort the user chose.
+  const hasDueDates = items.some((item) => item.due_date);
+  const [frozenDueDefault, setFrozenDueDefault] = useState<boolean | null>(null);
+  const dueDefault = frozenDueDefault ?? hasDueDates;
+  const [userSorted, setUserSorted] = useState<boolean | null>(null);
+  const isColumnSorted = userSorted ?? dueDefault;
 
   // --- Scroll-to-id from global search palette ---
   // The store field arms a one-shot request; we drop the active search query
@@ -224,7 +233,13 @@ export function BacklogView() {
                   rowTestId="backlog-task-row"
                   virtualized
                   sortableEnabled={canDrag}
-                  onSortChange={(key) => setIsColumnSorted(key !== undefined)}
+                  key={`due-default-${dueDefault}`}
+                  defaultSortKey={dueDefault ? 'due' : undefined}
+                  defaultSortDirection="asc"
+                  onSortChange={(key) => {
+                    setFrozenDueDefault(dueDefault);
+                    setUserSorted(key !== undefined);
+                  }}
                 />
               </SortableContext>
               <DragOverlay style={{ pointerEvents: 'none' }}>

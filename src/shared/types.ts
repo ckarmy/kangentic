@@ -3838,6 +3838,10 @@ export interface BacklogTaskUpdateInput {
   priority?: number;
   labels?: string[];
   pendingAttachments?: Array<{ filename: string; data: string; media_type: string }>;
+  /** YYYY-MM-DD. Null clears it; undefined leaves it as-is. */
+  dueDate?: string | null;
+  /** Replaces the whole object. Null clears it; undefined leaves it as-is. */
+  externalMetadata?: Record<string, unknown> | null;
 }
 
 export interface BacklogPromoteInput {

@@ -61,25 +61,58 @@ export function registerSessionTools(server: McpServer, resolver: RequestResolve
   server.registerTool(
     'kangentic_list_backlog',
     {
-      description: 'List items in the backlog staging area. The backlog holds work items before they are moved to the board. Items have priority levels and labels for organization. Pass `project` to list a different project\'s backlog.',
+      description: 'List items in the backlog staging area. The backlog holds work items before they are moved to the board. Items have priority levels, labels, an optional due date and optional external metadata. Ordered by due date (soonest first, undated last). The result carries a JSON `data` array with id, title, description, priority, priorityLabel, labels, dueDate (YYYY-MM-DD or null), assignee, externalMetadata (object or null) and createdAt. Pass `project` to list a different project\'s backlog.',
       inputSchema: z.object({
         priority: z.number().min(0).max(4).optional().describe('Filter by priority level: 0=none, 1=low, 2=medium, 3=high, 4=urgent.'),
         query: z.string().optional().describe('Search keyword to filter items by title, description, or labels (case-insensitive).'),
+        dueOnOrBefore: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('Only items whose dueDate is on or before this date (YYYY-MM-DD). Undated items are excluded.'),
         project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
       }),
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    async ({ priority, query, project }) => withProject(resolver, project, (ctx) => callHandler('list_backlog', {
+    async ({ priority, query, dueOnOrBefore, project }) => withProject(resolver, project, (ctx) => callHandler('list_backlog', {
       priority: priority ?? null,
       query: query ?? null,
+      dueOnOrBefore: dueOnOrBefore ?? null,
     }, ctx, 'Failed to list backlog')),
+  );
+
+  // --- kangentic_create_backlog_item ---
+  server.registerTool(
+    'kangentic_create_backlog_item',
+    {
+      description: 'Create an item in the backlog staging area (never on the board, never starts an agent). Returns the new item\'s id in `data.id`, plus the same fields kangentic_list_backlog returns. `approved` cannot be set by an agent. Pass `project` to create it in a different project.',
+      inputSchema: z.object({
+        title: z.string().min(1).max(200).describe('Item title (max 200 characters).'),
+        description: z.string().max(10_000).optional().describe('Item description (max 10,000 characters).'),
+        priority: z.number().int().min(0).max(4).optional().describe('Priority level: 0=none (default), 1=low, 2=medium, 3=high, 4=urgent.'),
+        labels: z.array(z.union([
+          z.string(),
+          z.object({ name: z.string(), color: z.string() }),
+        ])).optional().describe('Labels. Strings, or {name, color} objects to also set the label color.'),
+        dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('Due date, YYYY-MM-DD.'),
+        assignee: z.string().max(200).optional().describe('Free-text assignee.'),
+        externalMetadata: z.record(z.string(), z.unknown()).optional().describe('Arbitrary JSON object stored with the item (max 16 KB serialized).'),
+        project: z.string().optional().describe(PROJECT_SELECTOR_DESCRIPTION),
+      }),
+      annotations: MUTATING_ANNOTATIONS,
+    },
+    async ({ title, description, priority, labels, dueDate, assignee, externalMetadata, project }) => withProject(resolver, project, (ctx) => callHandler('create_backlog_task', {
+      title,
+      description: description ?? '',
+      priority: priority ?? 0,
+      labels: labels ?? [],
+      dueDate: dueDate ?? null,
+      assignee: assignee ?? null,
+      externalMetadata: externalMetadata ?? null,
+    }, ctx, 'Failed to create backlog item')),
   );
 
   // --- kangentic_promote_backlog ---
   server.registerTool(
     'kangentic_promote_backlog',
     {
-      description: 'Move one or more backlog tasks to the board, creating tasks in the specified column. Moved items are removed from the backlog. Find item IDs with kangentic_list_backlog or kangentic_search_tasks (with `scope: "backlog"`). Pass `project` to promote items in a different project.',
+      description: 'Move one or more backlog tasks to the board, creating tasks in the specified column: the Draft column (never starts an agent; protected items allowed) or the To Do column (protected items need a human). Any other column is refused. Moved items are removed from the backlog. Find item IDs with kangentic_list_backlog or kangentic_search_tasks (with `scope: "backlog"`). Pass `project` to promote items in a different project.',
       inputSchema: z.object({
         itemIds: z.array(z.string()).describe('Backlog task IDs to move to the board.'),
         column: z.string().optional().describe('Target column name. Defaults to the To Do column.'),
@@ -97,7 +130,7 @@ export function registerSessionTools(server: McpServer, resolver: RequestResolve
   server.registerTool(
     'kangentic_update_backlog_item',
     {
-      description: 'Update a backlog item\'s title, description, priority, labels, or attachments. Only the fields you provide are changed; omitted fields are left as-is. Note that `labels` is a full replacement (not additive) - pass the complete new label set; `attachments` is additive - existing attachments are kept. Find item IDs with kangentic_list_backlog or kangentic_search_tasks (with `scope: "backlog"`). Pass `project` to update a backlog item in a different project.',
+      description: 'Update a backlog item\'s title, description, priority, labels, dueDate, externalMetadata, or attachments. Only the fields you provide are changed; omitted fields are left as-is. Note that `labels` is a full replacement (not additive) - pass the complete new label set; `attachments` is additive - existing attachments are kept. Find item IDs with kangentic_list_backlog or kangentic_search_tasks (with `scope: "backlog"`). Pass `project` to update a backlog item in a different project.',
       inputSchema: z.object({
         itemId: z.string().describe('Backlog item UUID (from kangentic_list_backlog or kangentic_search_tasks).'),
         title: z.string().max(200).optional().describe('New title (max 200 characters).'),
@@ -107,6 +140,8 @@ export function registerSessionTools(server: McpServer, resolver: RequestResolve
           z.string(),
           z.object({ name: z.string(), color: z.string() }),
         ])).optional().describe('Full replacement label set. Strings, or {name, color} objects to also set the label color.'),
+        dueDate: z.union([z.string().regex(/^\d{4}-\d{2}-\d{2}$/), z.literal('')]).optional().describe('New due date, YYYY-MM-DD. An empty string clears it.'),
+        externalMetadata: z.record(z.string(), z.unknown()).nullable().optional().describe('Full replacement JSON object (max 16 KB serialized). null clears it.'),
         attachments: z.array(z.object({
           filePath: z.string().describe('Absolute path to the file to attach'),
           filename: z.string().optional().describe('Override display filename'),
@@ -115,12 +150,15 @@ export function registerSessionTools(server: McpServer, resolver: RequestResolve
       }),
       annotations: MUTATING_ANNOTATIONS,
     },
-    async ({ itemId, title, description, priority, labels, attachments, project }) => withProject(resolver, project, (ctx) => callHandler('update_backlog_item', {
+    async ({ itemId, title, description, priority, labels, dueDate, externalMetadata, attachments, project }) => withProject(resolver, project, (ctx) => callHandler('update_backlog_item', {
       itemId,
       title: title ?? null,
       description: description ?? null,
       priority: priority ?? null,
       labels: labels ?? null,
+      // undefined = untouched, null = clear (the handler's contract).
+      dueDate: dueDate === undefined ? undefined : (dueDate === '' ? null : dueDate),
+      externalMetadata,
       attachments: attachments ?? null,
     }, ctx, 'Failed to update backlog item')),
   );
